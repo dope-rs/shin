@@ -31,7 +31,7 @@ fn fresh_server() -> Server {
 fn fresh_client(resumption: Option<Resumption>) -> Client {
     Client::new(ClientConfig {
         verifier: Verifier::RawPublicKey {
-            expected_pubkey: *signing_key().pubkey(),
+            expected_pubkey: *signing_key().pubkey().unwrap(),
         },
         transport_params: Vec::new(),
         alpn_protocols: Vec::new(),

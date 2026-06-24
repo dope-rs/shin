@@ -37,6 +37,7 @@ impl ContentType {
 pub enum RecordError {
     BadContentType,
     BodyTooLarge,
+    RecordOverflow,
     OpenFailed,
     AllZeroInner,
     NotCipherTextOuter,
@@ -50,12 +51,19 @@ pub struct PlaintextRecord<'a> {
 }
 
 impl<'a> PlaintextRecord<'a> {
-    pub fn encode(content_type: ContentType, body: &[u8], out: &mut Vec<u8>) {
-        debug_assert!(body.len() <= MAX_PLAINTEXT_BODY);
+    pub fn encode(
+        content_type: ContentType,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), RecordError> {
+        if body.len() > MAX_PLAINTEXT_BODY {
+            return Err(RecordError::BodyTooLarge);
+        }
         out.push(content_type as u8);
         out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
         out.extend_from_slice(&(body.len() as u16).to_be_bytes());
         out.extend_from_slice(body);
+        Ok(())
     }
 
     pub fn parse(input: &'a [u8]) -> Result<Option<(Self, usize)>, RecordError> {
@@ -178,7 +186,6 @@ impl Opener {
         aad.copy_from_slice(&input[..HEADER_LEN]);
 
         let seq = self.seq;
-        self.seq += 1;
 
         let body = &mut input[HEADER_LEN..total];
         let plaintext_len = self
@@ -186,6 +193,12 @@ impl Opener {
             .open(seq, &aad, body)
             .map_err(|_| RecordError::OpenFailed)?
             .len();
+
+        self.seq += 1;
+
+        if plaintext_len > MAX_PLAINTEXT_BODY + 1 {
+            return Err(RecordError::RecordOverflow);
+        }
 
         let inner_slice = &input[HEADER_LEN..HEADER_LEN + plaintext_len];
         let inner_type_pos = inner_slice
@@ -233,5 +246,70 @@ mod tests {
             sealer.seal(ContentType::ApplicationData, &big),
             Err(RecordError::BodyTooLarge)
         );
+    }
+
+    #[test]
+    fn encode_rejects_oversize_body_in_release() {
+        let big = alloc::vec![0u8; MAX_PLAINTEXT_BODY + 1];
+        let mut out = Vec::new();
+        assert_eq!(
+            PlaintextRecord::encode(ContentType::Handshake, &big, &mut out),
+            Err(RecordError::BodyTooLarge)
+        );
+        assert!(out.is_empty());
+    }
+
+    fn craft_wire(seq: u64, inner_plaintext: &[u8]) -> Vec<u8> {
+        let keys = TrafficKeys::aes_128_gcm(&SECRET);
+        let aead = AeadKey::aes_128_gcm(&keys.key, keys.iv);
+        let outer_body_len = inner_plaintext.len() + AEAD_TAG_LEN;
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.push(ContentType::ApplicationData as u8);
+        header.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        header.extend_from_slice(&(outer_body_len as u16).to_be_bytes());
+        let ct = aead.seal(seq, &header, inner_plaintext);
+        let mut wire = header;
+        wire.extend_from_slice(&ct);
+        wire
+    }
+
+    #[test]
+    fn open_rejects_record_overflow() {
+        let mut inner = alloc::vec![0u8; MAX_PLAINTEXT_BODY + 1];
+        inner.push(ContentType::ApplicationData as u8);
+        let mut wire = craft_wire(0, &inner);
+        let mut opener = Opener::from_secret(&SECRET);
+        assert_eq!(opener.open(&mut wire), Err(RecordError::RecordOverflow));
+    }
+
+    #[test]
+    fn open_accepts_max_plaintext() {
+        let mut inner = alloc::vec![0u8; MAX_PLAINTEXT_BODY];
+        inner.push(ContentType::ApplicationData as u8);
+        let mut wire = craft_wire(0, &inner);
+        let mut opener = Opener::from_secret(&SECRET);
+        let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
+        assert_eq!(inner_type, ContentType::ApplicationData);
+        assert_eq!(range.len(), MAX_PLAINTEXT_BODY);
+    }
+
+    #[test]
+    fn open_does_not_advance_seq_on_auth_failure() {
+        let mut sealer = Sealer::from_secret(&SECRET);
+        let mut tampered = sealer.seal(ContentType::ApplicationData, b"body").unwrap();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let mut opener = Opener::from_secret(&SECRET);
+        assert_eq!(
+            opener.open(&mut tampered).unwrap_err(),
+            RecordError::OpenFailed
+        );
+        assert_eq!(opener.seq(), 0);
+
+        let mut fresh = Sealer::from_secret(&SECRET);
+        let mut good = fresh.seal(ContentType::ApplicationData, b"body").unwrap();
+        let (_, range, _) = opener.open(&mut good).unwrap().unwrap();
+        assert_eq!(&good[range], b"body");
+        assert_eq!(opener.seq(), 1);
     }
 }

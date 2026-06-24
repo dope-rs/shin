@@ -104,10 +104,17 @@ pub enum Error {
     Sig,
     Spki,
     Rng,
+    Encode,
 }
 
 impl From<crate::codec::DecodeError> for Error {
     fn from(_: crate::codec::DecodeError) -> Self {
         Self::Decode
+    }
+}
+
+impl From<crate::codec::EncodeError> for Error {
+    fn from(_: crate::codec::EncodeError) -> Self {
+        Self::Encode
     }
 }

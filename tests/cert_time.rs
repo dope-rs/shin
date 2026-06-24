@@ -78,3 +78,24 @@ fn leap_year_handled() {
     let mar1 = UnixTime::from_time_value(&utc_time(b"000301000000Z")).unwrap();
     assert_eq!(mar1.0 - jan1.0, 60 * 86_400);
 }
+
+#[test]
+fn day_of_month_validated_against_month_length() {
+    // April has 30 days; April 31 is invalid.
+    assert!(UnixTime::from_time_value(&utc_time(b"210431000000Z")).is_err());
+    // June 31 invalid; June 30 valid.
+    assert!(UnixTime::from_time_value(&utc_time(b"210631000000Z")).is_err());
+    assert!(UnixTime::from_time_value(&utc_time(b"210630000000Z")).is_ok());
+}
+
+#[test]
+fn february_day_validation_with_leap_year() {
+    // 2021 is not a leap year: Feb 29 invalid, Feb 28 valid, Feb 30 always invalid.
+    assert!(UnixTime::from_time_value(&utc_time(b"210229000000Z")).is_err());
+    assert!(UnixTime::from_time_value(&utc_time(b"210228000000Z")).is_ok());
+    // 2020 is a leap year: Feb 29 valid, Feb 30 invalid.
+    assert!(UnixTime::from_time_value(&utc_time(b"200229000000Z")).is_ok());
+    assert!(UnixTime::from_time_value(&utc_time(b"200230000000Z")).is_err());
+    // Generalized-time leap century: 2000 is leap.
+    assert!(UnixTime::from_time_value(&gen_time(b"20000229000000Z")).is_ok());
+}

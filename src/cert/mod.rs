@@ -5,7 +5,7 @@ mod ext;
 pub use ext::{
     BasicConstraints, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage, OID_EKU_CLIENT_AUTH,
     OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE,
-    OID_EXT_SAN,
+    OID_EXT_SAN, is_handled_ext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +140,12 @@ impl<'a> Cert<'a> {
 
         let outer_signature_alg = AlgorithmIdentifier::parse(&mut top)?;
 
+        if signature_alg.oid != outer_signature_alg.oid
+            || signature_alg.parameters != outer_signature_alg.parameters
+        {
+            return Err(CertError::BadAlgorithm);
+        }
+
         let sig_tlv = top.next()?;
         if sig_tlv.tag != Tag::BIT_STRING {
             return Err(CertError::Der(DerError::Mismatch));
@@ -188,6 +194,9 @@ impl<'a> Cert<'a> {
             if v > 2 {
                 return Err(CertError::BadVersion);
             }
+            if v == 0 {
+                return Err(CertError::BadVersion);
+            }
             v as u8 + 1
         } else {
             1
@@ -200,8 +209,8 @@ impl<'a> Cert<'a> {
         let subject_der = r.expect(Tag::SEQUENCE)?;
         let spki = SubjectPublicKeyInfo::parse_inline(&mut r)?;
 
-        let _ = r.read_optional(Tag::context(1, false))?;
-        let _ = r.read_optional(Tag::context(2, false))?;
+        let issuer_uid = r.read_optional(Tag::context(1, false))?.is_some();
+        let subject_uid = r.read_optional(Tag::context(2, false))?.is_some();
 
         let extensions_der = if let Some(ext_outer) = r.read_optional(Tag::context(3, true))? {
             let mut er = Reader::new(ext_outer);
@@ -211,6 +220,13 @@ impl<'a> Cert<'a> {
         } else {
             None
         };
+
+        if extensions_der.is_some() && version != 3 {
+            return Err(CertError::BadVersion);
+        }
+        if (issuer_uid || subject_uid) && version < 2 {
+            return Err(CertError::BadVersion);
+        }
 
         r.finish()?;
         Ok((

@@ -79,7 +79,7 @@ fn multiple_protocols_emit_in_order() {
 #[test]
 fn server_picks_first_overlap_and_client_observes() {
     let signing = SigningKey::from_seed(&[0x42u8; 32]).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey {
@@ -109,7 +109,7 @@ fn server_picks_first_overlap_and_client_observes() {
 #[test]
 fn no_overlap_leaves_alpn_unset() {
     let signing = SigningKey::from_seed(&[0x42u8; 32]).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey {

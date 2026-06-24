@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::codec::Reader;
+use crate::codec::{Encode, Reader};
 use crate::extension::{Extension, ExtensionType};
 use crate::handshake::{
     Certificate, CertificateEntry, CertificateVerify, ClientHello, EncryptedExtensions, Finished,
@@ -47,6 +47,12 @@ pub trait EarlyDataGuard {
 /// Allowed skew between client-claimed and server-measured ticket age (RFC 8446 §8.2).
 const MAX_TICKET_AGE_SKEW_MS: u64 = 10_000;
 
+/// Cap on KeyUpdate messages processed per record; bounds reply amplification.
+const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
+
+/// max_early_data_size advertised in NewSessionTicket when 0-RTT is accepted.
+const MAX_EARLY_DATA_SIZE: u32 = 16384;
+
 /// NewSessionTicket lifetime and upper bound of the 0-RTT freshness window.
 const TICKET_LIFETIME_SECS: u32 = 7200;
 const TICKET_LIFETIME_MS: u64 = TICKET_LIFETIME_SECS as u64 * 1000;
@@ -57,6 +63,7 @@ struct AcceptedPsk {
     issued_at_ms: u64,
     obfuscated_ticket_age: u32,
     binder: Vec<u8>,
+    alpn: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -129,9 +136,16 @@ impl Server {
     pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
         let mut events = Vec::new();
         let mut r = Reader::new(data);
+        let mut key_updates = 0u32;
         while !r.is_empty() {
             let snapshot = r.remaining();
             let msg = Handshake::decode(&mut r)?;
+            if matches!(msg, Handshake::KeyUpdate(_)) {
+                key_updates += 1;
+                if key_updates > MAX_KEY_UPDATES_PER_RECORD {
+                    return Err(Error::UnexpectedMessage);
+                }
+            }
             let consumed = snapshot.len() - r.remaining().len();
             let raw = &snapshot[..consumed];
             self.process(epoch, msg, raw, &mut events)?;
@@ -202,6 +216,12 @@ impl Server {
     ) -> Result<(), Error> {
         if !ch.cipher_suites.contains(&SUITE_AES_128_GCM_SHA256) {
             return Err(Error::UnsupportedCipherSuite);
+        }
+        if ch.legacy_compression_methods != [0] {
+            return Err(Error::Decode);
+        }
+        if ch.legacy_session_id.len() > 32 {
+            return Err(Error::Decode);
         }
         let sv = ch
             .extensions
@@ -277,7 +297,12 @@ impl Server {
         let early_accepted = self.config.accept_early_data
             && client_offered_early
             && match psk_accepted.as_ref() {
-                Some(p) => self.check_early_data_replay(p),
+                Some(p) => {
+                    // RFC 8446 §4.2.10: reject 0-RTT unless the newly-selected ALPN
+                    // exactly matches the protocol negotiated by the original session.
+                    let selected = self.selected_alpn.as_deref().unwrap_or(&[]);
+                    selected == p.alpn.as_slice() && self.check_early_data_replay(p)
+                }
                 None => false,
             };
 
@@ -383,7 +408,7 @@ impl Server {
         if let Some(picked) = &self.selected_alpn {
             ee_exts.push(Extension::new(
                 ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
-                Alpn::encode(core::slice::from_ref(picked)),
+                Alpn::encode(core::slice::from_ref(picked))?,
             ));
         }
         if early_accepted {
@@ -401,12 +426,15 @@ impl Server {
 
         if psk_accepted.is_none() {
             let certificate_list: Vec<CertificateEntry> = match &self.config.source {
-                CertSource::RawPublicKey { signing_key } => alloc::vec![CertificateEntry {
-                    cert_data: spki::SubjectPublicKey::Ed25519(*signing_key.pubkey())
-                        .encode()
-                        .expect("ed25519 SPKI encode"),
-                    extensions: Vec::new(),
-                }],
+                CertSource::RawPublicKey { signing_key } => {
+                    let pubkey = signing_key.pubkey().ok_or(Error::Sig)?;
+                    alloc::vec![CertificateEntry {
+                        cert_data: spki::SubjectPublicKey::Ed25519(*pubkey)
+                            .encode()
+                            .map_err(|_| Error::Spki)?,
+                        extensions: Vec::new(),
+                    }]
+                }
                 CertSource::X509 { chain_der, .. } => chain_der
                     .iter()
                     .map(|der| CertificateEntry {
@@ -425,7 +453,12 @@ impl Server {
 
             let h_pre_cv = self.transcript.hash();
             let cv_msg = CertVerify::message(&h_pre_cv, true);
-            let sig = self.config.source.signing_key().sign(&cv_msg);
+            let sig = self
+                .config
+                .source
+                .signing_key()
+                .sign(&cv_msg)
+                .map_err(|_| Error::Sig)?;
             let cv = CertificateVerify {
                 algorithm: self.config.source.signing_key().sig_scheme(),
                 signature: sig,
@@ -493,9 +526,18 @@ impl Server {
         if bind.len() != 32 {
             return None;
         }
-        let (psk, age_add, issued_at_ms) = crate::ticket::TicketSecret::new(secret)
+        let (psk, age_add, issued_at_ms, alpn) = crate::ticket::TicketSecret::new(secret)
             .decrypt(&id.identity)
             .ok()?;
+        if let Some(guard) = self.early_data_guard.as_ref() {
+            let now = guard.now_ms();
+            if issued_at_ms > now.saturating_add(MAX_TICKET_AGE_SKEW_MS) {
+                return None;
+            }
+            if now.saturating_sub(issued_at_ms) > TICKET_LIFETIME_MS {
+                return None;
+            }
+        }
         let n = raw.len();
         // RFC 8446 §4.2.11.2: strip the binders field (list_len 2 + binder_len 1 + binder).
         let binders_field = 2 + 1 + bind.len();
@@ -515,6 +557,7 @@ impl Server {
             issued_at_ms,
             obfuscated_ticket_age: id.obfuscated_ticket_age,
             binder: bind.clone(),
+            alpn,
         })
     }
 
@@ -574,15 +617,22 @@ impl Server {
         let age_add = u32::from_be_bytes(age_add_bytes);
         let psk = crate::schedule::ResumptionMaster::new(rms).psk(&nonce);
         let issued_at_ms = self.early_data_guard.as_ref().map_or(0, |g| g.now_ms());
+        let alpn = self.selected_alpn.clone().unwrap_or_default();
         let ticket = crate::ticket::TicketSecret::new(ticket_secret)
-            .encrypt(&psk, age_add, issued_at_ms, &self.rng)
+            .encrypt(&psk, age_add, issued_at_ms, &alpn, &self.rng)
             .map_err(|_| Error::Rng)?;
+        let mut nst_extensions = Vec::new();
+        if self.config.accept_early_data {
+            let mut body = Vec::new();
+            body.put_u32(MAX_EARLY_DATA_SIZE);
+            nst_extensions.push(Extension::new(ExtensionType::EARLY_DATA, body));
+        }
         let nst = NewSessionTicket {
             ticket_lifetime: TICKET_LIFETIME_SECS,
             ticket_age_add: age_add,
             ticket_nonce: nonce.to_vec(),
             ticket,
-            extensions: Vec::new(),
+            extensions: nst_extensions,
         };
         let mut bytes = Vec::new();
         Handshake::NewSessionTicket(nst).encode(&mut bytes);

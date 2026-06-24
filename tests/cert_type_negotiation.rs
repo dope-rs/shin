@@ -232,7 +232,7 @@ fn x509_server_with_transport_params_does_not_leak_to_tcp_tls_client() {
 #[test]
 fn quic_transport_params_round_trip_when_client_offers() {
     let server_key = SigningKey::from_seed(&[0x11u8; 32]).unwrap();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey {
@@ -270,7 +270,7 @@ fn quic_transport_params_round_trip_when_client_offers() {
 #[test]
 fn rpk_handshake_echoes_cert_type_extensions() {
     let server_key = SigningKey::from_seed(&[0x22u8; 32]).unwrap();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey {
@@ -364,7 +364,7 @@ fn x509_server_rejects_rpk_only_client_offer() {
 #[test]
 fn alpn_intersection_emits_extension() {
     let server_key = SigningKey::from_seed(&[0x33u8; 32]).unwrap();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey {
@@ -409,7 +409,7 @@ fn alpn_intersection_emits_extension() {
 #[test]
 fn alpn_no_overlap_omits_extension() {
     let server_key = SigningKey::from_seed(&[0x44u8; 32]).unwrap();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey {
@@ -448,7 +448,7 @@ fn alpn_no_overlap_omits_extension() {
 #[test]
 fn alpn_client_silent_omits_extension() {
     let server_key = SigningKey::from_seed(&[0x55u8; 32]).unwrap();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey {

@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use ring::hmac;
 
-use crate::codec::{DecodeError, Encode, Reader};
+use crate::codec::{DecodeError, Encode, EncodeError, Reader};
 use crate::hash::HASH_LEN;
 use crate::kdf::Hkdf;
 
@@ -166,14 +166,20 @@ impl KeyShare {
 pub(crate) struct Alpn;
 
 impl Alpn {
-    pub(crate) fn encode(protocols: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn encode(protocols: &[Vec<u8>]) -> Result<Vec<u8>, EncodeError> {
         let mut v = Vec::with_capacity(2 + protocols.iter().map(|p| 1 + p.len()).sum::<usize>());
-        v.put_vec_u16(|o| {
+        let mut err = None;
+        v.try_put_vec_u16(|o| {
             for p in protocols {
-                o.put_vec_u8(|o| o.put_slice(p));
+                if let Err(e) = o.try_put_vec_u8(|o| o.put_slice(p)) {
+                    err = Some(e);
+                }
             }
-        });
-        v
+        })?;
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(v)
     }
 
     pub(crate) fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, DecodeError> {
@@ -192,13 +198,19 @@ impl Alpn {
 pub(crate) struct ServerName;
 
 impl ServerName {
-    pub(crate) fn encode(hostname: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode(hostname: &[u8]) -> Result<Vec<u8>, EncodeError> {
         let mut v = Vec::with_capacity(5 + hostname.len());
-        v.put_vec_u16(|o| {
+        let mut err = None;
+        v.try_put_vec_u16(|o| {
             o.put_u8(0);
-            o.put_vec_u16(|o| o.put_slice(hostname));
-        });
-        v
+            if let Err(e) = o.try_put_vec_u16(|o| o.put_slice(hostname)) {
+                err = Some(e);
+            }
+        })?;
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(v)
     }
 }
 
@@ -258,5 +270,33 @@ impl Finished {
         let mut out = [0u8; HASH_LEN];
         out.copy_from_slice(tag.as_ref());
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpn_encode_ok() {
+        let protocols = alloc::vec![b"h3".to_vec(), b"hq".to_vec()];
+        assert!(Alpn::encode(&protocols).is_ok());
+    }
+
+    #[test]
+    fn alpn_encode_oversized_protocol() {
+        let protocols = alloc::vec![alloc::vec![0u8; 256]];
+        assert_eq!(Alpn::encode(&protocols), Err(EncodeError::Overflow));
+    }
+
+    #[test]
+    fn server_name_encode_ok() {
+        assert!(ServerName::encode(b"example.com").is_ok());
+    }
+
+    #[test]
+    fn server_name_encode_oversized() {
+        let hostname = alloc::vec![b'a'; 65536];
+        assert_eq!(ServerName::encode(&hostname), Err(EncodeError::Overflow));
     }
 }

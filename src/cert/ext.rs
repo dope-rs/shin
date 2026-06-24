@@ -11,6 +11,13 @@ pub const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 pub const OID_EKU_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 pub const OID_EKU_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
 
+pub fn is_handled_ext(oid: &[u8]) -> bool {
+    matches!(
+        oid,
+        OID_EXT_KEY_USAGE | OID_EXT_SAN | OID_EXT_BASIC_CONSTRAINTS | OID_EXT_EXTENDED_KEY_USAGE
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ExtensionEntry<'a> {
     pub oid: &'a [u8],
@@ -85,11 +92,17 @@ impl BasicConstraints {
         r.finish()?;
         let mut ir = Reader::new(inner);
         let ca = if ir.peek_tag() == Some(Tag::BOOLEAN) {
-            Tlv::boolean(ir.expect(Tag::BOOLEAN)?).map_err(CertError::Der)?
+            if !Tlv::boolean(ir.expect(Tag::BOOLEAN)?).map_err(CertError::Der)? {
+                return Err(CertError::Der(DerError::BadBool));
+            }
+            true
         } else {
             false
         };
         let path_len_constraint = if ir.peek_tag() == Some(Tag::INTEGER) {
+            if !ca {
+                return Err(CertError::Der(DerError::Mismatch));
+            }
             Some(Tlv::integer_u64(ir.expect(Tag::INTEGER)?)?)
         } else {
             None
@@ -133,21 +146,36 @@ impl KeyUsage {
         if bs.is_empty() {
             return Err(CertError::Der(DerError::BadBitString));
         }
-        let unused = bs[0];
+        let unused = bs[0] as usize;
         if unused > 7 {
             return Err(CertError::Der(DerError::BadBitString));
         }
+        let content = &bs[1..];
+        if content.is_empty() {
+            if unused != 0 {
+                return Err(CertError::Der(DerError::BadBitString));
+            }
+            return Ok(Self { bits: 0 });
+        }
+        if content.len() > 2 {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
+        let last = *content.last().unwrap();
+        if unused != 0 && last & ((1u16 << unused) - 1) as u8 != 0 {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
+        if last == 0 {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
         let mut bits = 0u16;
-        if bs.len() >= 2 {
-            let b0 = bs[1];
-            for i in 0..8 {
-                if (b0 >> (7 - i)) & 1 != 0 {
-                    bits |= 1 << i;
-                }
+        let b0 = content[0];
+        for i in 0..8 {
+            if (b0 >> (7 - i)) & 1 != 0 {
+                bits |= 1 << i;
             }
         }
-        if bs.len() >= 3 {
-            let b1 = bs[2];
+        if content.len() == 2 {
+            let b1 = content[1];
             if (b1 >> 7) & 1 != 0 {
                 bits |= 1 << 8;
             }

@@ -47,7 +47,7 @@ const QUIC_TRANSPORT_PARAMETERS: u16 = 57;
 #[test]
 fn handshake_completes_in_process() {
     let server_key = sample_signing_key();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: shin::server::CertSource::RawPublicKey {
@@ -150,7 +150,7 @@ fn client_rejects_wrong_server_pubkey() {
 #[test]
 fn server_rejects_tampered_client_finished() {
     let server_key = sample_signing_key();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: shin::server::CertSource::RawPublicKey {
@@ -188,7 +188,7 @@ fn server_rejects_tampered_client_finished() {
 #[test]
 fn keys_diverge_across_independent_handshakes() {
     let server_key = sample_signing_key();
-    let server_pubkey = *server_key.pubkey();
+    let server_pubkey = *server_key.pubkey().unwrap();
 
     let do_handshake = || -> ([u8; 32], [u8; 32]) {
         let mut server = Server::new(ServerConfig {

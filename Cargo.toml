@@ -1,6 +1,6 @@
 [package]
 name = "shin"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Hand-rolled single-threaded TLS 1.3"
 license = "MIT"

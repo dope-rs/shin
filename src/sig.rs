@@ -98,10 +98,10 @@ impl SigningKey {
         }))
     }
 
-    pub fn pubkey(&self) -> &[u8; PUBKEY_LEN] {
+    pub fn pubkey(&self) -> Option<&[u8; PUBKEY_LEN]> {
         match self {
-            Self::Ed25519(k) => &k.pubkey,
-            _ => panic!("pubkey() is Ed25519-only"),
+            Self::Ed25519(k) => Some(&k.pubkey),
+            _ => None,
         }
     }
 
@@ -126,32 +126,32 @@ impl SigningKey {
         }
     }
 
-    pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
+    pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, SigError> {
         match self {
-            Self::Ed25519(k) => k.inner.sign(msg).as_ref().to_vec(),
+            Self::Ed25519(k) => Ok(k.inner.sign(msg).as_ref().to_vec()),
             Self::EcdsaP256(k) => {
                 let rng = SystemRandom::new();
-                k.inner
+                Ok(k.inner
                     .sign(&rng, msg)
-                    .expect("ECDSA sign")
+                    .map_err(|_| SigError::InvalidKey)?
                     .as_ref()
-                    .to_vec()
+                    .to_vec())
             }
             Self::EcdsaP384(k) => {
                 let rng = SystemRandom::new();
-                k.inner
+                Ok(k.inner
                     .sign(&rng, msg)
-                    .expect("ECDSA sign")
+                    .map_err(|_| SigError::InvalidKey)?
                     .as_ref()
-                    .to_vec()
+                    .to_vec())
             }
             Self::Rsa(k) => {
                 let rng = SystemRandom::new();
                 let mut sig = alloc::vec![0u8; k.inner.public().modulus_len()];
                 k.inner
                     .sign(&RSA_PSS_SHA256, &rng, msg, &mut sig)
-                    .expect("RSA sign");
-                sig
+                    .map_err(|_| SigError::InvalidKey)?;
+                Ok(sig)
             }
         }
     }
@@ -209,5 +209,31 @@ impl VerifyingKey<'_> {
                 .verify(msg, sig)
                 .map_err(|_| bad()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_pubkey_some_and_sign_ok() {
+        let seed = [7u8; SEED_LEN];
+        let key = SigningKey::from_seed(&seed).unwrap();
+        assert!(key.pubkey().is_some());
+        let sig = key.sign(b"hello").unwrap();
+        assert_eq!(sig.len(), SIG_LEN);
+    }
+
+    #[test]
+    fn non_ed25519_pubkey_none() {
+        let seed = [7u8; SEED_LEN];
+        let key = SigningKey::from_seed(&seed).unwrap();
+        match key {
+            SigningKey::Ed25519(_) => {}
+            _ => panic!("expected ed25519"),
+        }
+        // pubkey() must not panic for any variant; Ed25519 returns Some.
+        assert!(key.pubkey().is_some());
     }
 }

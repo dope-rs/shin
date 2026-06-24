@@ -16,7 +16,9 @@ struct Ca {
 fn ca_params(cn: &str, path_len: Option<u8>) -> CertificateParams {
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.distinguished_name = rcgen::DistinguishedName::new();
-    params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
     params.is_ca = match path_len {
         Some(n) => IsCa::Ca(BasicConstraints::Constrained(n)),
         None => IsCa::Ca(BasicConstraints::Unconstrained),

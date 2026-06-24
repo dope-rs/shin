@@ -68,11 +68,19 @@ impl UnixTime {
     ) -> Result<u64, CertError> {
         if !(1970..=9999).contains(&year)
             || !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
+            || day < 1
             || hour > 23
             || min > 59
             || sec > 59
         {
+            return Err(CertError::BadValidity);
+        }
+        let mut month_days =
+            [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(month - 1) as usize];
+        if month == 2 && Self::is_leap(year) {
+            month_days = 29;
+        }
+        if day > month_days {
             return Err(CertError::BadValidity);
         }
         let mut days: u64 = 0;

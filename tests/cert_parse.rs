@@ -69,3 +69,53 @@ fn parse_rejects_truncated_cert() {
         shin::cert::CertError::Der(shin::asn1::DerError::Underflow)
     ));
 }
+
+const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+
+fn find_last(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    (0..=hay.len().saturating_sub(needle.len()))
+        .rev()
+        .find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+#[test]
+fn rejects_signature_algorithm_substitution() {
+    // Parse must reject when the inner TBS `signature` and the outer
+    // `signatureAlgorithm` AlgorithmIdentifiers disagree (RFC 5280 4.1.1.2).
+    let der = gen_self_signed("sigalg.local");
+    let cert = Cert::parse(&der).expect("baseline parses");
+    assert_eq!(cert.signature_alg.oid, OID_ECDSA_SHA256);
+
+    // Flip the last byte of the outer signatureAlgorithm OID (last occurrence).
+    let mut tampered = der.clone();
+    let pos = find_last(&tampered, OID_ECDSA_SHA256).expect("sig oid present");
+    let last = pos + OID_ECDSA_SHA256.len() - 1;
+    tampered[last] = 0x03; // turns ...0403_02 into ...0403_03 (ECDSA-SHA384)
+    assert_eq!(
+        Cert::parse(&tampered).unwrap_err(),
+        shin::cert::CertError::BadAlgorithm
+    );
+}
+
+#[test]
+fn rejects_explicit_default_version() {
+    // An explicit version field encoding v1 (INTEGER 0) violates the DER
+    // DEFAULT-omission rule and must be rejected.
+    let der = gen_self_signed("ver.local");
+    let cert = Cert::parse(&der).expect("baseline parses");
+    assert_eq!(cert.version, 3);
+
+    // v3 cert begins TBS with [0]{ INTEGER 2 } = a0 03 02 01 02.
+    let v3 = [0xa0u8, 0x03, 0x02, 0x01, 0x02];
+    let pos = find_last(&der, &v3).expect("v3 version prefix present");
+    // Locate the first occurrence (inside TBS) instead.
+    let pos = (0..=der.len() - v3.len())
+        .find(|&i| der[i..i + v3.len()] == v3)
+        .unwrap_or(pos);
+    let mut tampered = der.clone();
+    tampered[pos + 4] = 0x00; // INTEGER value 2 -> 0 (explicit v1)
+    assert_eq!(
+        Cert::parse(&tampered).unwrap_err(),
+        shin::cert::CertError::BadVersion
+    );
+}
