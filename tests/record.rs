@@ -52,7 +52,7 @@ fn ciphertext_round_trip_handshake_inner() {
     let mut opener = Opener::from_secret(&TEST_SECRET);
 
     let body = b"encrypted-extensions-payload";
-    let mut wire = sealer.seal(ContentType::Handshake, body);
+    let mut wire = sealer.seal(ContentType::Handshake, body).unwrap();
     assert_eq!(wire[0], ContentType::ApplicationData as u8);
     assert_eq!(wire.len(), HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN);
 
@@ -68,7 +68,7 @@ fn ciphertext_round_trip_app_data_inner() {
     let mut opener = Opener::from_secret(&TEST_SECRET);
 
     let body = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
-    let mut wire = sealer.seal(ContentType::ApplicationData, body);
+    let mut wire = sealer.seal(ContentType::ApplicationData, body).unwrap();
     let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
     assert_eq!(inner_type, ContentType::ApplicationData);
     assert_eq!(&wire[range], body);
@@ -81,7 +81,7 @@ fn sequence_number_increments_per_record() {
 
     for i in 0..5u8 {
         let body = vec![i; 32];
-        let mut wire = sealer.seal(ContentType::ApplicationData, &body);
+        let mut wire = sealer.seal(ContentType::ApplicationData, &body).unwrap();
         let (_, range, _) = opener.open(&mut wire).unwrap().unwrap();
         assert_eq!(&wire[range], &body);
     }
@@ -93,7 +93,7 @@ fn sequence_number_increments_per_record() {
 fn ciphertext_open_rejects_tampered_tag() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET);
     let mut opener = Opener::from_secret(&TEST_SECRET);
-    let mut wire = sealer.seal(ContentType::ApplicationData, b"body");
+    let mut wire = sealer.seal(ContentType::ApplicationData, b"body").unwrap();
     let last = wire.len() - 1;
     wire[last] ^= 0x01;
     assert_eq!(opener.open(&mut wire).unwrap_err(), RecordError::OpenFailed);
@@ -103,8 +103,8 @@ fn ciphertext_open_rejects_tampered_tag() {
 fn ciphertext_open_rejects_wrong_seq_order() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET);
     let mut opener = Opener::from_secret(&TEST_SECRET);
-    let _wire1 = sealer.seal(ContentType::ApplicationData, b"first");
-    let mut wire2 = sealer.seal(ContentType::ApplicationData, b"second");
+    let _wire1 = sealer.seal(ContentType::ApplicationData, b"first").unwrap();
+    let mut wire2 = sealer.seal(ContentType::ApplicationData, b"second").unwrap();
     assert_eq!(
         opener.open(&mut wire2).unwrap_err(),
         RecordError::OpenFailed
@@ -115,7 +115,7 @@ fn ciphertext_open_rejects_wrong_seq_order() {
 fn open_returns_none_when_input_short() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET);
     let mut opener = Opener::from_secret(&TEST_SECRET);
-    let wire = sealer.seal(ContentType::ApplicationData, b"hi");
+    let wire = sealer.seal(ContentType::ApplicationData, b"hi").unwrap();
 
     let mut head = wire[..HEADER_LEN - 1].to_vec();
     assert!(opener.open(&mut head).unwrap().is_none());
@@ -128,7 +128,7 @@ fn open_returns_none_when_input_short() {
 fn open_rejects_plaintext_outer_type() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET);
     let mut opener = Opener::from_secret(&TEST_SECRET);
-    let mut wire = sealer.seal(ContentType::Handshake, b"x");
+    let mut wire = sealer.seal(ContentType::Handshake, b"x").unwrap();
     wire[0] = ContentType::Handshake as u8;
     assert_eq!(
         opener.open(&mut wire).unwrap_err(),

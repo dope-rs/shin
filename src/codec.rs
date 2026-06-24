@@ -5,6 +5,8 @@ pub enum DecodeError {
     Underflow,
     InvalidEnum,
     Trailing,
+    DuplicateExtension,
+    TooManyCertificates,
 }
 
 pub struct Reader<'a> {

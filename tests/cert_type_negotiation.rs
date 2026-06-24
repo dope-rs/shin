@@ -106,7 +106,7 @@ fn has_ext(ee: &[(u16, Vec<u8>)], ty: ExtensionType) -> bool {
     ee.iter().any(|(t, _)| *t == ty.0)
 }
 
-fn ext_data<'a>(ee: &'a [(u16, Vec<u8>)], ty: ExtensionType) -> Option<&'a [u8]> {
+fn ext_data(ee: &[(u16, Vec<u8>)], ty: ExtensionType) -> Option<&[u8]> {
     ee.iter()
         .find(|(t, _)| *t == ty.0)
         .map(|(_, d)| d.as_slice())

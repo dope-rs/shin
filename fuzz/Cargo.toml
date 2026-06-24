@@ -1,0 +1,44 @@
+[package]
+name = "shin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.shin]
+path = ".."
+
+[[bin]]
+name = "record_parse"
+path = "fuzz_targets/record_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_parse"
+path = "fuzz_targets/handshake_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_parse"
+path = "fuzz_targets/cert_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extension_parse"
+path = "fuzz_targets/extension_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

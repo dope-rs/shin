@@ -7,6 +7,8 @@ pub const RANDOM_LEN: usize = 32;
 pub const TLS_1_3: u16 = 0x0304;
 pub const TLS_1_2: u16 = 0x0303;
 
+pub const MAX_CERTIFICATE_ENTRIES: usize = 16;
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeType {
@@ -187,6 +189,9 @@ impl Certificate {
         let mut sub = r.sub_u24()?;
         let mut certificate_list = Vec::new();
         while !sub.is_empty() {
+            if certificate_list.len() >= MAX_CERTIFICATE_ENTRIES {
+                return Err(DecodeError::TooManyCertificates);
+            }
             certificate_list.push(CertificateEntry::decode(&mut sub)?);
         }
         Ok(Self {
@@ -247,6 +252,9 @@ impl KeyUpdate {
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let request_update = r.u8()?;
+        if request_update > 1 {
+            return Err(DecodeError::InvalidEnum);
+        }
         Ok(Self { request_update })
     }
 }
