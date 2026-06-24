@@ -52,6 +52,58 @@ fn basic_constraints_default_when_absent() {
 }
 
 #[test]
+fn basic_constraints_path_len_without_ca_rejected() {
+    // SEQUENCE { INTEGER 3 } : pathLenConstraint with cA absent/FALSE is malformed.
+    let value = [0x30u8, 0x03, 0x02, 0x01, 0x03];
+    assert!(BasicConstraints::parse(&value).is_err());
+}
+
+#[test]
+fn basic_constraints_ca_false_boolean_rejected() {
+    // SEQUENCE { BOOLEAN FALSE } : DEFAULT FALSE must be omitted in DER.
+    let value = [0x30u8, 0x03, 0x01, 0x01, 0x00];
+    assert!(BasicConstraints::parse(&value).is_err());
+}
+
+#[test]
+fn basic_constraints_ca_true_with_path_len_ok() {
+    // SEQUENCE { BOOLEAN TRUE, INTEGER 2 }
+    let value = [0x30u8, 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x02];
+    let bc = BasicConstraints::parse(&value).unwrap();
+    assert!(bc.ca);
+    assert_eq!(bc.path_len_constraint, Some(2));
+}
+
+#[test]
+fn key_usage_rejects_nonzero_unused_bits() {
+    // BIT STRING, 1 unused bit, content byte 0x81: bit in the unused region is set.
+    let value = [0x03u8, 0x02, 0x01, 0x81];
+    assert!(KeyUsage::parse(&value).is_err());
+}
+
+#[test]
+fn key_usage_rejects_trailing_zero_byte() {
+    // BIT STRING, 0 unused, content {0x80, 0x00}: trailing all-zero byte is non-canonical.
+    let value = [0x03u8, 0x03, 0x00, 0x80, 0x00];
+    assert!(KeyUsage::parse(&value).is_err());
+}
+
+#[test]
+fn key_usage_rejects_overlong_content() {
+    // KeyUsage has at most 9 bits; a 3-byte content payload is invalid.
+    let value = [0x03u8, 0x04, 0x00, 0x80, 0x00, 0x01];
+    assert!(KeyUsage::parse(&value).is_err());
+}
+
+#[test]
+fn key_usage_decipher_only_bit_honored() {
+    // BIT STRING, 7 unused, content {0x00, 0x80}: only bit 8 (decipherOnly) set.
+    let value = [0x03u8, 0x03, 0x07, 0x00, 0x80];
+    let ku = KeyUsage::parse(&value).unwrap();
+    assert_eq!(ku.raw_bits(), KeyUsage::DECIPHER_ONLY);
+}
+
+#[test]
 fn key_usage_bits_decode() {
     let der = make_cert(|p| {
         p.is_ca = rcgen::IsCa::NoCa;

@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use crate::cert::{
     BasicConstraints, Cert, ExtensionIter, GeneralName, KeyUsage, OID_EKU_SERVER_AUTH,
     OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE, OID_EXT_SAN,
-    SubjectPublicKeyInfo, VerifyError,
+    SubjectPublicKeyInfo, VerifyError, is_handled_ext,
 };
 use crate::hostname::Hostname;
 use crate::time::UnixTime;
@@ -21,9 +21,11 @@ pub enum ChainError {
     NoKeyCertSign,
     PathLenExceeded,
     NotEndEntity,
+    IssuerSubjectMismatch,
     NoServerAuth,
     HostnameMismatch,
     NoTrustAnchor,
+    UnhandledCriticalExtension,
     Verify(VerifyError),
     Parse,
 }
@@ -73,6 +75,7 @@ impl Chain {
 
         for c in chain {
             Self::check_validity(c, now)?;
+            Self::check_critical_extensions(c)?;
         }
 
         let leaf = &chain[0];
@@ -90,6 +93,9 @@ impl Chain {
                 return Err(ChainError::NoTrustAnchor);
             }
             let issuer = &chain[i + 1];
+            if subject.issuer_der != issuer.subject_der {
+                return Err(ChainError::IssuerSubjectMismatch);
+            }
             Self::check_issuer_is_ca(issuer)?;
             Self::check_path_len(issuer, i)?;
             subject.verify_signature(&issuer.spki)?;
@@ -105,6 +111,17 @@ impl Chain {
         }
         if now > na {
             return Err(ChainError::Expired);
+        }
+        Ok(())
+    }
+
+    fn check_critical_extensions(c: &Cert<'_>) -> Result<(), ChainError> {
+        let exts = c.extensions_der.unwrap_or(&[]);
+        for ext in ExtensionIter::new(exts) {
+            let ext = ext?;
+            if ext.critical && !is_handled_ext(ext.oid) {
+                return Err(ChainError::UnhandledCriticalExtension);
+            }
         }
         Ok(())
     }

@@ -1,4 +1,7 @@
-use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{
+    BasicConstraints as RcgenBasicConstraints, CertificateParams, CustomExtension,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+};
 
 use shin::cert::Cert;
 use shin::chain::{Chain, ChainError, TrustAnchor};
@@ -147,6 +150,91 @@ fn rejects_missing_server_auth_eku() {
     assert_eq!(
         Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
         ChainError::NoServerAuth
+    );
+}
+
+fn leaf_with_custom_ext(critical: bool) -> Vec<u8> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec!["host.local".into()]).unwrap();
+    params.is_ca = IsCa::NoCa;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let mut ext =
+        CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 99999, 1], vec![0x05, 0x00]);
+    ext.set_criticality(critical);
+    params.custom_extensions = vec![ext];
+    params.self_signed(&key).unwrap().der().to_vec()
+}
+
+#[test]
+fn rejects_unknown_critical_extension() {
+    let der = leaf_with_custom_ext(true);
+    let cert = Cert::parse(&der).unwrap();
+    let now = now_for(&cert);
+    let chain = [cert.clone()];
+    let anchors = [TrustAnchor::from_cert(&cert)];
+    assert_eq!(
+        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        ChainError::UnhandledCriticalExtension
+    );
+}
+
+#[test]
+fn accepts_unknown_noncritical_extension() {
+    let der = leaf_with_custom_ext(false);
+    let cert = Cert::parse(&der).unwrap();
+    let now = now_for(&cert);
+    let chain = [cert.clone()];
+    let anchors = [TrustAnchor::from_cert(&cert)];
+    Chain::validate(&chain, &anchors, now, b"host.local").expect("non-critical unknown ext is ok");
+}
+
+fn ca(cn: &str) -> (CertificateParams, KeyPair, Vec<u8>) {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.is_ca = IsCa::Ca(RcgenBasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let der = params.clone().self_signed(&key).unwrap().der().to_vec();
+    (params, key, der)
+}
+
+fn leaf_signed_by(dns: &str, parent: &(CertificateParams, KeyPair, Vec<u8>)) -> Vec<u8> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec![dns.to_string()]).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, dns);
+    params.is_ca = IsCa::NoCa;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let issuer = Issuer::from_params(&parent.0, &parent.1);
+    params.signed_by(&key, &issuer).unwrap().der().to_vec()
+}
+
+#[test]
+fn rejects_issuer_subject_dn_mismatch() {
+    // Leaf is issued by `real_im`, but the chain presents a different CA
+    // (`wrong_im`, distinct subject DN) in the issuer slot. The anchor is a
+    // separate root whose subject does not match the leaf's issuer, so the
+    // walk reaches chain[1] and the DN linkage check must fire there.
+    let root = ca("root");
+    let real_im = ca("real-im");
+    let wrong_im = ca("wrong-im");
+    let leaf_der = leaf_signed_by("host.local", &real_im);
+
+    let leaf_cert = Cert::parse(&leaf_der).unwrap();
+    let wrong_cert = Cert::parse(&wrong_im.2).unwrap();
+    let root_cert = Cert::parse(&root.2).unwrap();
+    let now = now_for(&leaf_cert);
+
+    let chain = [leaf_cert.clone(), wrong_cert];
+    let anchors = [TrustAnchor::from_cert(&root_cert)];
+    assert_eq!(
+        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        ChainError::IssuerSubjectMismatch
     );
 }
 

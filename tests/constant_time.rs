@@ -21,7 +21,7 @@ fn server_rejects_tampered_client_finished() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing_key = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing_key.pubkey();
+    let server_pubkey = *signing_key.pubkey().unwrap();
 
     let mut server = Server::new(ServerConfig {
         source: CertSource::RawPublicKey { signing_key },

@@ -12,7 +12,7 @@ const TEST_SECRET: [u8; 32] = [
 fn plaintext_round_trip() {
     let body = b"client-hello-bytes";
     let mut buf = Vec::new();
-    PlaintextRecord::encode(ContentType::Handshake, body, &mut buf);
+    PlaintextRecord::encode(ContentType::Handshake, body, &mut buf).unwrap();
     assert_eq!(buf[0], ContentType::Handshake as u8);
     assert_eq!(&buf[1..3], &PROTOCOL_VERSION.to_be_bytes());
     assert_eq!(&buf[3..5], &(body.len() as u16).to_be_bytes());
@@ -28,7 +28,7 @@ fn plaintext_round_trip() {
 fn parse_plaintext_partial_returns_none() {
     let body = b"abc";
     let mut buf = Vec::new();
-    PlaintextRecord::encode(ContentType::Handshake, body, &mut buf);
+    PlaintextRecord::encode(ContentType::Handshake, body, &mut buf).unwrap();
     assert!(PlaintextRecord::parse(&buf[..3]).unwrap().is_none());
     assert!(
         PlaintextRecord::parse(&buf[..buf.len() - 1])
@@ -104,7 +104,9 @@ fn ciphertext_open_rejects_wrong_seq_order() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET);
     let mut opener = Opener::from_secret(&TEST_SECRET);
     let _wire1 = sealer.seal(ContentType::ApplicationData, b"first").unwrap();
-    let mut wire2 = sealer.seal(ContentType::ApplicationData, b"second").unwrap();
+    let mut wire2 = sealer
+        .seal(ContentType::ApplicationData, b"second")
+        .unwrap();
     assert_eq!(
         opener.open(&mut wire2).unwrap_err(),
         RecordError::OpenFailed

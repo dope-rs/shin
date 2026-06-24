@@ -31,6 +31,7 @@ impl Hkdf {
             ctx.update(&[counter]);
             let tag = ctx.sign();
             let block = tag.as_ref();
+            debug_assert_eq!(block.len(), HASH_LEN);
             let take = (out.len() - written).min(block.len());
             out[written..written + take].copy_from_slice(&block[..take]);
             t_prev[..block.len()].copy_from_slice(block);

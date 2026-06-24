@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 
 use crate::codec::{DecodeError, Encode, Reader};
 
+pub const MAX_EXTENSIONS: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtensionType(pub u16);
 
@@ -54,10 +56,15 @@ impl Extension {
     pub fn decode_list(r: &mut Reader<'_>) -> Result<Vec<Self>, DecodeError> {
         let mut sub = r.sub_u16()?;
         let mut out: Vec<Self> = Vec::new();
+        let mut seen: Vec<u16> = Vec::new();
         while !sub.is_empty() {
+            if out.len() >= MAX_EXTENSIONS {
+                return Err(DecodeError::InvalidEnum);
+            }
             let ext = Self::decode(&mut sub)?;
-            if out.iter().any(|e| e.ty == ext.ty) {
-                return Err(DecodeError::DuplicateExtension);
+            match seen.binary_search(&ext.ty.0) {
+                Ok(_) => return Err(DecodeError::DuplicateExtension),
+                Err(pos) => seen.insert(pos, ext.ty.0),
             }
             out.push(ext);
         }

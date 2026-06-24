@@ -139,14 +139,14 @@ impl Client {
         {
             extensions.push(Extension::new(
                 ExtensionType::SERVER_NAME,
-                ServerName::encode(hostname),
+                ServerName::encode(hostname)?,
             ));
         }
 
         if !self.config.alpn_protocols.is_empty() {
             extensions.push(Extension::new(
                 ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
-                Alpn::encode(&self.config.alpn_protocols),
+                Alpn::encode(&self.config.alpn_protocols)?,
             ));
         }
 
