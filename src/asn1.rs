@@ -136,6 +136,9 @@ impl<'a> Tlv<'a> {
             return Err(DerError::Underflow);
         }
         let (len_bytes, rest) = after.split_at(n);
+        if len_bytes[0] == 0 {
+            return Err(DerError::BadLength);
+        }
         let mut len = 0usize;
         for &b in len_bytes {
             len = (len << 8) | (b as usize);
@@ -196,10 +199,18 @@ impl<'a> Tlv<'a> {
         out.push(first % 40);
         let mut i = 1;
         while i < contents.len() {
+            if contents[i] == 0x80 {
+                return Err(DerError::BadOid);
+            }
             let mut value: u32 = 0;
+            let mut bits = 0u32;
             loop {
                 let b = contents[i];
                 i += 1;
+                bits += 7;
+                if bits > 32 {
+                    return Err(DerError::BadOid);
+                }
                 value = (value << 7) | ((b & 0x7f) as u32);
                 if b & 0x80 == 0 {
                     break;

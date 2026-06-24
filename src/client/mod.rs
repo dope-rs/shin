@@ -186,7 +186,10 @@ impl Client {
 
         if let Some(r) = &resumption {
             let n = ch_bytes.len();
-            let partial = &ch_bytes[..n - 32];
+            // RFC 8446 §4.2.11.2: binder covers the CH minus the binders field
+            // (list_len 2 + binder_len 1 + binder 32).
+            const BINDERS_FIELD_LEN: usize = 2 + 1 + 32;
+            let partial = &ch_bytes[..n - BINDERS_FIELD_LEN];
             let mut t = Transcript::new();
             t.update(partial);
             let partial_hash = t.hash();
@@ -317,6 +320,12 @@ impl Client {
     ) -> Result<(), Error> {
         if sh.cipher_suite != SUITE_AES_128_GCM_SHA256 {
             return Err(Error::UnsupportedCipherSuite);
+        }
+        const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
+        const DOWNGRADE_TLS11: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
+        let tail = &sh.random[RANDOM_LEN - 8..];
+        if tail == DOWNGRADE_TLS12 || tail == DOWNGRADE_TLS11 {
+            return Err(Error::DowngradeDetected);
         }
         let sv_data = sh
             .extensions
@@ -509,7 +518,7 @@ impl Client {
 
         let h_pre_sf = self.transcript.hash();
         let expected = FinishedProto::verify_data(&s_hs, &h_pre_sf);
-        if sf.verify_data.as_slice() != expected {
+        if !crate::ct_eq(sf.verify_data.as_slice(), &expected) {
             return Err(Error::BadFinished);
         }
         self.transcript.update(raw);

@@ -28,6 +28,14 @@ mod proto;
 pub mod client;
 pub mod server;
 
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Epoch {
     Plaintext,
@@ -83,6 +91,7 @@ pub enum Error {
     UnsupportedGroup,
     UnsupportedSigScheme,
     BadVersion,
+    DowngradeDetected,
     MissingExtension,
     KeyShareNotFound,
     BadCertificate,

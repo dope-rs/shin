@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use ring::rand::{SecureRandom, SystemRandom};
@@ -27,6 +28,35 @@ pub struct Config {
     pub alpn_protocols: Vec<Vec<u8>>,
     pub ticket_secret: Option<[u8; 32]>,
     pub accept_early_data: bool,
+}
+
+/// Embedder-supplied clock + replay store that makes 0-RTT early data safe.
+///
+/// Without a guard the server refuses early data even when `accept_early_data`
+/// is set: neither the freshness window nor the single-use check can run
+/// (RFC 8446 §8).
+pub trait EarlyDataGuard {
+    /// Milliseconds since the UNIX epoch.
+    fn now_ms(&self) -> u64;
+
+    /// Record a single-use token (the PSK binder); `false` means it was already
+    /// seen — a replay. Tokens need only be kept for `TICKET_LIFETIME_SECS`.
+    fn register(&mut self, token: &[u8]) -> bool;
+}
+
+/// Allowed skew between client-claimed and server-measured ticket age (RFC 8446 §8.2).
+const MAX_TICKET_AGE_SKEW_MS: u64 = 10_000;
+
+/// NewSessionTicket lifetime and upper bound of the 0-RTT freshness window.
+const TICKET_LIFETIME_SECS: u32 = 7200;
+const TICKET_LIFETIME_MS: u64 = TICKET_LIFETIME_SECS as u64 * 1000;
+
+struct AcceptedPsk {
+    psk: [u8; 32],
+    age_add: u32,
+    issued_at_ms: u64,
+    obfuscated_ticket_age: u32,
+    binder: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -67,6 +97,7 @@ pub struct Server {
     s_ap_traffic: Option<[u8; 32]>,
     selected_alpn: Option<Vec<u8>>,
     master: Option<KeySchedule>,
+    early_data_guard: Option<Box<dyn EarlyDataGuard>>,
 }
 
 impl Server {
@@ -82,7 +113,13 @@ impl Server {
             s_ap_traffic: None,
             selected_alpn: None,
             master: None,
+            early_data_guard: None,
         }
+    }
+
+    /// Install the [`EarlyDataGuard`]; required before any 0-RTT data is accepted.
+    pub fn set_early_data_guard(&mut self, guard: Box<dyn EarlyDataGuard>) {
+        self.early_data_guard = Some(guard);
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
@@ -237,14 +274,18 @@ impl Server {
             .extensions
             .iter()
             .any(|e| e.ty == ExtensionType::EARLY_DATA);
-        let early_accepted =
-            self.config.accept_early_data && psk_accepted.is_some() && client_offered_early;
+        let early_accepted = self.config.accept_early_data
+            && client_offered_early
+            && match psk_accepted.as_ref() {
+                Some(p) => self.check_early_data_replay(p),
+                None => false,
+            };
 
         self.transcript.update(raw);
 
-        if let (Some(psk), true) = (psk_accepted.as_ref(), early_accepted) {
+        if let (Some(p), true) = (psk_accepted.as_ref(), early_accepted) {
             let zero = [0u8; 32];
-            let early_secret = crate::kdf::Hkdf::extract(&zero, psk);
+            let early_secret = crate::kdf::Hkdf::extract(&zero, &p.psk);
             let h_ch = self.transcript.hash();
             let cets = crate::kdf::Hkdf::derive_secret(&early_secret, "c e traffic", &h_ch);
             events.push(Event::ZeroRttKeysReady { secret: cets });
@@ -291,7 +332,7 @@ impl Server {
 
         let dhe = server_eph.agree(&peer_pubkey).map_err(|_| Error::Kx)?;
         let ks_handshake = match &psk_accepted {
-            Some(psk) => KeySchedule::new_psk(psk).into_handshake(&dhe),
+            Some(p) => KeySchedule::new_psk(&p.psk).into_handshake(&dhe),
             None => KeySchedule::new().into_handshake(&dhe),
         };
         let h_chsh = self.transcript.hash();
@@ -432,7 +473,7 @@ impl Server {
         Ok(())
     }
 
-    fn try_accept_psk(&self, ch: &ClientHello, raw: &[u8]) -> Option<[u8; 32]> {
+    fn try_accept_psk(&self, ch: &ClientHello, raw: &[u8]) -> Option<AcceptedPsk> {
         let secret = self.config.ticket_secret?;
         let kx_ext = ch
             .extensions
@@ -452,21 +493,49 @@ impl Server {
         if bind.len() != 32 {
             return None;
         }
-        let (psk, _age_add) = crate::ticket::TicketSecret::new(secret)
+        let (psk, age_add, issued_at_ms) = crate::ticket::TicketSecret::new(secret)
             .decrypt(&id.identity)
             .ok()?;
         let n = raw.len();
-        if n < 32 {
+        // RFC 8446 §4.2.11.2: strip the binders field (list_len 2 + binder_len 1 + binder).
+        let binders_field = 2 + 1 + bind.len();
+        if n < binders_field {
             return None;
         }
         let mut t = Transcript::new();
-        t.update(&raw[..n - 32]);
+        t.update(&raw[..n - binders_field]);
         let partial_hash = t.hash();
         let expected = crate::psk::ResumptionBinder::compute(&psk, &partial_hash);
-        if expected.as_slice() != bind.as_slice() {
+        if !crate::ct_eq(expected.as_slice(), bind.as_slice()) {
             return None;
         }
-        Some(psk)
+        Some(AcceptedPsk {
+            psk,
+            age_add,
+            issued_at_ms,
+            obfuscated_ticket_age: id.obfuscated_ticket_age,
+            binder: bind.clone(),
+        })
+    }
+
+    // 0-RTT requires a guard, a fresh-enough ticket, and a non-replayed binder.
+    fn check_early_data_replay(&mut self, p: &AcceptedPsk) -> bool {
+        let Some(guard) = self.early_data_guard.as_mut() else {
+            return false;
+        };
+        let now = guard.now_ms();
+        if now < p.issued_at_ms {
+            return false;
+        }
+        let measured_age = now - p.issued_at_ms;
+        if measured_age > TICKET_LIFETIME_MS {
+            return false;
+        }
+        let claimed_age = p.obfuscated_ticket_age.wrapping_sub(p.age_add) as u64;
+        if measured_age.abs_diff(claimed_age) > MAX_TICKET_AGE_SKEW_MS {
+            return false;
+        }
+        guard.register(&p.binder)
     }
 
     fn handle_client_finished(
@@ -478,7 +547,7 @@ impl Server {
         let expected = self
             .expected_client_finished
             .ok_or(Error::UnexpectedMessage)?;
-        if f.verify_data.as_slice() != expected {
+        if !crate::ct_eq(f.verify_data.as_slice(), &expected) {
             return Err(Error::BadFinished);
         }
         self.transcript.update(raw);
@@ -504,11 +573,12 @@ impl Server {
         self.rng.fill(&mut age_add_bytes).map_err(|_| Error::Rng)?;
         let age_add = u32::from_be_bytes(age_add_bytes);
         let psk = crate::schedule::ResumptionMaster::new(rms).psk(&nonce);
+        let issued_at_ms = self.early_data_guard.as_ref().map_or(0, |g| g.now_ms());
         let ticket = crate::ticket::TicketSecret::new(ticket_secret)
-            .encrypt(&psk, age_add, &self.rng)
+            .encrypt(&psk, age_add, issued_at_ms, &self.rng)
             .map_err(|_| Error::Rng)?;
         let nst = NewSessionTicket {
-            ticket_lifetime: 7200,
+            ticket_lifetime: TICKET_LIFETIME_SECS,
             ticket_age_add: age_add,
             ticket_nonce: nonce.to_vec(),
             ticket,

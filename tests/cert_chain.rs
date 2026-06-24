@@ -18,10 +18,37 @@ fn self_signed_leaf(dns: &[&str]) -> Vec<u8> {
     params.self_signed(&key).unwrap().der().to_vec()
 }
 
+fn self_signed_ip_leaf(ip: &str) -> Vec<u8> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ip-leaf");
+    params.is_ca = IsCa::NoCa;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.subject_alt_names = vec![rcgen::SanType::IpAddress(ip.parse().unwrap())];
+    params.self_signed(&key).unwrap().der().to_vec()
+}
+
 fn now_for(leaf: &Cert<'_>) -> UnixTime {
     let nb = UnixTime::from_time_value(&leaf.validity.not_before).unwrap();
     let na = UnixTime::from_time_value(&leaf.validity.not_after).unwrap();
     UnixTime((nb.0 + na.0) / 2)
+}
+
+#[test]
+fn validates_self_signed_leaf_with_ipv6_san() {
+    let der = self_signed_ip_leaf("2001:db8::1");
+    let cert = Cert::parse(&der).unwrap();
+    let now = now_for(&cert);
+    let chain = [cert.clone()];
+    let anchors = [TrustAnchor::from_cert(&cert)];
+    Chain::validate(&chain, &anchors, now, b"2001:db8::1").expect("ipv6 SAN matches");
+    assert_eq!(
+        Chain::validate(&chain, &anchors, now, b"2001:db8::2").unwrap_err(),
+        ChainError::HostnameMismatch,
+    );
 }
 
 #[test]

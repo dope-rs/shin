@@ -65,6 +65,14 @@ fn time_ordering_compares() {
 }
 
 #[test]
+fn leap_second_rejected() {
+    // RFC 5280: seconds are 00..=59, so sec == 60 must be rejected.
+    assert!(UnixTime::from_time_value(&utc_time(b"201231235960Z")).is_err());
+    assert!(UnixTime::from_time_value(&gen_time(b"20201231235960Z")).is_err());
+    assert!(UnixTime::from_time_value(&utc_time(b"201231235959Z")).is_ok());
+}
+
+#[test]
 fn leap_year_handled() {
     let jan1 = UnixTime::from_time_value(&utc_time(b"000101000000Z")).unwrap();
     let mar1 = UnixTime::from_time_value(&utc_time(b"000301000000Z")).unwrap();

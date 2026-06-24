@@ -142,3 +142,31 @@ fn underflow_when_length_exceeds_buffer() {
     let bytes = [0x04, 0x05, 0x01, 0x02];
     assert_eq!(Reader::new(&bytes).next().unwrap_err(), DerError::Underflow);
 }
+
+#[test]
+fn long_form_leading_zero_length_rejected() {
+    let mut bytes = vec![0x04, 0x82, 0x00, 0xff];
+    bytes.extend(std::iter::repeat_n(0xaa, 0xff));
+    assert_eq!(Reader::new(&bytes).next().unwrap_err(), DerError::BadLength);
+}
+
+#[test]
+fn oid_non_minimal_subidentifier_rejected() {
+    let oid = [0x06, 0x03, 0x2a, 0x80, 0x01];
+    let (tlv, _) = Tlv::parse_one(&oid).unwrap();
+    assert_eq!(Tlv::oid(tlv.contents).unwrap_err(), DerError::BadOid);
+}
+
+#[test]
+fn oid_subidentifier_overflow_rejected() {
+    let oid = [0x06, 0x07, 0x2a, 0x90, 0x80, 0x80, 0x80, 0x80, 0x00];
+    let (tlv, _) = Tlv::parse_one(&oid).unwrap();
+    assert_eq!(Tlv::oid(tlv.contents).unwrap_err(), DerError::BadOid);
+}
+
+#[test]
+fn truncated_oid_continuation_rejected() {
+    let oid = [0x06, 0x02, 0x2a, 0x80];
+    let (tlv, _) = Tlv::parse_one(&oid).unwrap();
+    assert_eq!(Tlv::oid(tlv.contents).unwrap_err(), DerError::BadOid);
+}

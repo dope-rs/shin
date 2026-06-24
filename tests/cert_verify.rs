@@ -43,7 +43,7 @@ fn verify_self_signed_ed25519() {
 #[test]
 fn tampered_signature_rejected() {
     let der = self_signed(&PKCS_ECDSA_P256_SHA256, "tamper.local");
-    let cert = Cert::parse(&der).unwrap();
+    Cert::parse(&der).unwrap();
     let mut hacked = der.clone();
     let last = hacked.len() - 1;
     hacked[last] ^= 0x01;

@@ -1,10 +1,46 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
 use shin::extension::ExtensionType;
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, Server};
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
+
+// Fixed clock so the measured ticket age is ~0 in happy-path tests.
+const NOW_MS: u64 = 1_700_000_000_000;
+
+// Fixed-clock guard; clones share one strike list so two servers can model a replay.
+#[derive(Clone)]
+struct TestGuard {
+    now: u64,
+    seen: Rc<RefCell<Vec<Vec<u8>>>>,
+}
+
+impl TestGuard {
+    fn new(now: u64) -> Self {
+        Self {
+            now,
+            seen: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+}
+
+impl EarlyDataGuard for TestGuard {
+    fn now_ms(&self) -> u64 {
+        self.now
+    }
+    fn register(&mut self, token: &[u8]) -> bool {
+        let mut seen = self.seen.borrow_mut();
+        if seen.iter().any(|t| t.as_slice() == token) {
+            return false;
+        }
+        seen.push(token.to_vec());
+        true
+    }
+}
 
 fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x99u8; 32]).unwrap()
@@ -50,6 +86,8 @@ fn client(resumption: Option<Resumption>, enable_early_data: bool) -> Client {
 
 fn first_handshake_ticket() -> Resumption {
     let mut s = server(false);
+    // Issue with a guard so the ticket carries a real issued-at timestamp.
+    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -124,6 +162,7 @@ fn server_accepts_early_data_emits_matching_cets_and_ee_ext() {
 
     let mut c = client(Some(resumption), true);
     let mut s = server(true);
+    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
 
     let c1 = c.start().unwrap();
     let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -166,4 +205,54 @@ fn server_with_accept_off_skips_cets_even_with_offer() {
         cets(&s1).is_none(),
         "server didn't enable accept_early_data"
     );
+}
+
+#[test]
+fn server_without_guard_refuses_early_data() {
+    // accept_early_data = true but no guard: must still refuse.
+    let resumption = first_handshake_ticket();
+    let mut c = client(Some(resumption), true);
+    let mut s = server(true); // deliberately no set_early_data_guard
+    let c1 = c.start().unwrap();
+    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
+    assert!(cets(&s1).is_none(), "no guard => early data refused");
+}
+
+#[test]
+fn replayed_early_data_is_rejected() {
+    // Same ClientHello to two servers sharing a strike list: the 2nd is a replay.
+    let resumption = first_handshake_ticket();
+    let guard = TestGuard::new(NOW_MS);
+
+    let mut c = client(Some(resumption), true);
+    let c1 = c.start().unwrap();
+    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+
+    let mut s1 = server(true);
+    s1.set_early_data_guard(Box::new(guard.clone()));
+    let out1 = s1.read(Epoch::Plaintext, &ch).unwrap();
+    assert!(cets(&out1).is_some(), "first use accepts early data");
+
+    let mut s2 = server(true);
+    s2.set_early_data_guard(Box::new(guard.clone()));
+    let out2 = s2.read(Epoch::Plaintext, &ch).unwrap();
+    assert!(
+        cets(&out2).is_none(),
+        "replayed binder => early data refused"
+    );
+}
+
+#[test]
+fn stale_ticket_outside_freshness_window_rejected() {
+    let resumption = first_handshake_ticket();
+    let mut c = client(Some(resumption), true);
+    let c1 = c.start().unwrap();
+    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+
+    // Server clock far ahead of issued-at; client claims age ~0 -> exceeds skew.
+    let mut s = server(true);
+    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS + 60_000)));
+    let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
+    assert!(cets(&s1).is_none(), "stale ticket => early data refused");
 }

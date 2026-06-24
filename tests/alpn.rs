@@ -168,10 +168,10 @@ fn drive_handshake(client: &mut Client, server: &mut Server) {
 fn take_send(evs: Vec<Event>, epoch: Epoch) -> Vec<u8> {
     let mut out = Vec::new();
     for e in evs {
-        if let Event::Send { epoch: ep, data } = e {
-            if ep == epoch {
-                out.extend(data);
-            }
+        if let Event::Send { epoch: ep, data } = e
+            && ep == epoch
+        {
+            out.extend(data);
         }
     }
     out

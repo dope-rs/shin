@@ -9,7 +9,8 @@ const TICKET_NONCE_LEN: usize = 12;
 const TICKET_TAG_LEN: usize = 16;
 const PSK_LEN: usize = 32;
 const AGE_ADD_LEN: usize = 4;
-const PLAINTEXT_LEN: usize = PSK_LEN + AGE_ADD_LEN;
+const ISSUED_AT_LEN: usize = 8;
+const PLAINTEXT_LEN: usize = PSK_LEN + AGE_ADD_LEN + ISSUED_AT_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketError {
@@ -37,6 +38,7 @@ impl TicketSecret {
         &self,
         psk: &[u8; PSK_LEN],
         age_add: u32,
+        issued_at_ms: u64,
         rng: &dyn SecureRandom,
     ) -> Result<Vec<u8>, TicketError> {
         let key = self.aead_key()?;
@@ -48,6 +50,7 @@ impl TicketSecret {
         let mut buf = Vec::with_capacity(PLAINTEXT_LEN + TICKET_TAG_LEN);
         buf.extend_from_slice(psk);
         buf.extend_from_slice(&age_add.to_be_bytes());
+        buf.extend_from_slice(&issued_at_ms.to_be_bytes());
         key.seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut buf)
             .map_err(|_| TicketError::BadAuth)?;
 
@@ -57,7 +60,7 @@ impl TicketSecret {
         Ok(out)
     }
 
-    pub fn decrypt(&self, ticket: &[u8]) -> Result<([u8; PSK_LEN], u32), TicketError> {
+    pub fn decrypt(&self, ticket: &[u8]) -> Result<([u8; PSK_LEN], u32, u64), TicketError> {
         if ticket.len() != TICKET_NONCE_LEN + PLAINTEXT_LEN + TICKET_TAG_LEN {
             return Err(TicketError::BadFormat);
         }
@@ -76,7 +79,13 @@ impl TicketSecret {
         let mut psk = [0u8; PSK_LEN];
         psk.copy_from_slice(&plain[..PSK_LEN]);
         let mut age_bytes = [0u8; AGE_ADD_LEN];
-        age_bytes.copy_from_slice(&plain[PSK_LEN..]);
-        Ok((psk, u32::from_be_bytes(age_bytes)))
+        age_bytes.copy_from_slice(&plain[PSK_LEN..PSK_LEN + AGE_ADD_LEN]);
+        let mut issued_bytes = [0u8; ISSUED_AT_LEN];
+        issued_bytes.copy_from_slice(&plain[PSK_LEN + AGE_ADD_LEN..]);
+        Ok((
+            psk,
+            u32::from_be_bytes(age_bytes),
+            u64::from_be_bytes(issued_bytes),
+        ))
     }
 }

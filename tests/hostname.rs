@@ -22,19 +22,43 @@ fn wildcard_matches_one_label() {
 }
 
 #[test]
-fn wildcard_with_prefix_or_suffix() {
-    assert!(Hostname::dns_matches(
+fn partial_label_wildcards_rejected() {
+    // Hardened: only a full single-label "*" is a valid wildcard.
+    assert!(!Hostname::dns_matches(
         b"foo*.example.com",
         b"foobar.example.com"
     ));
-    assert!(Hostname::dns_matches(
+    assert!(!Hostname::dns_matches(
         b"*bar.example.com",
         b"foobar.example.com"
     ));
     assert!(!Hostname::dns_matches(
-        b"foo*.example.com",
+        b"f*o.example.com",
         b"foo.example.com"
     ));
+}
+
+#[test]
+fn embedded_nul_rejected() {
+    assert!(!Hostname::dns_matches(
+        b"example.com\0.evil.com",
+        b"example.com"
+    ));
+    assert!(!Hostname::dns_matches(
+        b"example.com",
+        b"example.com\0.evil.com"
+    ));
+    assert!(!Hostname::dns_matches(b"exam\0ple.com", b"exam\0ple.com"));
+}
+
+#[test]
+fn malformed_names_rejected() {
+    assert!(!Hostname::dns_matches(b"", b""));
+    assert!(!Hostname::dns_matches(b".example.com", b".example.com"));
+    assert!(!Hostname::dns_matches(b"a..com", b"a..com"));
+    assert!(!Hostname::dns_matches(b"*.*.com", b"a.b.com"));
+    assert!(!Hostname::dns_matches(b"*", b"example"));
+    assert!(!Hostname::dns_matches(b"*.com", b".com"));
 }
 
 #[test]

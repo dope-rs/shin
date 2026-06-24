@@ -71,7 +71,7 @@ impl UnixTime {
             || !(1..=31).contains(&day)
             || hour > 23
             || min > 59
-            || sec > 60
+            || sec > 59
         {
             return Err(CertError::BadValidity);
         }

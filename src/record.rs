@@ -40,6 +40,7 @@ pub enum RecordError {
     OpenFailed,
     AllZeroInner,
     NotCipherTextOuter,
+    SeqExhausted,
 }
 
 #[derive(Debug, Clone)]
@@ -98,13 +99,22 @@ impl Sealer {
         self.seq
     }
 
-    pub fn seal(&mut self, inner_type: ContentType, body: &[u8]) -> Vec<u8> {
+    pub fn seal(&mut self, inner_type: ContentType, body: &[u8]) -> Result<Vec<u8>, RecordError> {
+        if body.len() > MAX_PLAINTEXT_BODY {
+            return Err(RecordError::BodyTooLarge);
+        }
+        if self.seq == u64::MAX {
+            return Err(RecordError::SeqExhausted);
+        }
+
         let mut inner = Vec::with_capacity(body.len() + 1);
         inner.extend_from_slice(body);
         inner.push(inner_type as u8);
 
         let outer_body_len = inner.len() + AEAD_TAG_LEN;
-        assert!(outer_body_len <= MAX_CIPHERTEXT_BODY);
+        if outer_body_len > MAX_CIPHERTEXT_BODY {
+            return Err(RecordError::BodyTooLarge);
+        }
 
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.push(ContentType::ApplicationData as u8);
@@ -119,7 +129,7 @@ impl Sealer {
         let mut out = Vec::with_capacity(HEADER_LEN + ct_with_tag.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(&ct_with_tag);
-        out
+        Ok(out)
     }
 }
 
@@ -160,6 +170,9 @@ impl Opener {
         if outer_type != ContentType::ApplicationData as u8 {
             return Err(RecordError::NotCipherTextOuter);
         }
+        if self.seq == u64::MAX {
+            return Err(RecordError::SeqExhausted);
+        }
 
         let mut aad = [0u8; HEADER_LEN];
         aad.copy_from_slice(&input[..HEADER_LEN]);
@@ -184,5 +197,41 @@ impl Opener {
         let plaintext_start = HEADER_LEN;
         let plaintext_end = HEADER_LEN + inner_type_pos;
         Ok(Some((inner_type, plaintext_start..plaintext_end, total)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: [u8; 32] = [0x42u8; 32];
+
+    #[test]
+    fn seal_refuses_at_seq_max() {
+        let mut sealer = Sealer::from_secret(&SECRET);
+        sealer.seq = u64::MAX;
+        assert_eq!(
+            sealer.seal(ContentType::ApplicationData, b"x"),
+            Err(RecordError::SeqExhausted)
+        );
+    }
+
+    #[test]
+    fn open_refuses_at_seq_max() {
+        let mut sealer = Sealer::from_secret(&SECRET);
+        let mut wire = sealer.seal(ContentType::ApplicationData, b"x").unwrap();
+        let mut opener = Opener::from_secret(&SECRET);
+        opener.seq = u64::MAX;
+        assert_eq!(opener.open(&mut wire), Err(RecordError::SeqExhausted));
+    }
+
+    #[test]
+    fn seal_refuses_oversize_body() {
+        let mut sealer = Sealer::from_secret(&SECRET);
+        let big = alloc::vec![0u8; MAX_PLAINTEXT_BODY + 1];
+        assert_eq!(
+            sealer.seal(ContentType::ApplicationData, &big),
+            Err(RecordError::BodyTooLarge)
+        );
     }
 }

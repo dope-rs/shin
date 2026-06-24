@@ -53,9 +53,13 @@ impl Extension {
 
     pub fn decode_list(r: &mut Reader<'_>) -> Result<Vec<Self>, DecodeError> {
         let mut sub = r.sub_u16()?;
-        let mut out = Vec::new();
+        let mut out: Vec<Self> = Vec::new();
         while !sub.is_empty() {
-            out.push(Self::decode(&mut sub)?);
+            let ext = Self::decode(&mut sub)?;
+            if out.iter().any(|e| e.ty == ext.ty) {
+                return Err(DecodeError::DuplicateExtension);
+            }
+            out.push(ext);
         }
         Ok(out)
     }
