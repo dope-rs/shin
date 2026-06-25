@@ -87,6 +87,75 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
     );
 }
 
+/// RFC 8446 §4.2.11.2: the binder covers the ClientHello truncated at the start
+/// of `binders`, i.e. len - (2 list-len + 1 binder-len + 32) = len - 35 for one
+/// SHA-256 binder. A naive len - 32 is off by 3 and breaks interop.
+#[test]
+fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
+    use shin::hash::Transcript;
+    use shin::psk::ResumptionBinder;
+
+    let psk = [0x99u8; 32];
+    let resumption = Resumption {
+        psk,
+        ticket: vec![0x5A; 48],
+        ticket_age_add: 7,
+        age_millis: 1_000,
+    };
+
+    let mut c = Client::new(Config {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: [0x42u8; 32],
+        },
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        resumption: Some(resumption.clone()),
+        enable_early_data: false,
+    });
+    let ch_bytes = c
+        .start()
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e {
+            Event::Send {
+                epoch: Epoch::Plaintext,
+                data,
+            } => Some(data),
+            _ => None,
+        })
+        .unwrap();
+
+    let ch = match Handshake::decode(&mut Reader::new(&ch_bytes)).unwrap() {
+        Handshake::ClientHello(ch) => ch,
+        _ => panic!(),
+    };
+    let on_wire_binder = {
+        let psk_ext = ch
+            .extensions
+            .iter()
+            .find(|e| e.ty == ExtensionType::PRE_SHARED_KEY)
+            .unwrap();
+        Offer::decode(&psk_ext.data).unwrap().1[0].clone()
+    };
+
+    let n = ch_bytes.len();
+
+    let mut t_ok = Transcript::new();
+    t_ok.update(&ch_bytes[..n - 35]);
+    let expected = ResumptionBinder::compute(&psk, &t_ok.hash());
+    assert_eq!(
+        on_wire_binder,
+        expected.to_vec(),
+        "binder must cover len-35"
+    );
+
+    // len-32 (off by 3) must NOT match.
+    let mut t_bad = Transcript::new();
+    t_bad.update(&ch_bytes[..n - 32]);
+    let wrong = ResumptionBinder::compute(&psk, &t_bad.hash());
+    assert_ne!(on_wire_binder, wrong.to_vec());
+}
+
 #[test]
 fn pre_shared_key_is_last_extension() {
     let ch = drive_ch(Some(Resumption {

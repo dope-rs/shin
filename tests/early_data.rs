@@ -274,6 +274,26 @@ fn stale_ticket_outside_freshness_window_rejected() {
 }
 
 #[test]
+fn early_data_rejected_when_claimed_ticket_age_is_implausible() {
+    // RFC 8446 §8.2: claimed ticket age must be within skew of the measured age.
+    let mut resumption = first_handshake_ticket();
+    resumption.age_millis = 3_600_000;
+    let mut c = client(Some(resumption), true);
+    let c1 = c.start().unwrap();
+    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+
+    let mut s = server(true);
+    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
+    let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
+    assert!(
+        cets(&s1).is_none(),
+        "implausible claimed ticket age must reject 0-RTT"
+    );
+    // 1-RTT resumption still proceeds: the binder itself is valid.
+    assert!(extract_send(&s1, Epoch::Plaintext).is_some());
+}
+
+#[test]
 fn early_data_accepted_when_resumed_alpn_matches() {
     // Sanity: identical ALPN on the issuing and resuming sessions still accepts 0-RTT.
     let resumption = first_handshake_ticket_cfg(alloc_vec(b"h2"), NOW_MS);
