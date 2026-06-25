@@ -84,6 +84,7 @@ pub enum KeyDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     Decode,
     UnexpectedMessage,
@@ -92,6 +93,9 @@ pub enum Error {
     UnsupportedSigScheme,
     BadVersion,
     DowngradeDetected,
+    HelloRetryRequest,
+    UnsolicitedExtension,
+    SigSchemeNotOffered,
     MissingExtension,
     KeyShareNotFound,
     BadCertificate,

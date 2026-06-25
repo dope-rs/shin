@@ -55,6 +55,65 @@ fn validates_self_signed_leaf_with_ipv6_san() {
 }
 
 #[test]
+fn ipv6_san_matches_compressed_reference_forms() {
+    let der = self_signed_ip_leaf("2001:db8::1");
+    let cert = Cert::parse(&der).unwrap();
+    let now = now_for(&cert);
+    let chain = [cert.clone()];
+    let anchors = [TrustAnchor::from_cert(&cert)];
+    for form in [
+        &b"2001:db8::1"[..],
+        &b"2001:0db8:0000:0000:0000:0000:0000:0001"[..],
+        &b"2001:db8:0:0:0:0:0:1"[..],
+    ] {
+        Chain::validate(&chain, &anchors, now, form)
+            .unwrap_or_else(|_| panic!("form {:?} should match", core::str::from_utf8(form)));
+    }
+}
+
+#[test]
+fn ipv6_san_rejects_dns_reference_and_vice_versa() {
+    let ip_der = self_signed_ip_leaf("2001:db8::1");
+    let ip_cert = Cert::parse(&ip_der).unwrap();
+    let ip_now = now_for(&ip_cert);
+    let ip_chain = [ip_cert.clone()];
+    let ip_anchors = [TrustAnchor::from_cert(&ip_cert)];
+    assert_eq!(
+        Chain::validate(&ip_chain, &ip_anchors, ip_now, b"example.com").unwrap_err(),
+        ChainError::HostnameMismatch
+    );
+
+    let dns_der = self_signed_leaf(&["host.local"]);
+    let dns_cert = Cert::parse(&dns_der).unwrap();
+    let dns_now = now_for(&dns_cert);
+    let dns_chain = [dns_cert.clone()];
+    let dns_anchors = [TrustAnchor::from_cert(&dns_cert)];
+    assert_eq!(
+        Chain::validate(&dns_chain, &dns_anchors, dns_now, b"2001:db8::1").unwrap_err(),
+        ChainError::HostnameMismatch
+    );
+}
+
+#[test]
+fn ipv4_mapped_and_distinct_ipv6_do_not_collide() {
+    let der = self_signed_ip_leaf("2001:db8::1");
+    let cert = Cert::parse(&der).unwrap();
+    let now = now_for(&cert);
+    let chain = [cert.clone()];
+    let anchors = [TrustAnchor::from_cert(&cert)];
+    // A different address whose textual prefix overlaps must not match.
+    assert_eq!(
+        Chain::validate(&chain, &anchors, now, b"2001:db8::1:0").unwrap_err(),
+        ChainError::HostnameMismatch
+    );
+    // Garbage that is neither a valid IP nor a DNS label must not match.
+    assert_eq!(
+        Chain::validate(&chain, &anchors, now, b"2001:db8::zz").unwrap_err(),
+        ChainError::HostnameMismatch
+    );
+}
+
+#[test]
 fn validates_self_signed_leaf_with_dns_san() {
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
@@ -102,6 +161,27 @@ fn rejects_expired_cert() {
     let beyond = UnixTime(na.0 + 60);
     assert_eq!(
         Chain::validate(&chain, &anchors, beyond, b"host.local").unwrap_err(),
+        ChainError::Expired
+    );
+}
+
+#[test]
+fn validity_boundaries_are_inclusive() {
+    // RFC 5280 §4.1.2.5: notBefore and notAfter are both inclusive.
+    let der = self_signed_leaf(&["host.local"]);
+    let cert = Cert::parse(&der).unwrap();
+    let nb = UnixTime::from_time_value(&cert.validity.not_before).unwrap();
+    let na = UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let chain = [cert.clone()];
+    let anchors = [TrustAnchor::from_cert(&cert)];
+    Chain::validate(&chain, &anchors, nb, b"host.local").expect("notBefore is inclusive");
+    Chain::validate(&chain, &anchors, na, b"host.local").expect("notAfter is inclusive");
+    assert_eq!(
+        Chain::validate(&chain, &anchors, UnixTime(nb.0 - 1), b"host.local").unwrap_err(),
+        ChainError::NotYetValid
+    );
+    assert_eq!(
+        Chain::validate(&chain, &anchors, UnixTime(na.0 + 1), b"host.local").unwrap_err(),
         ChainError::Expired
     );
 }

@@ -41,4 +41,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "psk_parse"
+path = "fuzz_targets/psk_parse.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

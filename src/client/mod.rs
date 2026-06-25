@@ -25,6 +25,9 @@ use crate::{Epoch, Error, Event};
 
 mod config;
 
+/// Anti-amplification cap on KeyUpdates accepted per record.
+const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
+
 pub use config::{Config, OwnedTrustAnchor, Resumption, Verifier};
 
 use config::{LeafKey, LeafKeyKind};
@@ -221,9 +224,16 @@ impl Client {
     pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
         let mut events = Vec::new();
         let mut r = Reader::new(data);
+        let mut key_updates = 0u32;
         while !r.is_empty() {
             let snapshot = r.remaining();
             let msg = Handshake::decode(&mut r)?;
+            if matches!(msg, Handshake::KeyUpdate(_)) {
+                key_updates += 1;
+                if key_updates > MAX_KEY_UPDATES_PER_RECORD {
+                    return Err(Error::UnexpectedMessage);
+                }
+            }
             let consumed = snapshot.len() - r.remaining().len();
             let raw = &snapshot[..consumed];
             self.process(epoch, msg, raw, &mut events)?;
@@ -321,6 +331,15 @@ impl Client {
         if sh.cipher_suite != SUITE_AES_128_GCM_SHA256 {
             return Err(Error::UnsupportedCipherSuite);
         }
+        // RFC 8446 §4.1.3: HRR random. We offer only X25519, so any HRR is unsatisfiable.
+        const HRR_RANDOM: [u8; RANDOM_LEN] = [
+            0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
+            0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+            0xc8, 0xa8, 0x33, 0x9c,
+        ];
+        if sh.random == HRR_RANDOM {
+            return Err(Error::HelloRetryRequest);
+        }
         const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
         const DOWNGRADE_TLS11: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
         let tail = &sh.random[RANDOM_LEN - 8..];
@@ -345,6 +364,18 @@ impl Client {
             .data
             .as_slice();
         let server_pubkey = KeyShare::server_decode(ks_data)?;
+
+        // RFC 8446 §4.1.3: only these extensions are legal in ServerHello.
+        for ext in &sh.extensions {
+            if !matches!(
+                ext.ty,
+                ExtensionType::SUPPORTED_VERSIONS
+                    | ExtensionType::KEY_SHARE
+                    | ExtensionType::PRE_SHARED_KEY
+            ) {
+                return Err(Error::UnsolicitedExtension);
+            }
+        }
 
         let psk_selected = sh
             .extensions
@@ -489,11 +520,34 @@ impl Client {
         Ok(())
     }
 
+    fn offered_sig_scheme(&self, scheme: u16) -> bool {
+        use crate::proto::{
+            SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_ED25519,
+            SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512,
+        };
+        match self.config.verifier {
+            Verifier::RawPublicKey { .. } => scheme == SIG_ED25519,
+            Verifier::X509 { .. } => matches!(
+                scheme,
+                SIG_ECDSA_SECP256R1_SHA256
+                    | SIG_ECDSA_SECP384R1_SHA384
+                    | SIG_RSA_PSS_RSAE_SHA256
+                    | SIG_RSA_PSS_RSAE_SHA384
+                    | SIG_RSA_PSS_RSAE_SHA512
+                    | SIG_ED25519
+            ),
+        }
+    }
+
     fn handle_certificate_verify(
         &mut self,
         cv: CertificateVerify,
         raw: &[u8],
     ) -> Result<(), Error> {
+        // RFC 8446 §4.4.3: scheme must be one we advertised in signature_algorithms.
+        if !self.offered_sig_scheme(cv.algorithm) {
+            return Err(Error::SigSchemeNotOffered);
+        }
         let leaf = self
             .server_leaf_key
             .as_ref()
