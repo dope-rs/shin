@@ -24,27 +24,33 @@ fn has_done(events: &[Event]) -> bool {
     events.iter().any(|e| matches!(e, Event::Done))
 }
 
-fn make_pair() -> (Client, Server) {
+fn make_pair() -> (Client<fn() -> u64>, Server<fn() -> u64>) {
     let server_key = sample_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
-    let server = Server::new(ServerConfig {
-        source: shin::server::CertSource::RawPublicKey {
-            signing_key: server_key,
+    let server: Server<fn() -> u64> = Server::new(
+        ServerConfig {
+            source: shin::server::CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: SERVER_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: SERVER_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let client = Client::new(ClientConfig {
-        verifier: shin::client::Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let client: Client<fn() -> u64> = Client::new(
+        ClientConfig {
+            verifier: shin::client::Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: CLIENT_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: CLIENT_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
     (client, server)
 }
 

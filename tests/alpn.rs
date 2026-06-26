@@ -2,20 +2,23 @@ use shin::client::{Client, Config as ClientConfig, Verifier};
 use shin::codec::Reader;
 use shin::extension::ExtensionType;
 use shin::handshake::{ClientHello, Handshake};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, Server};
 use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::{Clock, Epoch, Event};
 
 fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
-    let mut c = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: [0x42u8; 32],
+    let mut c = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: [0x42u8; 32],
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: alpn,
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: alpn,
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
     let evs = c.start().unwrap();
     let ch_bytes = evs
         .into_iter()
@@ -81,24 +84,30 @@ fn server_picks_first_overlap_and_client_observes() {
     let signing = SigningKey::from_seed(&[0x42u8; 32]).unwrap();
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: signing,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"http/1.1".to_vec()],
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"http/1.1".to_vec()],
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     drive_handshake(&mut client, &mut server);
 
@@ -107,36 +116,50 @@ fn server_picks_first_overlap_and_client_observes() {
 }
 
 #[test]
-fn no_overlap_leaves_alpn_unset() {
+fn no_overlap_aborts_with_no_application_protocol() {
     let signing = SigningKey::from_seed(&[0x42u8; 32]).unwrap();
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: signing,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"h2".to_vec()],
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"h2".to_vec()],
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"http/1.1".to_vec()],
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"http/1.1".to_vec()],
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
-    drive_handshake(&mut client, &mut server);
-
-    assert_eq!(server.selected_alpn(), None);
-    assert_eq!(client.selected_alpn(), None);
+    // RFC 7301 §3.2: empty intersection MUST abort, not complete ALPN-less.
+    let evs = client.start().unwrap();
+    let ch = take_send(evs, Epoch::Plaintext);
+    let err = server.read(Epoch::Plaintext, &ch).unwrap_err();
+    assert_eq!(err, shin::Error::NoApplicationProtocol);
+    assert_eq!(
+        err.alert().description,
+        shin::alert::AlertDescription::NoApplicationProtocol,
+    );
 }
 
-fn drive_handshake(client: &mut Client, server: &mut Server) {
+fn drive_handshake<CC: Clock, SC: Clock, G: EarlyDataGuard>(
+    client: &mut Client<CC>,
+    server: &mut Server<SC, G>,
+) {
     let evs = client.start().unwrap();
     let ch = take_send(evs, Epoch::Plaintext);
     let evs = server.read(Epoch::Plaintext, &ch).unwrap();

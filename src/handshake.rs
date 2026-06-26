@@ -8,6 +8,13 @@ pub const RANDOM_LEN: usize = 32;
 pub const TLS_1_3: u16 = 0x0304;
 pub const TLS_1_2: u16 = 0x0303;
 
+/// The fixed ServerHello.random marking a HelloRetryRequest (RFC 8446 §4.1.3):
+/// SHA-256 of "HelloRetryRequest".
+pub const HELLO_RETRY_REQUEST_RANDOM: [u8; RANDOM_LEN] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
 pub const MAX_CERTIFICATE_ENTRIES: usize = 16;
 
 /// Bounds peer-pinned memory while reassembling a fragmented message.
@@ -370,6 +377,7 @@ pub enum Handshake {
     Certificate(Certificate),
     CertificateVerify(CertificateVerify),
     Finished(Finished),
+    EndOfEarlyData,
     KeyUpdate(KeyUpdate),
     NewSessionTicket(NewSessionTicket),
 }
@@ -383,6 +391,7 @@ impl Handshake {
             Self::Certificate(_) => HandshakeType::Certificate,
             Self::CertificateVerify(_) => HandshakeType::CertificateVerify,
             Self::Finished(_) => HandshakeType::Finished,
+            Self::EndOfEarlyData => HandshakeType::EndOfEarlyData,
             Self::KeyUpdate(_) => HandshakeType::KeyUpdate,
             Self::NewSessionTicket(_) => HandshakeType::NewSessionTicket,
         }
@@ -397,6 +406,7 @@ impl Handshake {
             Self::Certificate(m) => m.encode(o),
             Self::CertificateVerify(m) => m.encode(o),
             Self::Finished(m) => m.encode(o),
+            Self::EndOfEarlyData => {}
             Self::KeyUpdate(m) => m.encode(o),
             Self::NewSessionTicket(m) => m.encode(o),
         });
@@ -416,13 +426,14 @@ impl Handshake {
                 Self::CertificateVerify(CertificateVerify::decode(&mut body)?)
             }
             HandshakeType::Finished => Self::Finished(Finished::decode(&mut body)?),
+            HandshakeType::EndOfEarlyData => Self::EndOfEarlyData,
             HandshakeType::KeyUpdate => Self::KeyUpdate(KeyUpdate::decode(&mut body)?),
             HandshakeType::NewSessionTicket => {
                 Self::NewSessionTicket(NewSessionTicket::decode(&mut body)?)
             }
-            HandshakeType::EndOfEarlyData
-            | HandshakeType::CertificateRequest
-            | HandshakeType::MessageHash => return Err(DecodeError::InvalidEnum),
+            HandshakeType::CertificateRequest | HandshakeType::MessageHash => {
+                return Err(DecodeError::InvalidEnum);
+            }
         };
         body.finish()?;
         Ok(m)

@@ -49,25 +49,31 @@ fn handshake_completes_in_process() {
     let server_key = sample_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: shin::server::CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: shin::server::CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: SERVER_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: SERVER_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
+        || 0,
+    );
 
-    let mut client = Client::new(ClientConfig {
-        verifier: shin::client::Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: shin::client::Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: CLIENT_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: CLIENT_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch_bytes = extract_send(&c1, Epoch::Plaintext).expect("ClientHello");
@@ -112,26 +118,32 @@ fn handshake_completes_in_process() {
 #[test]
 fn client_rejects_wrong_server_pubkey() {
     let server_key = sample_signing_key();
-    let mut server = Server::new(ServerConfig {
-        source: shin::server::CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: shin::server::CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: SERVER_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: SERVER_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
+        || 0,
+    );
 
     let bogus_pubkey = [0xAAu8; 32];
-    let mut client = Client::new(ClientConfig {
-        verifier: shin::client::Verifier::RawPublicKey {
-            expected_pubkey: bogus_pubkey,
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: shin::client::Verifier::RawPublicKey {
+                expected_pubkey: bogus_pubkey,
+            },
+            transport_params: CLIENT_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: CLIENT_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -152,24 +164,30 @@ fn server_rejects_tampered_client_finished() {
     let server_key = sample_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: shin::server::CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: shin::server::CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: SERVER_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: SERVER_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: shin::client::Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: shin::client::Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: CLIENT_TP.to_vec(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: CLIENT_TP.to_vec(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -191,24 +209,30 @@ fn keys_diverge_across_independent_handshakes() {
     let server_pubkey = *server_key.pubkey().unwrap();
 
     let do_handshake = || -> ([u8; 32], [u8; 32]) {
-        let mut server = Server::new(ServerConfig {
-            source: shin::server::CertSource::RawPublicKey {
-                signing_key: server_key.clone(),
+        let mut server = Server::new(
+            ServerConfig {
+                source: shin::server::CertSource::RawPublicKey {
+                    signing_key: server_key.clone(),
+                },
+                transport_params: SERVER_TP.to_vec(),
+                alpn_protocols: Vec::new(),
+                ticket_keys: None,
+                accept_early_data: false,
             },
-            transport_params: SERVER_TP.to_vec(),
-            alpn_protocols: Vec::new(),
-            ticket_secret: None,
-            accept_early_data: false,
-        });
-        let mut client = Client::new(ClientConfig {
-            verifier: shin::client::Verifier::RawPublicKey {
-                expected_pubkey: server_pubkey,
+            || 0,
+        );
+        let mut client = Client::new(
+            ClientConfig {
+                verifier: shin::client::Verifier::RawPublicKey {
+                    expected_pubkey: server_pubkey,
+                },
+                transport_params: CLIENT_TP.to_vec(),
+                alpn_protocols: Vec::new(),
+                resumption: None,
+                enable_early_data: false,
             },
-            transport_params: CLIENT_TP.to_vec(),
-            alpn_protocols: Vec::new(),
-            resumption: None,
-            enable_early_data: false,
-        });
+            || 0,
+        );
 
         let c1 = client.start().unwrap();
         let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();

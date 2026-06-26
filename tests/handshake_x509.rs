@@ -72,27 +72,32 @@ fn handshake_with_x509_chain() {
     };
     let now = now_inside(&cert_der);
 
-    let server = Server::new(ServerConfig {
-        source: CertSource::X509 {
-            chain_der: vec![cert_der.clone()],
-            signing_key: signing,
+    let server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let client = Client::new(ClientConfig {
-        verifier: Verifier::X509 {
-            anchors: vec![anchor],
-            hostname: HOSTNAME.as_bytes().to_vec(),
-            now_seconds: now,
+        || 0,
+    );
+    let client = Client::new(
+        ClientConfig {
+            verifier: Verifier::X509 {
+                anchors: vec![anchor],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        move || now * 1000,
+    );
 
     let (mut client, mut server) = (client, server);
 
@@ -119,27 +124,32 @@ fn rejects_wrong_hostname() {
     };
     let now = now_inside(&cert_der);
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::X509 {
-            chain_der: vec![cert_der.clone()],
-            signing_key: signing,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::X509 {
-            anchors: vec![anchor],
-            hostname: b"other.local".to_vec(),
-            now_seconds: now,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::X509 {
+                anchors: vec![anchor],
+                hostname: b"other.local".to_vec(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        move || now * 1000,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -165,27 +175,32 @@ fn rejects_unknown_anchor() {
     };
     let now = now_inside(&cert_der);
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::X509 {
-            chain_der: vec![cert_der.clone()],
-            signing_key: signing,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::X509 {
-            anchors: vec![bogus_anchor],
-            hostname: HOSTNAME.as_bytes().to_vec(),
-            now_seconds: now,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::X509 {
+                anchors: vec![bogus_anchor],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        move || now * 1000,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -195,4 +210,97 @@ fn rejects_unknown_anchor() {
     client.read(Epoch::Plaintext, &sh).unwrap();
     let result = client.read(Epoch::Handshake, &s_hs);
     assert!(result.is_err(), "client must reject unknown anchor");
+}
+
+fn not_after(cert_der: &[u8]) -> u64 {
+    let cert = Cert::parse(cert_der).unwrap();
+    shin::time::UnixTime::from_time_value(&cert.validity.not_after)
+        .unwrap()
+        .0
+}
+
+#[test]
+fn stale_clock_rejects_expired_certificate() {
+    let (cert_der, signing) = ed25519_self_signed();
+    let cert_view = Cert::parse(&cert_der).unwrap();
+    let anchor = OwnedTrustAnchor {
+        subject_der: cert_view.subject_der.to_vec(),
+        spki_der: cert_view.spki.raw_der.to_vec(),
+    };
+    let expired_at = not_after(&cert_der) + 86_400;
+
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
+        },
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::X509 {
+                anchors: vec![anchor],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
+        },
+        move || expired_at * 1000,
+    );
+    // Clock injected per-handshake reads a time past expiry.
+
+    let c1 = client.start().unwrap();
+    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
+    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    client.read(Epoch::Plaintext, &sh).unwrap();
+    assert_eq!(
+        client.read(Epoch::Handshake, &s_hs).unwrap_err(),
+        shin::Error::BadCertificateChain(shin::chain::ChainError::Expired),
+    );
+}
+
+#[test]
+fn config_validate_rejects_empty_anchors_and_hostname() {
+    let empty_anchors = ClientConfig {
+        verifier: Verifier::X509 {
+            anchors: Vec::new(),
+            hostname: HOSTNAME.as_bytes().to_vec(),
+        },
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        resumption: None,
+        enable_early_data: false,
+    };
+    assert_eq!(
+        empty_anchors.validate().unwrap_err(),
+        shin::Error::BadConfig
+    );
+
+    let (cert_der, _) = ed25519_self_signed();
+    let cert_view = Cert::parse(&cert_der).unwrap();
+    let anchor = OwnedTrustAnchor {
+        subject_der: cert_view.subject_der.to_vec(),
+        spki_der: cert_view.spki.raw_der.to_vec(),
+    };
+    let empty_host = ClientConfig {
+        verifier: Verifier::X509 {
+            anchors: vec![anchor],
+            hostname: Vec::new(),
+        },
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        resumption: None,
+        enable_early_data: false,
+    };
+    assert_eq!(empty_host.validate().unwrap_err(), shin::Error::BadConfig);
 }

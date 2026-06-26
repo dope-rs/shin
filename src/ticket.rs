@@ -21,6 +21,7 @@ pub enum TicketError {
     BadKey,
 }
 
+#[derive(Clone)]
 pub struct TicketSecret([u8; 32]);
 
 impl TicketSecret {
@@ -42,7 +43,7 @@ impl TicketSecret {
         age_add: u32,
         issued_at_ms: u64,
         alpn: &[u8],
-        rng: &dyn SecureRandom,
+        rng: &impl SecureRandom,
     ) -> Result<Vec<u8>, TicketError> {
         if alpn.len() > MAX_ALPN_LEN {
             return Err(TicketError::BadFormat);
@@ -105,5 +106,118 @@ impl TicketSecret {
             u64::from_be_bytes(issued_bytes),
             alpn,
         ))
+    }
+}
+
+pub type DecryptedTicket = ([u8; PSK_LEN], u32, u64, Vec<u8>);
+
+/// Two-generation key set: seal under `current`, still open `previous` for one
+/// rotation window. Produced by [`TicketRotator`].
+#[derive(Clone)]
+pub struct TicketKeys {
+    current: [u8; 32],
+    previous: Option<[u8; 32]>,
+}
+
+impl TicketKeys {
+    pub fn single(secret: [u8; 32]) -> Self {
+        Self {
+            current: secret,
+            previous: None,
+        }
+    }
+
+    pub fn with_previous(current: [u8; 32], previous: Option<[u8; 32]>) -> Self {
+        Self { current, previous }
+    }
+
+    pub fn encrypt(
+        &self,
+        psk: &[u8; PSK_LEN],
+        age_add: u32,
+        issued_at_ms: u64,
+        alpn: &[u8],
+        rng: &impl SecureRandom,
+    ) -> Result<Vec<u8>, TicketError> {
+        TicketSecret::new(self.current).encrypt(psk, age_add, issued_at_ms, alpn, rng)
+    }
+
+    pub fn decrypt(&self, ticket: &[u8]) -> Result<DecryptedTicket, TicketError> {
+        match TicketSecret::new(self.current).decrypt(ticket) {
+            Ok(v) => Ok(v),
+            Err(e) => match self.previous {
+                Some(prev) => TicketSecret::new(prev).decrypt(ticket),
+                None => Err(e),
+            },
+        }
+    }
+}
+
+/// Rolls the ticket key once it is older than `rotate_after_ms` or has sealed
+/// `rotate_after_count` tickets, keeping the displaced key as `previous` for one
+/// generation. [`issuing_keys`](Self::issuing_keys) seals,
+/// [`accepting_keys`](Self::accepting_keys) opens.
+pub struct TicketRotator {
+    current: [u8; 32],
+    previous: Option<[u8; 32]>,
+    current_since_ms: u64,
+    issued_under_current: u64,
+    rotate_after_ms: u64,
+    rotate_after_count: u64,
+}
+
+impl TicketRotator {
+    pub fn new(
+        rng: &impl SecureRandom,
+        now_ms: u64,
+        rotate_after_ms: u64,
+        rotate_after_count: u64,
+    ) -> Result<Self, TicketError> {
+        let mut current = [0u8; 32];
+        rng.fill(&mut current).map_err(|_| TicketError::BadKey)?;
+        Ok(Self {
+            current,
+            previous: None,
+            current_since_ms: now_ms,
+            issued_under_current: 0,
+            rotate_after_ms,
+            rotate_after_count,
+        })
+    }
+
+    fn due(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.current_since_ms) >= self.rotate_after_ms
+            || self.issued_under_current >= self.rotate_after_count
+    }
+
+    fn rotate(&mut self, rng: &impl SecureRandom, now_ms: u64) -> Result<(), TicketError> {
+        let mut next = [0u8; 32];
+        rng.fill(&mut next).map_err(|_| TicketError::BadKey)?;
+        self.previous = Some(self.current);
+        self.current = next;
+        self.current_since_ms = now_ms;
+        self.issued_under_current = 0;
+        Ok(())
+    }
+
+    /// Keys for sealing a ticket now, rotating first if the schedule is due.
+    pub fn issuing_keys(
+        &mut self,
+        rng: &impl SecureRandom,
+        now_ms: u64,
+    ) -> Result<TicketKeys, TicketError> {
+        if self.due(now_ms) {
+            self.rotate(rng, now_ms)?;
+        }
+        self.issued_under_current = self.issued_under_current.saturating_add(1);
+        Ok(self.accepting_keys())
+    }
+
+    /// Current + previous keys for opening an inbound ticket. Never rotates.
+    pub fn accepting_keys(&self) -> TicketKeys {
+        TicketKeys {
+            current: self.current,
+            previous: self.previous,
+        }
     }
 }

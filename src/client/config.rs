@@ -34,8 +34,21 @@ pub enum Verifier {
     X509 {
         anchors: Vec<OwnedTrustAnchor>,
         hostname: Vec<u8>,
-        now_seconds: u64,
     },
+}
+
+impl Config {
+    /// Reject obviously-broken configuration before a handshake starts: an X.509
+    /// verifier needs at least one trust anchor and a non-empty server name to
+    /// be able to authenticate anything.
+    pub fn validate(&self) -> Result<(), Error> {
+        if let Verifier::X509 { anchors, hostname } = &self.verifier
+            && (anchors.is_empty() || hostname.is_empty())
+        {
+            return Err(Error::BadConfig);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

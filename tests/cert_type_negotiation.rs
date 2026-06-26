@@ -132,27 +132,32 @@ fn x509_server_omits_cert_type_and_quic_tp_when_client_did_not_offer() {
     let (cert_der, signing) = ed25519_self_signed();
     let now = cert_validity_midpoint(&cert_der);
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::X509 {
-            chain_der: vec![cert_der.clone()],
-            signing_key: signing,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::X509 {
-            anchors: vec![x509_anchor(&cert_der)],
-            hostname: HOSTNAME.as_bytes().to_vec(),
-            now_seconds: now,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::X509 {
+                anchors: vec![x509_anchor(&cert_der)],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        move || now * 1000,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -192,27 +197,32 @@ fn x509_server_with_transport_params_does_not_leak_to_tcp_tls_client() {
     let (cert_der, signing) = ed25519_self_signed();
     let now = cert_validity_midpoint(&cert_der);
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::X509 {
-            chain_der: vec![cert_der.clone()],
-            signing_key: signing,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: b"server-tp-payload".to_vec(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: b"server-tp-payload".to_vec(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::X509 {
-            anchors: vec![x509_anchor(&cert_der)],
-            hostname: HOSTNAME.as_bytes().to_vec(),
-            now_seconds: now,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::X509 {
+                anchors: vec![x509_anchor(&cert_der)],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+            },
+            transport_params: Vec::new(), // ← TCP-TLS: client doesn't offer
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(), // ← TCP-TLS: client doesn't offer
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        move || now * 1000,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -234,24 +244,30 @@ fn quic_transport_params_round_trip_when_client_offers() {
     let server_key = SigningKey::from_seed(&[0x11u8; 32]).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: b"\xde\xad\xbe\xef-server".to_vec(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: b"\xde\xad\xbe\xef-server".to_vec(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: b"\xca\xfe\xba\xbe-client".to_vec(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: b"\xca\xfe\xba\xbe-client".to_vec(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -272,24 +288,30 @@ fn rpk_handshake_echoes_cert_type_extensions() {
     let server_key = SigningKey::from_seed(&[0x22u8; 32]).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -327,26 +349,32 @@ fn rpk_handshake_echoes_cert_type_extensions() {
 fn x509_server_rejects_rpk_only_client_offer() {
     let (cert_der, signing) = ed25519_self_signed();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::X509 {
-            chain_der: vec![cert_der.clone()],
-            signing_key: signing,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
+        || 0,
+    );
     // RPK verifier on the client → CH carries cert_type=[RPK] only.
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: [0xAA; 32], // wrong, but we won't get that far
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: [0xAA; 32], // wrong, but we won't get that far
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -366,24 +394,30 @@ fn alpn_intersection_emits_extension() {
     let server_key = SigningKey::from_seed(&[0x33u8; 32]).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"http/1.1".to_vec()],
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"http/1.1".to_vec()],
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -407,37 +441,40 @@ fn alpn_intersection_emits_extension() {
 // faking one). Some peers treat ALPN absence as "no ALPN agreed".
 // -------------------------------------------------------------------
 #[test]
-fn alpn_no_overlap_omits_extension() {
+fn alpn_no_overlap_aborts() {
     let server_key = SigningKey::from_seed(&[0x44u8; 32]).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"h2".to_vec()],
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"h2".to_vec()],
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"http/1.1".to_vec()],
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"http/1.1".to_vec()],
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
-    let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let ee = server_ee_extensions(&s1);
-
-    assert!(
-        !has_ext(&ee, ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION),
-        "no-overlap ALPN must result in extension omission: ee={ee:?}",
+    assert_eq!(
+        server.read(Epoch::Plaintext, &ch).unwrap_err(),
+        shin::Error::NoApplicationProtocol,
     );
 }
 
@@ -450,24 +487,30 @@ fn alpn_client_silent_omits_extension() {
     let server_key = SigningKey::from_seed(&[0x55u8; 32]).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let mut server = Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: server_key,
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"http/1.1".to_vec()],
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: vec![b"http/1.1".to_vec()],
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        || 0,
+    );
+    let mut client = Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(), // silent
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(), // silent
-        resumption: None,
-        enable_early_data: false,
-    });
+        || 0,
+    );
 
     let c1 = client.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();

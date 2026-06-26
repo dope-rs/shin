@@ -3,16 +3,19 @@ use shin::extension::{Extension, ExtensionType};
 use shin::handshake::{Handshake, RANDOM_LEN, ServerHello, TLS_1_2};
 use shin::{Epoch, Error, Event};
 
-fn client() -> Client {
-    Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: [0u8; 32],
+fn client() -> Client<fn() -> u64> {
+    Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: [0u8; 32],
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    })
+        || 0,
+    )
 }
 
 fn session_id_echo(events: &[Event]) -> Vec<u8> {

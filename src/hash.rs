@@ -28,6 +28,16 @@ impl Transcript {
     pub fn hash_empty() -> [u8; HASH_LEN] {
         Self::new().hash()
     }
+
+    /// RFC 8446 §4.4.1: after a HelloRetryRequest the transcript restarts as
+    /// `message_hash(ClientHello1)` (type 0xFE), then HRR and ClientHello2 follow.
+    pub fn restart_with_message_hash(client_hello1: [u8; HASH_LEN]) -> Self {
+        let mut t = Self::new();
+        let mut synthetic = alloc::vec![0xFE, 0x00, 0x00, HASH_LEN as u8];
+        synthetic.extend_from_slice(&client_hello1);
+        t.update(&synthetic);
+        t
+    }
 }
 
 impl Default for Transcript {

@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use crate::cert::{
-    BasicConstraints, Cert, ExtensionIter, GeneralName, KeyUsage, NameConstraints,
+    BasicConstraints, Cert, ExtensionIter, GeneralName, KeyUsage, NameConstraints, OID_EKU_ANY,
     OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE,
     OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, SubjectPublicKeyInfo, VerifyError, is_handled_ext,
 };
@@ -27,6 +27,7 @@ pub enum ChainError {
     NameConstraintViolation,
     NoTrustAnchor,
     UnhandledCriticalExtension,
+    DuplicateExtension,
     Verify(VerifyError),
     Parse,
 }
@@ -58,6 +59,7 @@ impl<'a> TrustAnchor<'a> {
     }
 }
 
+#[derive(Clone)]
 struct LeafSan<'a> {
     dns: Vec<Vec<u8>>,
     ip: Vec<&'a [u8]>,
@@ -100,6 +102,7 @@ impl Chain {
         for c in chain {
             Self::check_validity(c, now)?;
             Self::check_critical_extensions(c)?;
+            Self::check_no_duplicate_extensions(c)?;
         }
 
         let leaf = &chain[0];
@@ -108,28 +111,124 @@ impl Chain {
         let leaf_san = LeafSan::collect(leaf)?;
         Self::check_hostname(&leaf_san, hostname_dns_id)?;
 
-        for i in 0..chain.len() {
-            let subject = &chain[i];
-            if let Ok(anchor) = Self::find_anchor_for(subject, trust_anchors) {
-                subject.verify_signature(&anchor.spki)?;
+        let order = Self::order_chain(chain);
+        let ordered: Vec<&Cert> = order.iter().map(|&i| &chain[i]).collect();
+        let all_linked = ordered.len() == chain.len();
+
+        let mut constrained = false;
+        for c in &ordered {
+            constrained |= Self::has_name_constraints(c)?;
+        }
+        let sans: Vec<LeafSan> = if constrained {
+            core::iter::once(Ok(leaf_san.clone()))
+                .chain(ordered[1..].iter().map(|c| LeafSan::collect(c)))
+                .collect::<Result<_, _>>()?
+        } else {
+            Vec::new()
+        };
+
+        for i in 0..ordered.len() {
+            let subject = ordered[i];
+            if Self::verifies_against_anchor(subject, trust_anchors) {
                 return Ok(());
             }
-            if i + 1 >= chain.len() {
-                return Err(ChainError::NoTrustAnchor);
+            if i + 1 >= ordered.len() {
+                return Err(if all_linked {
+                    ChainError::NoTrustAnchor
+                } else {
+                    ChainError::IssuerSubjectMismatch
+                });
             }
-            let issuer = &chain[i + 1];
+            let issuer = ordered[i + 1];
             if subject.issuer_der != issuer.subject_der {
                 return Err(ChainError::IssuerSubjectMismatch);
             }
             Self::check_issuer_is_ca(issuer)?;
+            Self::check_ca_eku(issuer)?;
             Self::check_path_len(issuer, i)?;
-            Self::check_name_constraints(issuer, &leaf_san)?;
+            if constrained {
+                Self::check_name_constraints(issuer, &sans[..=i])?;
+            }
             subject.verify_signature(&issuer.spki)?;
         }
         Err(ChainError::NoTrustAnchor)
     }
 
-    fn check_name_constraints(ca: &Cert<'_>, leaf_san: &LeafSan<'_>) -> Result<(), ChainError> {
+    fn has_name_constraints(c: &Cert<'_>) -> Result<bool, ChainError> {
+        let exts = c.extensions_der.unwrap_or(&[]);
+        Ok(ExtensionIter::find(exts, OID_EXT_NAME_CONSTRAINTS)?.is_some())
+    }
+
+    /// Leaf→up ordering by issuer/subject linkage (RFC 8446 §4.4.2 allows
+    /// shuffled chains). A signature check breaks ties only when several
+    /// candidates share the issuer DN (cross-signing).
+    fn order_chain(chain: &[Cert<'_>]) -> Vec<usize> {
+        let mut used = alloc::vec![false; chain.len()];
+        let mut path = alloc::vec![0usize];
+        used[0] = true;
+        loop {
+            let current = &chain[*path.last().unwrap()];
+            let matches: Vec<usize> = chain
+                .iter()
+                .enumerate()
+                .filter(|&(idx, cand)| !used[idx] && cand.subject_der == current.issuer_der)
+                .map(|(idx, _)| idx)
+                .collect();
+            let chosen = match matches.as_slice() {
+                [] => break,
+                &[only] => only,
+                many => many
+                    .iter()
+                    .copied()
+                    .find(|&idx| current.verify_signature(&chain[idx].spki).is_ok())
+                    .unwrap_or(many[0]),
+            };
+            used[chosen] = true;
+            path.push(chosen);
+        }
+        path
+    }
+
+    fn check_no_duplicate_extensions(c: &Cert<'_>) -> Result<(), ChainError> {
+        let exts = c.extensions_der.unwrap_or(&[]);
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for ext in ExtensionIter::new(exts) {
+            let ext = ext?;
+            if seen.contains(&ext.oid) {
+                return Err(ChainError::DuplicateExtension);
+            }
+            seen.push(ext.oid);
+        }
+        Ok(())
+    }
+
+    /// EKU chaining: an intermediate's EKU, if present, must permit serverAuth
+    /// or anyExtendedKeyUsage.
+    fn check_ca_eku(ca: &Cert<'_>) -> Result<(), ChainError> {
+        let exts = ca.extensions_der.unwrap_or(&[]);
+        let Some((_, val)) = ExtensionIter::find(exts, OID_EXT_EXTENDED_KEY_USAGE)? else {
+            return Ok(());
+        };
+        let ekus = KeyUsage::parse_extended(val)?;
+        if ekus.contains(&OID_EKU_SERVER_AUTH) || ekus.contains(&OID_EKU_ANY) {
+            Ok(())
+        } else {
+            Err(ChainError::NoServerAuth)
+        }
+    }
+
+    fn verifies_against_anchor(subject: &Cert<'_>, anchors: &[TrustAnchor<'_>]) -> bool {
+        anchors.iter().any(|a| {
+            a.subject_der == subject.issuer_der && subject.verify_signature(&a.spki).is_ok()
+        })
+    }
+
+    /// RFC 5280 §4.2.1.10: a CA's name constraints bind every subordinate SAN
+    /// below it, not just the leaf.
+    fn check_name_constraints(
+        ca: &Cert<'_>,
+        subordinates: &[LeafSan<'_>],
+    ) -> Result<(), ChainError> {
         let exts = ca.extensions_der.unwrap_or(&[]);
         let Some((_, val)) = ExtensionIter::find(exts, OID_EXT_NAME_CONSTRAINTS)? else {
             return Ok(());
@@ -148,29 +247,31 @@ impl Chain {
             .map(|p| Self::ascii_lower(p))
             .collect();
 
-        for d in &leaf_san.dns {
-            if excluded_dns.iter().any(|ex| Self::dns_in_subtree(d, ex)) {
-                return Err(ChainError::NameConstraintViolation);
+        for san in subordinates {
+            for d in &san.dns {
+                if excluded_dns.iter().any(|ex| Self::dns_in_subtree(d, ex)) {
+                    return Err(ChainError::NameConstraintViolation);
+                }
+                if !permitted_dns.is_empty()
+                    && !permitted_dns.iter().any(|p| Self::dns_in_subtree(d, p))
+                {
+                    return Err(ChainError::NameConstraintViolation);
+                }
             }
-            if !permitted_dns.is_empty()
-                && !permitted_dns.iter().any(|p| Self::dns_in_subtree(d, p))
-            {
-                return Err(ChainError::NameConstraintViolation);
-            }
-        }
 
-        for p in &leaf_san.ip {
-            if nc.excluded.ip.iter().any(|ex| Self::ip_in_subtree(p, ex)) {
-                return Err(ChainError::NameConstraintViolation);
-            }
-            if !nc.permitted.ip.is_empty()
-                && !nc
-                    .permitted
-                    .ip
-                    .iter()
-                    .any(|net| Self::ip_in_subtree(p, net))
-            {
-                return Err(ChainError::NameConstraintViolation);
+            for p in &san.ip {
+                if nc.excluded.ip.iter().any(|ex| Self::ip_in_subtree(p, ex)) {
+                    return Err(ChainError::NameConstraintViolation);
+                }
+                if !nc.permitted.ip.is_empty()
+                    && !nc
+                        .permitted
+                        .ip
+                        .iter()
+                        .any(|net| Self::ip_in_subtree(p, net))
+                {
+                    return Err(ChainError::NameConstraintViolation);
+                }
             }
         }
         Ok(())
@@ -300,18 +401,6 @@ impl Chain {
             }
         }
         Ok(())
-    }
-
-    fn find_anchor_for<'a>(
-        top: &Cert<'_>,
-        anchors: &'a [TrustAnchor<'_>],
-    ) -> Result<&'a TrustAnchor<'a>, ChainError> {
-        for a in anchors {
-            if a.subject_der == top.issuer_der {
-                return Ok(a);
-            }
-        }
-        Err(ChainError::NoTrustAnchor)
     }
 
     fn ascii_lower(s: &[u8]) -> Vec<u8> {

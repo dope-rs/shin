@@ -137,3 +137,22 @@ fn open_rejects_plaintext_outer_type() {
         RecordError::NotCipherTextOuter
     );
 }
+
+#[test]
+fn auth_failure_poisons_opener_so_later_valid_records_are_refused() {
+    let mut sealer = Sealer::from_secret(&TEST_SECRET);
+    let mut tampered = sealer.seal(ContentType::ApplicationData, b"body").unwrap();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+
+    let mut opener = Opener::from_secret(&TEST_SECRET);
+    assert_eq!(
+        opener.open(&mut tampered).unwrap_err(),
+        RecordError::OpenFailed
+    );
+    assert_eq!(opener.seq(), 0, "a forgery must not advance the sequence");
+
+    let mut fresh = Sealer::from_secret(&TEST_SECRET);
+    let mut good = fresh.seal(ContentType::ApplicationData, b"body").unwrap();
+    assert_eq!(opener.open(&mut good).unwrap_err(), RecordError::Poisoned);
+}
