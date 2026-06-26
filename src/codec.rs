@@ -7,6 +7,8 @@ pub enum DecodeError {
     Trailing,
     DuplicateExtension,
     TooManyCertificates,
+    HandshakeTooLarge,
+    HandshakeSpansEpoch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

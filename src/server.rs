@@ -3,11 +3,11 @@ use alloc::vec::Vec;
 
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::codec::{Encode, Reader};
+use crate::codec::Encode;
 use crate::extension::{Extension, ExtensionType};
 use crate::handshake::{
     Certificate, CertificateEntry, CertificateVerify, ClientHello, EncryptedExtensions, Finished,
-    Handshake, NewSessionTicket, RANDOM_LEN, ServerHello, TLS_1_2,
+    Handshake, HsReassembler, NewSessionTicket, RANDOM_LEN, ServerHello, TLS_1_2,
 };
 use crate::hash::Transcript;
 use crate::kx::EphemeralKey;
@@ -46,9 +46,6 @@ pub trait EarlyDataGuard {
 
 /// Allowed skew between client-claimed and server-measured ticket age (RFC 8446 §8.2).
 const MAX_TICKET_AGE_SKEW_MS: u64 = 10_000;
-
-/// Cap on KeyUpdate messages processed per record; bounds reply amplification.
-const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
 
 /// max_early_data_size advertised in NewSessionTicket when 0-RTT is accepted.
 const MAX_EARLY_DATA_SIZE: u32 = 16384;
@@ -105,6 +102,7 @@ pub struct Server {
     selected_alpn: Option<Vec<u8>>,
     master: Option<KeySchedule>,
     early_data_guard: Option<Box<dyn EarlyDataGuard>>,
+    reasm: HsReassembler,
 }
 
 impl Server {
@@ -121,6 +119,7 @@ impl Server {
             selected_alpn: None,
             master: None,
             early_data_guard: None,
+            reasm: HsReassembler::default(),
         }
     }
 
@@ -134,21 +133,10 @@ impl Server {
     }
 
     pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
+        self.reasm.push(epoch, data)?;
         let mut events = Vec::new();
-        let mut r = Reader::new(data);
-        let mut key_updates = 0u32;
-        while !r.is_empty() {
-            let snapshot = r.remaining();
-            let msg = Handshake::decode(&mut r)?;
-            if matches!(msg, Handshake::KeyUpdate(_)) {
-                key_updates += 1;
-                if key_updates > MAX_KEY_UPDATES_PER_RECORD {
-                    return Err(Error::UnexpectedMessage);
-                }
-            }
-            let consumed = snapshot.len() - r.remaining().len();
-            let raw = &snapshot[..consumed];
-            self.process(epoch, msg, raw, &mut events)?;
+        while let Some((msg, raw)) = self.reasm.next_message()? {
+            self.process(epoch, msg, &raw, &mut events)?;
         }
         Ok(events)
     }
