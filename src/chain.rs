@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
 
 use crate::cert::{
-    BasicConstraints, Cert, ExtensionIter, GeneralName, KeyUsage, OID_EKU_SERVER_AUTH,
-    OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE, OID_EXT_SAN,
-    SubjectPublicKeyInfo, VerifyError, is_handled_ext,
+    BasicConstraints, Cert, ExtensionIter, GeneralName, KeyUsage, NameConstraints,
+    OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE,
+    OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, SubjectPublicKeyInfo, VerifyError, is_handled_ext,
 };
 use crate::hostname::Hostname;
 use crate::time::UnixTime;
@@ -24,6 +24,7 @@ pub enum ChainError {
     IssuerSubjectMismatch,
     NoServerAuth,
     HostnameMismatch,
+    NameConstraintViolation,
     NoTrustAnchor,
     UnhandledCriticalExtension,
     Verify(VerifyError),
@@ -57,6 +58,29 @@ impl<'a> TrustAnchor<'a> {
     }
 }
 
+struct LeafSan<'a> {
+    dns: Vec<Vec<u8>>,
+    ip: Vec<&'a [u8]>,
+}
+
+impl<'a> LeafSan<'a> {
+    fn collect(leaf: &Cert<'a>) -> Result<Self, ChainError> {
+        let exts = leaf.extensions_der.unwrap_or(&[]);
+        let mut dns = Vec::new();
+        let mut ip = Vec::new();
+        if let Some((_, san_val)) = ExtensionIter::find(exts, OID_EXT_SAN)? {
+            for n in GeneralName::parse_alt_names(san_val)? {
+                match n {
+                    GeneralName::DnsName(d) => dns.push(Chain::ascii_lower(d)),
+                    GeneralName::IpAddress(p) => ip.push(p),
+                    GeneralName::Other { .. } => {}
+                }
+            }
+        }
+        Ok(Self { dns, ip })
+    }
+}
+
 pub struct Chain;
 
 impl Chain {
@@ -81,7 +105,8 @@ impl Chain {
         let leaf = &chain[0];
         Self::check_end_entity(leaf)?;
         Self::check_server_auth(leaf)?;
-        Self::check_hostname(leaf, hostname_dns_id)?;
+        let leaf_san = LeafSan::collect(leaf)?;
+        Self::check_hostname(&leaf_san, hostname_dns_id)?;
 
         for i in 0..chain.len() {
             let subject = &chain[i];
@@ -98,9 +123,84 @@ impl Chain {
             }
             Self::check_issuer_is_ca(issuer)?;
             Self::check_path_len(issuer, i)?;
+            Self::check_name_constraints(issuer, &leaf_san)?;
             subject.verify_signature(&issuer.spki)?;
         }
         Err(ChainError::NoTrustAnchor)
+    }
+
+    fn check_name_constraints(ca: &Cert<'_>, leaf_san: &LeafSan<'_>) -> Result<(), ChainError> {
+        let exts = ca.extensions_der.unwrap_or(&[]);
+        let Some((_, val)) = ExtensionIter::find(exts, OID_EXT_NAME_CONSTRAINTS)? else {
+            return Ok(());
+        };
+        let nc = NameConstraints::parse(val)?;
+        let permitted_dns: Vec<Vec<u8>> = nc
+            .permitted
+            .dns
+            .iter()
+            .map(|p| Self::ascii_lower(p))
+            .collect();
+        let excluded_dns: Vec<Vec<u8>> = nc
+            .excluded
+            .dns
+            .iter()
+            .map(|p| Self::ascii_lower(p))
+            .collect();
+
+        for d in &leaf_san.dns {
+            if excluded_dns.iter().any(|ex| Self::dns_in_subtree(d, ex)) {
+                return Err(ChainError::NameConstraintViolation);
+            }
+            if !permitted_dns.is_empty()
+                && !permitted_dns.iter().any(|p| Self::dns_in_subtree(d, p))
+            {
+                return Err(ChainError::NameConstraintViolation);
+            }
+        }
+
+        for p in &leaf_san.ip {
+            if nc.excluded.ip.iter().any(|ex| Self::ip_in_subtree(p, ex)) {
+                return Err(ChainError::NameConstraintViolation);
+            }
+            if !nc.permitted.ip.is_empty()
+                && !nc
+                    .permitted
+                    .ip
+                    .iter()
+                    .any(|net| Self::ip_in_subtree(p, net))
+            {
+                return Err(ChainError::NameConstraintViolation);
+            }
+        }
+        Ok(())
+    }
+
+    fn dns_in_subtree(name: &[u8], constraint: &[u8]) -> bool {
+        if constraint.is_empty() {
+            return true;
+        }
+        let (constraint, subdomains_only) = match constraint.split_first() {
+            Some((b'.', rest)) => (rest, true),
+            _ => (constraint, false),
+        };
+        if !subdomains_only && name == constraint {
+            return true;
+        }
+        name.len() > constraint.len()
+            && name[name.len() - constraint.len() - 1] == b'.'
+            && &name[name.len() - constraint.len()..] == constraint
+    }
+
+    fn ip_in_subtree(addr: &[u8], net: &[u8]) -> bool {
+        if net.len() != addr.len() * 2 {
+            return false;
+        }
+        let (network, mask) = net.split_at(addr.len());
+        addr.iter()
+            .zip(network)
+            .zip(mask)
+            .all(|((a, n), m)| (a & m) == (n & m))
     }
 
     fn check_validity(c: &Cert<'_>, now: UnixTime) -> Result<(), ChainError> {
@@ -150,29 +250,22 @@ impl Chain {
         }
     }
 
-    fn check_hostname(leaf: &Cert<'_>, host: &[u8]) -> Result<(), ChainError> {
-        let exts = leaf.extensions_der.ok_or(ChainError::HostnameMismatch)?;
-        let (_, san_val) =
-            ExtensionIter::find(exts, OID_EXT_SAN)?.ok_or(ChainError::HostnameMismatch)?;
-        let names = GeneralName::parse_alt_names(san_val)?;
-        let lowered = Self::ascii_lower(host);
-        let is_ip = Self::parse_ip(host).is_some();
-        for n in &names {
-            match n {
-                crate::cert::GeneralName::DnsName(d) if !is_ip => {
-                    let presented = Self::ascii_lower(d);
-                    if Hostname::dns_matches(&presented, &lowered) {
-                        return Ok(());
-                    }
+    fn check_hostname(leaf_san: &LeafSan<'_>, host: &[u8]) -> Result<(), ChainError> {
+        match Self::parse_ip(host) {
+            Some(target) => {
+                if leaf_san.ip.iter().any(|p| Hostname::ip_matches(p, &target)) {
+                    return Ok(());
                 }
-                crate::cert::GeneralName::IpAddress(p) if is_ip => {
-                    if let Some(target) = Self::parse_ip(host)
-                        && Hostname::ip_matches(p, &target)
-                    {
-                        return Ok(());
-                    }
+            }
+            None => {
+                let lowered = Self::ascii_lower(host);
+                if leaf_san
+                    .dns
+                    .iter()
+                    .any(|d| Hostname::dns_matches(d, &lowered))
+                {
+                    return Ok(());
                 }
-                _ => {}
             }
         }
         Err(ChainError::HostnameMismatch)
