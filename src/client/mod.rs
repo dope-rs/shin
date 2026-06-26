@@ -14,19 +14,21 @@ use crate::hostname::Hostname;
 use crate::kx::EphemeralKey;
 use crate::proto::{
     Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertType, CertVerify,
-    Finished as FinishedProto, KeyShare, SUITE_AES_128_GCM_SHA256, ServerName, SignatureAlgorithms,
-    SupportedGroups, SupportedVersions, TLS_1_3,
+    Finished as FinishedProto, GROUP_X25519, KeyShare, SUITE_AES_128_GCM_SHA256, ServerName,
+    SignatureAlgorithms, SupportedGroups, SupportedVersions, TLS_1_3,
 };
 use crate::schedule::KeySchedule;
 use crate::spki;
 use crate::time::UnixTime;
-use crate::{Epoch, Error, Event};
+use crate::{Clock, Epoch, Error, Event};
 
 mod config;
 
 pub use config::{Config, OwnedTrustAnchor, Resumption, Verifier};
 
 use config::{LeafKey, LeafKeyKind};
+
+use crate::handshake::HELLO_RETRY_REQUEST_RANDOM as HRR_RANDOM;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -39,7 +41,7 @@ enum State {
     Done,
 }
 
-pub struct Client {
+pub struct Client<C: Clock> {
     config: Config,
     state: State,
     transcript: Transcript,
@@ -54,13 +56,21 @@ pub struct Client {
     selected_alpn: Option<Vec<u8>>,
     resumption_master: Option<[u8; 32]>,
     psk_used: bool,
+    early_data_offered: bool,
+    early_data_accepted: bool,
+    ee_offered: Vec<ExtensionType>,
+    clock: C,
+    client_random: [u8; RANDOM_LEN],
+    session_id: Vec<u8>,
+    hrr_done: bool,
     reasm: HsReassembler,
 }
 
-impl Client {
-    pub fn new(config: Config) -> Self {
+impl<C: Clock> Client<C> {
+    pub fn new(config: Config, clock: C) -> Self {
         Self {
             config,
+            clock,
             state: State::Initial,
             transcript: Transcript::new(),
             rng: SystemRandom::new(),
@@ -74,6 +84,12 @@ impl Client {
             selected_alpn: None,
             resumption_master: None,
             psk_used: false,
+            early_data_offered: false,
+            early_data_accepted: false,
+            ee_offered: Vec::new(),
+            client_random: [0u8; RANDOM_LEN],
+            session_id: Vec::new(),
+            hrr_done: false,
             reasm: HsReassembler::default(),
         }
     }
@@ -82,22 +98,18 @@ impl Client {
         self.selected_alpn.as_deref()
     }
 
-    pub fn start(&mut self) -> Result<Vec<Event>, Error> {
-        if self.state != State::Initial {
-            return Err(Error::UnexpectedMessage);
-        }
-        let eph = EphemeralKey::generate(&self.rng).map_err(|_| Error::Kx)?;
-
-        let mut client_random = [0u8; RANDOM_LEN];
-        self.rng.fill(&mut client_random).map_err(|_| Error::Rng)?;
-        let mut session_id = [0u8; 32];
-        self.rng.fill(&mut session_id).map_err(|_| Error::Rng)?;
-
+    /// Extensions shared by ClientHello1 and the HelloRetryRequest retry,
+    /// optionally echoing a `cookie` (RFC 8446 §4.2.2). PSK/early-data are
+    /// appended by the caller since their binders depend on the final layout.
+    fn base_extensions(
+        &self,
+        kx_pubkey: &[u8; 32],
+        cookie: Option<&[u8]>,
+    ) -> Result<Vec<Extension>, Error> {
         let server_cert_type = match self.config.verifier {
             Verifier::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
             Verifier::X509 { .. } => CERT_TYPE_X509,
         };
-
         let mut extensions = alloc::vec![
             Extension::new(
                 ExtensionType::SUPPORTED_VERSIONS,
@@ -111,10 +123,7 @@ impl Client {
                     Verifier::X509 { .. } => SignatureAlgorithms::x509_encode(),
                 }
             ),
-            Extension::new(
-                ExtensionType::KEY_SHARE,
-                KeyShare::client_encode(eph.pubkey())
-            ),
+            Extension::new(ExtensionType::KEY_SHARE, KeyShare::client_encode(kx_pubkey)),
         ];
 
         if matches!(self.config.verifier, Verifier::RawPublicKey { .. }) {
@@ -151,8 +160,60 @@ impl Client {
             ));
         }
 
+        if let Some(c) = cookie {
+            extensions.push(Extension::new(ExtensionType::COOKIE, c.to_vec()));
+        }
+
+        Ok(extensions)
+    }
+
+    fn build_client_hello(&self, extensions: Vec<Extension>) -> ClientHello {
+        ClientHello {
+            legacy_version: TLS_1_2,
+            random: self.client_random,
+            legacy_session_id: self.session_id.clone(),
+            cipher_suites: alloc::vec![SUITE_AES_128_GCM_SHA256],
+            legacy_compression_methods: alloc::vec![0],
+            extensions,
+        }
+    }
+
+    /// Offered extensions the server may legally echo in EncryptedExtensions
+    /// (RFC 8446 §4.2); EE rejects anything else.
+    fn record_ee_offered(&mut self, extensions: &[Extension]) {
+        self.ee_offered = extensions
+            .iter()
+            .map(|e| e.ty)
+            .filter(|ty| Self::ee_eligible(*ty))
+            .collect();
+    }
+
+    fn encode_client_hello(&mut self, extensions: Vec<Extension>) -> Vec<u8> {
+        self.record_ee_offered(&extensions);
+        let ch = self.build_client_hello(extensions);
+        let mut ch_bytes = Vec::new();
+        Handshake::ClientHello(ch).encode(&mut ch_bytes);
+        ch_bytes
+    }
+
+    pub fn start(&mut self) -> Result<Vec<Event>, Error> {
+        if self.state != State::Initial {
+            return Err(Error::UnexpectedMessage);
+        }
+        let eph = EphemeralKey::generate(&self.rng).map_err(|_| Error::Kx)?;
+
+        let mut client_random = [0u8; RANDOM_LEN];
+        self.rng.fill(&mut client_random).map_err(|_| Error::Rng)?;
+        let mut session_id = [0u8; 32];
+        self.rng.fill(&mut session_id).map_err(|_| Error::Rng)?;
+        self.client_random = client_random;
+        self.session_id = session_id.to_vec();
+
+        let mut extensions = self.base_extensions(eph.pubkey(), None)?;
+
         let resumption = self.config.resumption.clone();
         let early_data_offered = self.config.enable_early_data && resumption.is_some();
+        self.early_data_offered = early_data_offered;
         if let Some(r) = &resumption {
             if early_data_offered {
                 extensions.push(Extension::new(ExtensionType::EARLY_DATA, Vec::new()));
@@ -173,17 +234,7 @@ impl Client {
             let _ = r;
         }
 
-        let ch = ClientHello {
-            legacy_version: TLS_1_2,
-            random: client_random,
-            legacy_session_id: session_id.to_vec(),
-            cipher_suites: alloc::vec![SUITE_AES_128_GCM_SHA256],
-            legacy_compression_methods: alloc::vec![0],
-            extensions,
-        };
-
-        let mut ch_bytes = Vec::new();
-        Handshake::ClientHello(ch).encode(&mut ch_bytes);
+        let mut ch_bytes = self.encode_client_hello(extensions);
 
         if let Some(r) = &resumption {
             let n = ch_bytes.len();
@@ -263,11 +314,23 @@ impl Client {
                     let psk = crate::schedule::ResumptionMaster::new(rms).psk(&nst.ticket_nonce);
                     events.push(Event::ResumptionSecret { psk });
                 }
+                let max_early_data = nst
+                    .extensions
+                    .iter()
+                    .find(|e| e.ty == ExtensionType::EARLY_DATA)
+                    .map(|e| {
+                        let mut r = crate::codec::Reader::new(&e.data);
+                        let v = r.u32().map_err(Error::from)?;
+                        r.finish().map_err(Error::from)?;
+                        Ok::<u32, Error>(v)
+                    })
+                    .transpose()?;
                 events.push(Event::NewSessionTicket {
                     ticket_lifetime: nst.ticket_lifetime,
                     ticket_age_add: nst.ticket_age_add,
                     ticket_nonce: nst.ticket_nonce,
                     ticket: nst.ticket,
+                    max_early_data,
                 });
                 Ok(())
             }
@@ -318,14 +381,8 @@ impl Client {
         if sh.cipher_suite != SUITE_AES_128_GCM_SHA256 {
             return Err(Error::UnsupportedCipherSuite);
         }
-        // RFC 8446 §4.1.3: HRR random. We offer only X25519, so any HRR is unsatisfiable.
-        const HRR_RANDOM: [u8; RANDOM_LEN] = [
-            0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
-            0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
-            0xc8, 0xa8, 0x33, 0x9c,
-        ];
         if sh.random == HRR_RANDOM {
-            return Err(Error::HelloRetryRequest);
+            return self.handle_hello_retry_request(sh, raw, events);
         }
         const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
         const DOWNGRADE_TLS11: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
@@ -407,6 +464,78 @@ impl Client {
         Ok(())
     }
 
+    /// Handle a HelloRetryRequest (RFC 8446 §4.1.4): resend the ClientHello with
+    /// the same key share and the echoed cookie over the rewritten transcript. At
+    /// most one HRR, only for our single group; resumption + HRR is unsupported.
+    fn handle_hello_retry_request(
+        &mut self,
+        hrr: ServerHello,
+        raw: &[u8],
+        events: &mut Vec<Event>,
+    ) -> Result<(), Error> {
+        if self.hrr_done {
+            return Err(Error::UnexpectedMessage);
+        }
+        if self.config.resumption.is_some() {
+            return Err(Error::HelloRetryRequest);
+        }
+
+        let mut saw_supported_versions = false;
+        let mut selected_group = None;
+        let mut cookie = None;
+        for ext in &hrr.extensions {
+            match ext.ty {
+                ExtensionType::SUPPORTED_VERSIONS => {
+                    if SupportedVersions::server_decode(&ext.data)? != TLS_1_3 {
+                        return Err(Error::BadVersion);
+                    }
+                    saw_supported_versions = true;
+                }
+                ExtensionType::KEY_SHARE => {
+                    selected_group = Some(KeyShare::hrr_selected_group(&ext.data)?);
+                }
+                ExtensionType::COOKIE => cookie = Some(ext.data.clone()),
+                _ => return Err(Error::UnsolicitedExtension),
+            }
+        }
+        if !saw_supported_versions {
+            return Err(Error::MissingExtension);
+        }
+        if selected_group.ok_or(Error::MissingExtension)? != GROUP_X25519 {
+            return Err(Error::UnsupportedGroup);
+        }
+
+        let h1 = self.transcript.hash();
+        self.transcript = Transcript::restart_with_message_hash(h1);
+        self.transcript.update(raw);
+
+        let eph_pub = *self.eph.as_ref().ok_or(Error::UnexpectedMessage)?.pubkey();
+        let extensions = self.base_extensions(&eph_pub, cookie.as_deref())?;
+        let ch_bytes = self.encode_client_hello(extensions);
+        self.transcript.update(&ch_bytes);
+        self.hrr_done = true;
+        events.push(Event::Send {
+            epoch: Epoch::Plaintext,
+            data: ch_bytes,
+        });
+        Ok(())
+    }
+
+    /// Extension types this client may offer that are also legal in
+    /// EncryptedExtensions (RFC 8446 §4.2).
+    fn ee_eligible(ty: ExtensionType) -> bool {
+        matches!(
+            ty,
+            ExtensionType::SERVER_NAME
+                | ExtensionType::SUPPORTED_GROUPS
+                | ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION
+                | ExtensionType::SERVER_CERTIFICATE_TYPE
+                | ExtensionType::CLIENT_CERTIFICATE_TYPE
+                | ExtensionType::EARLY_DATA
+                | ExtensionType::QUIC_TRANSPORT_PARAMETERS
+        )
+    }
+
     fn handle_encrypted_extensions(
         &mut self,
         ee: EncryptedExtensions,
@@ -414,6 +543,10 @@ impl Client {
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         for ext in &ee.extensions {
+            if !self.ee_offered.contains(&ext.ty) {
+                return Err(Error::UnsolicitedExtension);
+            }
+
             if ext.ty == ExtensionType::QUIC_TRANSPORT_PARAMETERS {
                 events.push(Event::PeerExtension {
                     ty: ext.ty.0,
@@ -422,14 +555,26 @@ impl Client {
             } else if ext.ty == ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION {
                 let chosen = Alpn::decode(&ext.data).map_err(|_| Error::Decode)?;
                 if chosen.len() != 1 {
-                    return Err(Error::Decode);
+                    return Err(Error::IllegalParameter);
                 }
                 let pick = chosen.into_iter().next().unwrap();
                 if !self.config.alpn_protocols.iter().any(|p| p == &pick) {
-                    return Err(Error::UnexpectedMessage);
+                    return Err(Error::IllegalParameter);
                 }
                 self.selected_alpn = Some(pick);
+            } else if ext.ty == ExtensionType::EARLY_DATA {
+                if !self.early_data_offered || !ext.data.is_empty() {
+                    return Err(Error::UnsolicitedExtension);
+                }
+                self.early_data_accepted = true;
             }
+        }
+        if self.early_data_offered {
+            events.push(if self.early_data_accepted {
+                Event::EarlyDataAccepted
+            } else {
+                Event::EarlyDataRejected
+            });
         }
         self.transcript.update(raw);
         self.state = if self.psk_used {
@@ -460,11 +605,8 @@ impl Client {
                     raw: server_pk.to_vec(),
                 });
             }
-            Verifier::X509 {
-                anchors,
-                hostname,
-                now_seconds,
-            } => {
+            Verifier::X509 { anchors, hostname } => {
+                let now_seconds = self.clock.now_ms() / 1000;
                 if cert.certificate_list.is_empty() {
                     return Err(Error::BadCertificate);
                 }
@@ -478,7 +620,7 @@ impl Client {
                     .iter()
                     .map(|a| a.view())
                     .collect::<Result<Vec<_>, _>>()?;
-                Chain::validate(&parsed, &anchor_views, UnixTime(*now_seconds), hostname).map_err(
+                Chain::validate(&parsed, &anchor_views, UnixTime(now_seconds), hostname).map_err(
                     |e| match e {
                         crate::chain::ChainError::NoTrustAnchor => Error::NoTrustAnchorForIssuer(
                             parsed.last().unwrap().issuer_der.to_vec(),
@@ -581,7 +723,18 @@ impl Client {
             write_secret: c_ap,
         });
 
-        let cf_data = FinishedProto::verify_data(&c_hs, &h_sf);
+        if self.early_data_accepted {
+            let mut eod_bytes = Vec::new();
+            Handshake::EndOfEarlyData.encode(&mut eod_bytes);
+            self.transcript.update(&eod_bytes);
+            events.push(Event::Send {
+                epoch: Epoch::EarlyData,
+                data: eod_bytes,
+            });
+        }
+
+        let h_pre_cf = self.transcript.hash();
+        let cf_data = FinishedProto::verify_data(&c_hs, &h_pre_cf);
         let cf = Finished {
             verify_data: cf_data.to_vec(),
         };

@@ -23,28 +23,34 @@ fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x55u8; 32]).unwrap()
 }
 
-fn rpk_client() -> Client {
-    Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: *signing_key().pubkey().unwrap(),
+fn rpk_client() -> Client<fn() -> u64> {
+    Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: *signing_key().pubkey().unwrap(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    })
+        || 0,
+    )
 }
 
-fn rpk_server() -> Server {
-    Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: signing_key(),
+fn rpk_server() -> Server<fn() -> u64> {
+    Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: signing_key(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    })
+        || 0,
+    )
 }
 
 fn send(events: &[Event], epoch: Epoch) -> Vec<u8> {
@@ -59,7 +65,7 @@ fn send(events: &[Event], epoch: Epoch) -> Vec<u8> {
 
 /// Drives a full RPK handshake so the returned client is in the post-handshake
 /// (Done) state, where KeyUpdate is the only legal message.
-fn completed_rpk_client() -> Client {
+fn completed_rpk_client() -> Client<fn() -> u64> {
     let mut server = rpk_server();
     let mut client = rpk_client();
     let c1 = client.start().unwrap();
@@ -105,14 +111,67 @@ fn server_hello(random: [u8; RANDOM_LEN], extensions: Vec<Extension>) -> Vec<u8>
     out
 }
 
+fn hrr_key_share_ext() -> Extension {
+    Extension::new(
+        ExtensionType::KEY_SHARE,
+        GROUP_X25519.to_be_bytes().to_vec(),
+    )
+}
+
+fn cookie_ext(inner: &[u8]) -> Extension {
+    let mut data = Vec::new();
+    data.extend_from_slice(&(inner.len() as u16).to_be_bytes());
+    data.extend_from_slice(inner);
+    Extension::new(ExtensionType::COOKIE, data)
+}
+
 #[test]
-fn client_detects_hello_retry_request() {
+fn client_answers_hello_retry_request_echoing_cookie() {
     let mut c = rpk_client();
     c.start().unwrap();
-    let sh = server_hello(HRR_RANDOM, vec![supported_versions_ext(), key_share_ext()]);
+    let cookie = cookie_ext(b"server-supplied-cookie");
+    let sh = server_hello(
+        HRR_RANDOM,
+        vec![
+            supported_versions_ext(),
+            hrr_key_share_ext(),
+            cookie.clone(),
+        ],
+    );
+    let evs = c
+        .read(Epoch::Plaintext, &sh)
+        .expect("HRR is answered, not aborted");
+    let retry = send(&evs, Epoch::Plaintext);
+    use shin::handshake::{Handshake, HandshakeType};
+    let mut r = Reader::new(&retry);
+    let Handshake::ClientHello(ch2) = Handshake::decode(&mut r).unwrap() else {
+        panic!("retry must be a ClientHello");
+    };
+    let _ = HandshakeType::ClientHello;
+    let echoed = ch2
+        .extensions
+        .iter()
+        .find(|e| e.ty == ExtensionType::COOKIE)
+        .expect("retry must echo the cookie");
+    assert_eq!(echoed.data, cookie.data);
+}
+
+#[test]
+fn client_rejects_second_hello_retry_request() {
+    let mut c = rpk_client();
+    c.start().unwrap();
+    let sh = server_hello(
+        HRR_RANDOM,
+        vec![supported_versions_ext(), hrr_key_share_ext()],
+    );
+    c.read(Epoch::Plaintext, &sh).expect("first HRR answered");
+    let sh2 = server_hello(
+        HRR_RANDOM,
+        vec![supported_versions_ext(), hrr_key_share_ext()],
+    );
     assert_eq!(
-        c.read(Epoch::Plaintext, &sh).unwrap_err(),
-        Error::HelloRetryRequest
+        c.read(Epoch::Plaintext, &sh2).unwrap_err(),
+        Error::UnexpectedMessage,
     );
 }
 
@@ -178,6 +237,70 @@ fn client_rejects_certificate_verify_with_unoffered_scheme() {
     assert_eq!(
         client.read(Epoch::Handshake, &tampered).unwrap_err(),
         Error::SigSchemeNotOffered
+    );
+}
+
+fn tamper_ee<F: FnMut(&mut Vec<Extension>)>(flight: &[u8], mut f: F) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut r = Reader::new(flight);
+    while !r.is_empty() {
+        match Handshake::decode(&mut r).unwrap() {
+            Handshake::EncryptedExtensions(mut ee) => {
+                f(&mut ee.extensions);
+                Handshake::EncryptedExtensions(ee).encode(&mut out);
+            }
+            other => other.encode(&mut out),
+        }
+    }
+    out
+}
+
+#[test]
+fn client_rejects_unsolicited_encrypted_extension() {
+    let mut server = rpk_server();
+    let mut client = rpk_client();
+    let c1 = client.start().unwrap();
+    let s1 = server
+        .read(Epoch::Plaintext, &send(&c1, Epoch::Plaintext))
+        .unwrap();
+    client
+        .read(Epoch::Plaintext, &send(&s1, Epoch::Plaintext))
+        .unwrap();
+
+    let tampered = tamper_ee(&send(&s1, Epoch::Handshake), |exts| {
+        exts.push(Extension::new(
+            ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+            vec![0x00, 0x03, 0x02, b'h', b'2'],
+        ));
+    });
+
+    assert_eq!(
+        client.read(Epoch::Handshake, &tampered).unwrap_err(),
+        Error::UnsolicitedExtension
+    );
+}
+
+#[test]
+fn client_rejects_duplicate_encrypted_extension() {
+    let mut server = rpk_server();
+    let mut client = rpk_client();
+    let c1 = client.start().unwrap();
+    let s1 = server
+        .read(Epoch::Plaintext, &send(&c1, Epoch::Plaintext))
+        .unwrap();
+    client
+        .read(Epoch::Plaintext, &send(&s1, Epoch::Plaintext))
+        .unwrap();
+
+    let tampered = tamper_ee(&send(&s1, Epoch::Handshake), |exts| {
+        if let Some(first) = exts.first().cloned() {
+            exts.push(first);
+        }
+    });
+
+    assert_eq!(
+        client.read(Epoch::Handshake, &tampered).unwrap_err(),
+        Error::Decode
     );
 }
 

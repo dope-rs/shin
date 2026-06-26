@@ -6,15 +6,18 @@ use shin::psk::{KX_MODE_PSK_DHE, KxModes, Offer};
 use shin::{Epoch, Event};
 
 fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
-    let mut c = Client::new(Config {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: [0x42u8; 32],
+    let mut c = Client::new(
+        Config {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: [0x42u8; 32],
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption,
-        enable_early_data: false,
-    });
+        || 0,
+    );
     let evs = c.start().unwrap();
     let ch_bytes = evs
         .into_iter()
@@ -103,15 +106,18 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
         age_millis: 1_000,
     };
 
-    let mut c = Client::new(Config {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: [0x42u8; 32],
+    let mut c = Client::new(
+        Config {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: [0x42u8; 32],
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: Some(resumption.clone()),
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: Some(resumption.clone()),
-        enable_early_data: false,
-    });
+        || 0,
+    );
     let ch_bytes = c
         .start()
         .unwrap()

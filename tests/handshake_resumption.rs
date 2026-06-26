@@ -1,9 +1,16 @@
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::{Clock, Epoch, Event};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
+
+struct FixedClock(u64);
+impl Clock for FixedClock {
+    fn now_ms(&self) -> u64 {
+        self.0
+    }
+}
 
 fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
     events.iter().find_map(|e| match e {
@@ -16,31 +23,40 @@ fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x55u8; 32]).unwrap()
 }
 
-fn fresh_server() -> Server {
-    Server::new(ServerConfig {
-        source: CertSource::RawPublicKey {
-            signing_key: signing_key(),
+fn fresh_server() -> Server<FixedClock> {
+    Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: signing_key(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: Some(TICKET_SECRET),
-        accept_early_data: false,
-    })
+        FixedClock(1_000_000),
+    )
 }
 
-fn fresh_client(resumption: Option<Resumption>) -> Client {
-    Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: *signing_key().pubkey().unwrap(),
+fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
+    Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: *signing_key().pubkey().unwrap(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption,
-        enable_early_data: false,
-    })
+        || 0,
+    )
 }
 
-fn drive(client: &mut Client, server: &mut Server) -> (Vec<Event>, Vec<Event>) {
+fn drive(
+    client: &mut Client<fn() -> u64>,
+    server: &mut Server<FixedClock>,
+) -> (Vec<Event>, Vec<Event>) {
     let mut all_client = Vec::new();
     let mut all_server = Vec::new();
 

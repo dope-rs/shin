@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use ring::rand::{SecureRandom, SystemRandom};
@@ -7,7 +6,8 @@ use crate::codec::Encode;
 use crate::extension::{Extension, ExtensionType};
 use crate::handshake::{
     Certificate, CertificateEntry, CertificateVerify, ClientHello, EncryptedExtensions, Finished,
-    Handshake, HsReassembler, NewSessionTicket, RANDOM_LEN, ServerHello, TLS_1_2,
+    HELLO_RETRY_REQUEST_RANDOM, Handshake, HsReassembler, NewSessionTicket, RANDOM_LEN,
+    ServerHello, TLS_1_2,
 };
 use crate::hash::Transcript;
 use crate::kx::EphemeralKey;
@@ -19,14 +19,15 @@ use crate::proto::{
 use crate::schedule::KeySchedule;
 use crate::sig::SigningKey;
 use crate::spki;
-use crate::{Epoch, Error, Event};
+use crate::ticket::TicketKeys;
+use crate::{Clock, Epoch, Error, Event};
 
 #[derive(Clone)]
 pub struct Config {
     pub source: CertSource,
     pub transport_params: Vec<u8>,
     pub alpn_protocols: Vec<Vec<u8>>,
-    pub ticket_secret: Option<[u8; 32]>,
+    pub ticket_keys: Option<TicketKeys>,
     pub accept_early_data: bool,
 }
 
@@ -36,12 +37,19 @@ pub struct Config {
 /// is set: neither the freshness window nor the single-use check can run
 /// (RFC 8446 §8).
 pub trait EarlyDataGuard {
-    /// Milliseconds since the UNIX epoch.
-    fn now_ms(&self) -> u64;
-
     /// Record a single-use token (the PSK binder); `false` means it was already
     /// seen — a replay. Tokens need only be kept for `TICKET_LIFETIME_SECS`.
     fn register(&mut self, token: &[u8]) -> bool;
+}
+
+/// Default guard for servers that never accept 0-RTT: reports every token as
+/// already-seen, so early data is always refused.
+pub struct NoGuard;
+
+impl EarlyDataGuard for NoGuard {
+    fn register(&mut self, _token: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Allowed skew between client-claimed and server-measured ticket age (RFC 8446 §8.2).
@@ -86,11 +94,12 @@ impl CertSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     ExpectClientHello,
+    ExpectEndOfEarlyData,
     ExpectClientFinished,
     Done,
 }
 
-pub struct Server {
+pub struct Server<C: Clock, G: EarlyDataGuard = NoGuard> {
     config: Config,
     state: State,
     transcript: Transcript,
@@ -101,14 +110,31 @@ pub struct Server {
     s_ap_traffic: Option<[u8; 32]>,
     selected_alpn: Option<Vec<u8>>,
     master: Option<KeySchedule>,
-    early_data_guard: Option<Box<dyn EarlyDataGuard>>,
+    early_data_guard: Option<G>,
+    clock: C,
+    hrr_done: bool,
     reasm: HsReassembler,
 }
 
-impl Server {
-    pub fn new(config: Config) -> Self {
+impl<C: Clock> Server<C, NoGuard> {
+    /// A server that never accepts 0-RTT. For 0-RTT use
+    /// [`with_early_data_guard`](Server::with_early_data_guard).
+    pub fn new(config: Config, clock: C) -> Self {
+        Self::build(config, clock, None)
+    }
+}
+
+impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
+    /// A server that accepts 0-RTT, gated by `guard` (replay store + freshness).
+    pub fn with_early_data_guard(config: Config, clock: C, guard: G) -> Self {
+        Self::build(config, clock, Some(guard))
+    }
+
+    fn build(config: Config, clock: C, early_data_guard: Option<G>) -> Self {
         Self {
             config,
+            clock,
+            early_data_guard,
             state: State::ExpectClientHello,
             transcript: Transcript::new(),
             rng: SystemRandom::new(),
@@ -118,14 +144,13 @@ impl Server {
             s_ap_traffic: None,
             selected_alpn: None,
             master: None,
-            early_data_guard: None,
+            hrr_done: false,
             reasm: HsReassembler::default(),
         }
     }
 
-    /// Install the [`EarlyDataGuard`]; required before any 0-RTT data is accepted.
-    pub fn set_early_data_guard(&mut self, guard: Box<dyn EarlyDataGuard>) {
-        self.early_data_guard = Some(guard);
+    fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
@@ -151,6 +176,11 @@ impl Server {
         match (self.state, msg) {
             (State::ExpectClientHello, Handshake::ClientHello(ch)) if epoch == Epoch::Plaintext => {
                 self.handle_client_hello(ch, raw, events)
+            }
+            (State::ExpectEndOfEarlyData, Handshake::EndOfEarlyData)
+                if epoch == Epoch::EarlyData =>
+            {
+                self.handle_end_of_early_data(raw)
             }
             (State::ExpectClientFinished, Handshake::Finished(f)) if epoch == Epoch::Handshake => {
                 self.handle_client_finished(f, raw, events)
@@ -206,7 +236,7 @@ impl Server {
             return Err(Error::UnsupportedCipherSuite);
         }
         if ch.legacy_compression_methods != [0] {
-            return Err(Error::Decode);
+            return Err(Error::IllegalParameter);
         }
         if ch.legacy_session_id.len() > 32 {
             return Err(Error::Decode);
@@ -236,12 +266,18 @@ impl Server {
         if !SignatureAlgorithms::decode(&sigs.data)?.contains(&local_sig_scheme) {
             return Err(Error::UnsupportedSigScheme);
         }
-        let ks = ch
+        let peer_pubkey = match ch
             .extensions
             .iter()
             .find(|e| e.ty == ExtensionType::KEY_SHARE)
-            .ok_or(Error::MissingExtension)?;
-        let peer_pubkey = KeyShare::client_decode(&ks.data)?;
+            .map(|ks| KeyShare::client_decode(&ks.data))
+        {
+            Some(Ok(pk)) => pk,
+            _ if !self.hrr_done => {
+                return self.send_hello_retry_request(raw, &ch.legacy_session_id, events);
+            }
+            _ => return Err(Error::MissingExtension),
+        };
 
         // RFC 7250 §4.1 — server MUST NOT echo the cert_type extensions
         // unless the client offered them. Same applies to RFC 9001's
@@ -268,6 +304,9 @@ impl Server {
                     .iter()
                     .find(|s| offered.iter().any(|o| o == *s))
                     .cloned();
+                if self.selected_alpn.is_none() && !offered.is_empty() {
+                    return Err(Error::NoApplicationProtocol);
+                }
             } else if ext.ty == ExtensionType::SERVER_CERTIFICATE_TYPE {
                 client_offered_server_cert_type =
                     Some(CertType::decode_list(&ext.data).map_err(|_| Error::Decode)?);
@@ -489,13 +528,65 @@ impl Server {
         });
 
         self.c_hs_traffic = Some(c_hs);
-        self.expected_client_finished = Some(FinishedProto::verify_data(&c_hs, &h_sf));
+        if early_accepted {
+            self.state = State::ExpectEndOfEarlyData;
+        } else {
+            self.expected_client_finished = Some(FinishedProto::verify_data(&c_hs, &h_sf));
+            self.state = State::ExpectClientFinished;
+        }
+        Ok(())
+    }
+
+    /// RFC 8446 §4.1.4: ask for a retry (one only) when the ClientHello carried
+    /// no usable key_share, rewriting the transcript to `message_hash(CH1)`.
+    fn send_hello_retry_request(
+        &mut self,
+        ch_raw: &[u8],
+        session_id_echo: &[u8],
+        events: &mut Vec<Event>,
+    ) -> Result<(), Error> {
+        let hrr = ServerHello {
+            legacy_version: TLS_1_2,
+            random: HELLO_RETRY_REQUEST_RANDOM,
+            legacy_session_id_echo: session_id_echo.to_vec(),
+            cipher_suite: SUITE_AES_128_GCM_SHA256,
+            legacy_compression_method: 0,
+            extensions: alloc::vec![
+                Extension::new(
+                    ExtensionType::SUPPORTED_VERSIONS,
+                    crate::proto::SupportedVersions::server_encode(),
+                ),
+                Extension::new(ExtensionType::KEY_SHARE, KeyShare::hrr_encode()),
+            ],
+        };
+        let mut hrr_bytes = Vec::new();
+        Handshake::ServerHello(hrr).encode(&mut hrr_bytes);
+
+        let mut t = Transcript::new();
+        t.update(ch_raw);
+        self.transcript = Transcript::restart_with_message_hash(t.hash());
+        self.transcript.update(&hrr_bytes);
+
+        self.hrr_done = true;
+        events.push(Event::Send {
+            epoch: Epoch::Plaintext,
+            data: hrr_bytes,
+        });
+        Ok(())
+    }
+
+    fn handle_end_of_early_data(&mut self, raw: &[u8]) -> Result<(), Error> {
+        let c_hs = self.c_hs_traffic.ok_or(Error::UnexpectedMessage)?;
+        self.transcript.update(raw);
+        let h = self.transcript.hash();
+        self.expected_client_finished = Some(FinishedProto::verify_data(&c_hs, &h));
         self.state = State::ExpectClientFinished;
         Ok(())
     }
 
     fn try_accept_psk(&self, ch: &ClientHello, raw: &[u8]) -> Option<AcceptedPsk> {
-        let secret = self.config.ticket_secret?;
+        let keys = self.config.ticket_keys.as_ref()?;
+        let now = self.now_ms();
         let kx_ext = ch
             .extensions
             .iter()
@@ -514,17 +605,12 @@ impl Server {
         if bind.len() != 32 {
             return None;
         }
-        let (psk, age_add, issued_at_ms, alpn) = crate::ticket::TicketSecret::new(secret)
-            .decrypt(&id.identity)
-            .ok()?;
-        if let Some(guard) = self.early_data_guard.as_ref() {
-            let now = guard.now_ms();
-            if issued_at_ms > now.saturating_add(MAX_TICKET_AGE_SKEW_MS) {
-                return None;
-            }
-            if now.saturating_sub(issued_at_ms) > TICKET_LIFETIME_MS {
-                return None;
-            }
+        let (psk, age_add, issued_at_ms, alpn) = keys.decrypt(&id.identity).ok()?;
+        if issued_at_ms > now.saturating_add(MAX_TICKET_AGE_SKEW_MS) {
+            return None;
+        }
+        if now.saturating_sub(issued_at_ms) > TICKET_LIFETIME_MS {
+            return None;
         }
         let n = raw.len();
         // RFC 8446 §4.2.11.2: strip the binders field (list_len 2 + binder_len 1 + binder).
@@ -551,10 +637,10 @@ impl Server {
 
     // 0-RTT requires a guard, a fresh-enough ticket, and a non-replayed binder.
     fn check_early_data_replay(&mut self, p: &AcceptedPsk) -> bool {
+        let now = self.now_ms();
         let Some(guard) = self.early_data_guard.as_mut() else {
             return false;
         };
-        let now = guard.now_ms();
         if now < p.issued_at_ms {
             return false;
         }
@@ -593,9 +679,10 @@ impl Server {
         let Some(master) = self.master.as_ref() else {
             return Ok(());
         };
-        let Some(ticket_secret) = self.config.ticket_secret else {
+        let Some(keys) = self.config.ticket_keys.as_ref() else {
             return Ok(());
         };
+        let issued_at_ms = self.now_ms();
         let h_cf = self.transcript.hash();
         let rms = master.resumption_master_secret(&h_cf);
         let mut nonce = [0u8; 8];
@@ -604,9 +691,8 @@ impl Server {
         self.rng.fill(&mut age_add_bytes).map_err(|_| Error::Rng)?;
         let age_add = u32::from_be_bytes(age_add_bytes);
         let psk = crate::schedule::ResumptionMaster::new(rms).psk(&nonce);
-        let issued_at_ms = self.early_data_guard.as_ref().map_or(0, |g| g.now_ms());
         let alpn = self.selected_alpn.clone().unwrap_or_default();
-        let ticket = crate::ticket::TicketSecret::new(ticket_secret)
+        let ticket = keys
             .encrypt(&psk, age_add, issued_at_ms, &alpn, &self.rng)
             .map_err(|_| Error::Rng)?;
         let mut nst_extensions = Vec::new();

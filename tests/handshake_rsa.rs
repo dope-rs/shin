@@ -61,27 +61,32 @@ fn handshake_with_rsa_pss_x509_chain() {
     };
     let now = now_inside(&cert_der);
 
-    let server = Server::new(ServerConfig {
-        source: CertSource::X509 {
-            chain_der: vec![cert_der.clone()],
-            signing_key: signing,
+    let server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![cert_der.clone()],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let client = Client::new(ClientConfig {
-        verifier: Verifier::X509 {
-            anchors: vec![anchor],
-            hostname: HOSTNAME.as_bytes().to_vec(),
-            now_seconds: now,
+        || 0,
+    );
+    let client = Client::new(
+        ClientConfig {
+            verifier: Verifier::X509 {
+                anchors: vec![anchor],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        move || now * 1000,
+    );
 
     let (mut client, mut server) = (client, server);
 

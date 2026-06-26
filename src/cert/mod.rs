@@ -4,7 +4,7 @@ mod ext;
 
 pub use ext::{
     BasicConstraints, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage, NameConstraints,
-    OID_EKU_CLIENT_AUTH, OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS,
+    OID_EKU_ANY, OID_EKU_CLIENT_AUTH, OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS,
     OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE, OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, Subtrees,
     is_handled_ext,
 };
@@ -291,8 +291,14 @@ pub const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 
 pub const OID_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 pub const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 
+pub const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+
 pub const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 pub const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
 
 pub const OID_P256_CURVE: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 pub const OID_P384_CURVE: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
@@ -306,41 +312,64 @@ pub enum VerifyError {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PssHash {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
 impl Cert<'_> {
     pub fn verify_signature(
         &self,
         issuer_spki: &SubjectPublicKeyInfo<'_>,
     ) -> Result<(), VerifyError> {
+        use ring::signature as s;
         let sig_oid = self.signature_alg.oid;
         let pk_oid = issuer_spki.algorithm.oid;
 
-        let alg: &dyn ring::signature::VerificationAlgorithm = match (sig_oid, pk_oid) {
-            (s, p) if s == OID_SHA256_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                &ring::signature::RSA_PKCS1_2048_8192_SHA256
+        match (sig_oid, pk_oid) {
+            (a, p) if a == OID_SHA256_WITH_RSA && p == OID_RSA_ENCRYPTION => {
+                self.verify_with(issuer_spki, &s::RSA_PKCS1_2048_8192_SHA256)
             }
-            (s, p) if s == OID_SHA384_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                &ring::signature::RSA_PKCS1_2048_8192_SHA384
+            (a, p) if a == OID_SHA384_WITH_RSA && p == OID_RSA_ENCRYPTION => {
+                self.verify_with(issuer_spki, &s::RSA_PKCS1_2048_8192_SHA384)
             }
-            (s, p) if s == OID_SHA512_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                &ring::signature::RSA_PKCS1_2048_8192_SHA512
+            (a, p) if a == OID_SHA512_WITH_RSA && p == OID_RSA_ENCRYPTION => {
+                self.verify_with(issuer_spki, &s::RSA_PKCS1_2048_8192_SHA512)
             }
-            (s, p) if s == OID_ECDSA_SHA256 && p == OID_EC_PUBLIC_KEY => {
+            (a, p) if a == OID_ECDSA_SHA256 && p == OID_EC_PUBLIC_KEY => {
                 Self::check_named_curve(issuer_spki, OID_P256_CURVE)?;
-                &ring::signature::ECDSA_P256_SHA256_ASN1
+                self.verify_with(issuer_spki, &s::ECDSA_P256_SHA256_ASN1)
             }
-            (s, p) if s == OID_ECDSA_SHA384 && p == OID_EC_PUBLIC_KEY => {
+            (a, p) if a == OID_ECDSA_SHA384 && p == OID_EC_PUBLIC_KEY => {
                 Self::check_named_curve(issuer_spki, OID_P384_CURVE)?;
-                &ring::signature::ECDSA_P384_SHA384_ASN1
+                self.verify_with(issuer_spki, &s::ECDSA_P384_SHA384_ASN1)
             }
-            (s, p) if s == OID_ED25519 && p == OID_ED25519 => &ring::signature::ED25519,
-            (s, p) if Self::known_sig(s) && Self::known_pk(p) => {
-                return Err(VerifyError::AlgorithmMismatch);
+            (a, p) if a == OID_ED25519 && p == OID_ED25519 => {
+                self.verify_with(issuer_spki, &s::ED25519)
             }
-            _ => return Err(VerifyError::UnsupportedAlgorithm),
-        };
+            (a, p) if a == OID_RSA_PSS && (p == OID_RSA_ENCRYPTION || p == OID_RSA_PSS) => {
+                match Self::pss_hash(self.signature_alg.parameters)? {
+                    PssHash::Sha256 => self.verify_with(issuer_spki, &s::RSA_PSS_2048_8192_SHA256),
+                    PssHash::Sha384 => self.verify_with(issuer_spki, &s::RSA_PSS_2048_8192_SHA384),
+                    PssHash::Sha512 => self.verify_with(issuer_spki, &s::RSA_PSS_2048_8192_SHA512),
+                }
+            }
+            (a, p) if Self::known_sig(a) && Self::known_pk(p) => {
+                Err(VerifyError::AlgorithmMismatch)
+            }
+            _ => Err(VerifyError::UnsupportedAlgorithm),
+        }
+    }
 
-        let key = ring::signature::UnparsedPublicKey::new(alg, issuer_spki.subject_public_key);
-        key.verify(self.tbs_der, self.signature)
+    fn verify_with<A: ring::signature::VerificationAlgorithm>(
+        &self,
+        issuer_spki: &SubjectPublicKeyInfo<'_>,
+        alg: &'static A,
+    ) -> Result<(), VerifyError> {
+        ring::signature::UnparsedPublicKey::new(alg, issuer_spki.subject_public_key)
+            .verify(self.tbs_der, self.signature)
             .map_err(|_| VerifyError::Failed)
     }
 
@@ -353,6 +382,7 @@ impl Cert<'_> {
                 || x == OID_ECDSA_SHA256
                 || x == OID_ECDSA_SHA384
                 || x == OID_ED25519
+                || x == OID_RSA_PSS
         )
     }
 
@@ -362,7 +392,30 @@ impl Cert<'_> {
             x if x == OID_RSA_ENCRYPTION
                 || x == OID_EC_PUBLIC_KEY
                 || x == OID_ED25519
+                || x == OID_RSA_PSS
         )
+    }
+
+    /// Message digest from RSASSA-PSS-params (RFC 4055 §3.1). Only the standard
+    /// MGF1-same-hash, salt = digest-length profile; SHA-1 default is rejected.
+    fn pss_hash(params: &[u8]) -> Result<PssHash, VerifyError> {
+        let mut r = Reader::new(params);
+        let inner = r.expect(Tag::SEQUENCE).map_err(|_| VerifyError::Failed)?;
+        let mut sr = Reader::new(inner);
+        let hash_field = sr
+            .read_optional(Tag::context(0, true))
+            .map_err(|_| VerifyError::Failed)?
+            .ok_or(VerifyError::UnsupportedAlgorithm)?;
+        let mut hr = Reader::new(hash_field);
+        let alg = hr.expect(Tag::SEQUENCE).map_err(|_| VerifyError::Failed)?;
+        let mut ar = Reader::new(alg);
+        let oid = ar.expect(Tag::OID).map_err(|_| VerifyError::Failed)?;
+        match oid {
+            x if x == OID_SHA256 => Ok(PssHash::Sha256),
+            x if x == OID_SHA384 => Ok(PssHash::Sha384),
+            x if x == OID_SHA512 => Ok(PssHash::Sha512),
+            _ => Err(VerifyError::UnsupportedAlgorithm),
+        }
     }
 
     fn check_named_curve(

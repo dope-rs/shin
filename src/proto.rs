@@ -128,6 +128,13 @@ impl KeyShare {
         v
     }
 
+    /// HelloRetryRequest key_share: the selected group only (RFC 8446 §4.2.8).
+    pub(crate) fn hrr_encode() -> Vec<u8> {
+        let mut v = Vec::with_capacity(2);
+        v.put_u16(GROUP_X25519);
+        v
+    }
+
     pub(crate) fn client_decode(data: &[u8]) -> Result<[u8; 32], DecodeError> {
         let mut r = Reader::new(data);
         let mut entries = r.sub_u16()?;
@@ -144,6 +151,15 @@ impl KeyShare {
             }
         }
         Err(DecodeError::InvalidEnum)
+    }
+
+    /// A HelloRetryRequest key_share carries only the server's selected group
+    /// (RFC 8446 §4.2.8), not a full KeyShareEntry.
+    pub(crate) fn hrr_selected_group(data: &[u8]) -> Result<u16, DecodeError> {
+        let mut r = Reader::new(data);
+        let group = r.u16()?;
+        r.finish()?;
+        Ok(group)
     }
 
     pub(crate) fn server_decode(data: &[u8]) -> Result<[u8; 32], DecodeError> {

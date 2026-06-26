@@ -5,13 +5,16 @@ use shin::handshake::{ClientHello, Handshake};
 use shin::{Epoch, Event};
 
 fn drive_client_hello(verifier: Verifier) -> ClientHello {
-    let mut c = Client::new(Config {
-        verifier,
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+    let mut c = Client::new(
+        Config {
+            verifier,
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
+        },
+        || 0,
+    );
     let evs = c.start().unwrap();
     let ch_bytes = evs
         .into_iter()
@@ -37,7 +40,6 @@ fn x509_verifier(hostname: &[u8]) -> Verifier {
             spki_der: vec![0x30, 0x00],
         }],
         hostname: hostname.to_vec(),
-        now_seconds: 1_700_000_000,
     }
 }
 

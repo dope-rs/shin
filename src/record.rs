@@ -12,6 +12,10 @@ pub const MAX_CIPHERTEXT_BODY: usize = (1 << 14) + 256;
 pub const HEADER_LEN: usize = 5;
 pub const AEAD_TAG_LEN: usize = 16;
 
+/// Records sealable under one AES-128-GCM key before a KeyUpdate is due (RFC 8446
+/// §5.5): 2^23, matching rustls.
+pub const AEAD_CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ContentType {
@@ -42,6 +46,9 @@ pub enum RecordError {
     AllZeroInner,
     NotCipherTextOuter,
     SeqExhausted,
+    /// A prior open failed authentication; the opener rejects all further use
+    /// (RFC 8446 §5.2 — a failed open is fatal).
+    Poisoned,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +114,11 @@ impl Sealer {
         self.seq
     }
 
+    /// True once a KeyUpdate is due (see [`AEAD_CONFIDENTIALITY_LIMIT`]).
+    pub fn needs_key_update(&self) -> bool {
+        self.seq >= AEAD_CONFIDENTIALITY_LIMIT
+    }
+
     pub fn seal(&mut self, inner_type: ContentType, body: &[u8]) -> Result<Vec<u8>, RecordError> {
         if body.len() > MAX_PLAINTEXT_BODY {
             return Err(RecordError::BodyTooLarge);
@@ -144,6 +156,7 @@ impl Sealer {
 pub struct Opener {
     aead: AeadKey,
     seq: u64,
+    poisoned: bool,
 }
 
 impl Opener {
@@ -152,6 +165,7 @@ impl Opener {
         Self {
             aead: AeadKey::aes_128_gcm(&keys.key, keys.iv),
             seq: 0,
+            poisoned: false,
         }
     }
 
@@ -159,10 +173,18 @@ impl Opener {
         self.seq
     }
 
+    /// True once a KeyUpdate is due (see [`AEAD_CONFIDENTIALITY_LIMIT`]).
+    pub fn needs_key_update(&self) -> bool {
+        self.seq >= AEAD_CONFIDENTIALITY_LIMIT
+    }
+
     pub fn open(
         &mut self,
         input: &mut [u8],
     ) -> Result<Option<(ContentType, core::ops::Range<usize>, usize)>, RecordError> {
+        if self.poisoned {
+            return Err(RecordError::Poisoned);
+        }
         if input.len() < HEADER_LEN {
             return Ok(None);
         }
@@ -188,11 +210,13 @@ impl Opener {
         let seq = self.seq;
 
         let body = &mut input[HEADER_LEN..total];
-        let plaintext_len = self
-            .aead
-            .open(seq, &aad, body)
-            .map_err(|_| RecordError::OpenFailed)?
-            .len();
+        let plaintext_len = match self.aead.open(seq, &aad, body) {
+            Ok(plain) => plain.len(),
+            Err(_) => {
+                self.poisoned = true;
+                return Err(RecordError::OpenFailed);
+            }
+        };
 
         self.seq += 1;
 
@@ -291,25 +315,5 @@ mod tests {
         let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
         assert_eq!(inner_type, ContentType::ApplicationData);
         assert_eq!(range.len(), MAX_PLAINTEXT_BODY);
-    }
-
-    #[test]
-    fn open_does_not_advance_seq_on_auth_failure() {
-        let mut sealer = Sealer::from_secret(&SECRET);
-        let mut tampered = sealer.seal(ContentType::ApplicationData, b"body").unwrap();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0x01;
-        let mut opener = Opener::from_secret(&SECRET);
-        assert_eq!(
-            opener.open(&mut tampered).unwrap_err(),
-            RecordError::OpenFailed
-        );
-        assert_eq!(opener.seq(), 0);
-
-        let mut fresh = Sealer::from_secret(&SECRET);
-        let mut good = fresh.seal(ContentType::ApplicationData, b"body").unwrap();
-        let (_, range, _) = opener.open(&mut good).unwrap().unwrap();
-        assert_eq!(&good[range], b"body");
-        assert_eq!(opener.seq(), 1);
     }
 }

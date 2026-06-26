@@ -3,9 +3,9 @@ use std::rc::Rc;
 
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
 use shin::extension::ExtensionType;
-use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, Server};
+use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, NoGuard, Server};
 use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::{Clock, Epoch, Event};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
 
@@ -28,10 +28,13 @@ impl TestGuard {
     }
 }
 
-impl EarlyDataGuard for TestGuard {
+impl Clock for TestGuard {
     fn now_ms(&self) -> u64 {
         self.now
     }
+}
+
+impl EarlyDataGuard for TestGuard {
     fn register(&mut self, token: &[u8]) -> bool {
         let mut seen = self.seen.borrow_mut();
         if seen.iter().any(|t| t.as_slice() == token) {
@@ -60,23 +63,47 @@ fn cets(events: &[Event]) -> Option<[u8; 32]> {
     })
 }
 
-fn server(accept: bool) -> Server {
-    server_alpn(accept, Vec::new())
-}
-
-fn server_alpn(accept: bool, alpn_protocols: Vec<Vec<u8>>) -> Server {
-    Server::new(ServerConfig {
+fn server_config(accept: bool, alpn_protocols: Vec<Vec<u8>>) -> ServerConfig {
+    ServerConfig {
         source: CertSource::RawPublicKey {
             signing_key: signing_key(),
         },
         transport_params: Vec::new(),
         alpn_protocols,
-        ticket_secret: Some(TICKET_SECRET),
+        ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
         accept_early_data: accept,
-    })
+    }
 }
 
-fn client(resumption: Option<Resumption>, enable_early_data: bool) -> Client {
+fn server(accept: bool, now_ms: u64) -> Server<TestGuard, TestGuard> {
+    server_alpn(accept, Vec::new(), now_ms)
+}
+
+fn server_alpn(
+    accept: bool,
+    alpn_protocols: Vec<Vec<u8>>,
+    now_ms: u64,
+) -> Server<TestGuard, TestGuard> {
+    Server::with_early_data_guard(
+        server_config(accept, alpn_protocols),
+        TestGuard::new(now_ms),
+        TestGuard::new(now_ms),
+    )
+}
+
+fn server_with_guard(accept: bool, now_ms: u64, guard: TestGuard) -> Server<TestGuard, TestGuard> {
+    Server::with_early_data_guard(
+        server_config(accept, Vec::new()),
+        TestGuard::new(now_ms),
+        guard,
+    )
+}
+
+fn server_no_guard(accept: bool, now_ms: u64) -> Server<TestGuard, NoGuard> {
+    Server::new(server_config(accept, Vec::new()), TestGuard::new(now_ms))
+}
+
+fn client(resumption: Option<Resumption>, enable_early_data: bool) -> Client<fn() -> u64> {
     client_alpn(resumption, enable_early_data, Vec::new())
 }
 
@@ -84,16 +111,19 @@ fn client_alpn(
     resumption: Option<Resumption>,
     enable_early_data: bool,
     alpn_protocols: Vec<Vec<u8>>,
-) -> Client {
-    Client::new(ClientConfig {
-        verifier: Verifier::RawPublicKey {
-            expected_pubkey: *signing_key().pubkey().unwrap(),
+) -> Client<fn() -> u64> {
+    Client::new(
+        ClientConfig {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: *signing_key().pubkey().unwrap(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols,
+            resumption,
+            enable_early_data,
         },
-        transport_params: Vec::new(),
-        alpn_protocols,
-        resumption,
-        enable_early_data,
-    })
+        || 0,
+    )
 }
 
 fn first_handshake_ticket() -> Resumption {
@@ -101,9 +131,8 @@ fn first_handshake_ticket() -> Resumption {
 }
 
 fn first_handshake_ticket_cfg(alpn_protocols: Vec<Vec<u8>>, now_ms: u64) -> Resumption {
-    let mut s = server_alpn(false, alpn_protocols.clone());
+    let mut s = server_alpn(false, alpn_protocols.clone(), now_ms);
     // Issue with a guard so the ticket carries a real issued-at timestamp.
-    s.set_early_data_guard(Box::new(TestGuard::new(now_ms)));
     let mut c = client_alpn(None, false, alpn_protocols);
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -177,8 +206,7 @@ fn server_accepts_early_data_emits_matching_cets_and_ee_ext() {
     let resumption = first_handshake_ticket();
 
     let mut c = client(Some(resumption), true);
-    let mut s = server(true);
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
+    let mut s = server(true, NOW_MS);
 
     let c1 = c.start().unwrap();
     let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -212,7 +240,7 @@ fn server_accepts_early_data_emits_matching_cets_and_ee_ext() {
 fn server_with_accept_off_skips_cets_even_with_offer() {
     let resumption = first_handshake_ticket();
     let mut c = client(Some(resumption), true);
-    let mut s = server(false);
+    let mut s = server(false, NOW_MS);
 
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -228,7 +256,7 @@ fn server_without_guard_refuses_early_data() {
     // accept_early_data = true but no guard: must still refuse.
     let resumption = first_handshake_ticket();
     let mut c = client(Some(resumption), true);
-    let mut s = server(true); // deliberately no set_early_data_guard
+    let mut s = server_no_guard(true, NOW_MS);
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
@@ -245,13 +273,11 @@ fn replayed_early_data_is_rejected() {
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
 
-    let mut s1 = server(true);
-    s1.set_early_data_guard(Box::new(guard.clone()));
+    let mut s1 = server_with_guard(true, NOW_MS, guard.clone());
     let out1 = s1.read(Epoch::Plaintext, &ch).unwrap();
     assert!(cets(&out1).is_some(), "first use accepts early data");
 
-    let mut s2 = server(true);
-    s2.set_early_data_guard(Box::new(guard.clone()));
+    let mut s2 = server_with_guard(true, NOW_MS, guard.clone());
     let out2 = s2.read(Epoch::Plaintext, &ch).unwrap();
     assert!(
         cets(&out2).is_none(),
@@ -267,8 +293,7 @@ fn stale_ticket_outside_freshness_window_rejected() {
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
 
     // Server clock far ahead of issued-at; client claims age ~0 -> exceeds skew.
-    let mut s = server(true);
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS + 60_000)));
+    let mut s = server(true, NOW_MS + 60_000);
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(cets(&s1).is_none(), "stale ticket => early data refused");
 }
@@ -282,8 +307,7 @@ fn early_data_rejected_when_claimed_ticket_age_is_implausible() {
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
 
-    let mut s = server(true);
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
+    let mut s = server(true, NOW_MS);
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(
         cets(&s1).is_none(),
@@ -298,8 +322,7 @@ fn early_data_accepted_when_resumed_alpn_matches() {
     // Sanity: identical ALPN on the issuing and resuming sessions still accepts 0-RTT.
     let resumption = first_handshake_ticket_cfg(alloc_vec(b"h2"), NOW_MS);
     let mut c = client_alpn(Some(resumption), true, alloc_vec(b"h2"));
-    let mut s = server_alpn(true, alloc_vec(b"h2"));
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
+    let mut s = server_alpn(true, alloc_vec(b"h2"), NOW_MS);
 
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -312,8 +335,7 @@ fn early_data_rejected_when_resumed_alpn_mismatches() {
     // Original session negotiated "h2"; resumption negotiates "http/1.1".
     let resumption = first_handshake_ticket_cfg(alloc_vec(b"h2"), NOW_MS);
     let mut c = client_alpn(Some(resumption), true, alloc_vec(b"http/1.1"));
-    let mut s = server_alpn(true, alloc_vec(b"http/1.1"));
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
+    let mut s = server_alpn(true, alloc_vec(b"http/1.1"), NOW_MS);
 
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -340,8 +362,7 @@ fn expired_ticket_does_not_resume_via_psk() {
     let mut c = client(Some(resumption), false);
 
     // 8 days after issuance (> 7200s lifetime).
-    let mut s = server(false);
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS + 8 * 86_400_000)));
+    let mut s = server(false, NOW_MS + 8 * 86_400_000);
 
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -369,8 +390,7 @@ fn fresh_ticket_still_resumes_via_psk() {
     let resumption = first_handshake_ticket();
     let mut c = client(Some(resumption), false);
 
-    let mut s = server(false);
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS + 1000)));
+    let mut s = server(false, NOW_MS + 1000);
 
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -422,15 +442,15 @@ fn server_rejects_nonnull_compression_method() {
     let ch = reencode_ch(&fresh_client_hello(), |ch| {
         ch.legacy_compression_methods = vec![0, 1];
     });
-    let mut s = server(false);
+    let mut s = server(false, NOW_MS);
     let err = s.read(Epoch::Plaintext, &ch).unwrap_err();
-    assert_eq!(err, shin::Error::Decode);
+    assert_eq!(err, shin::Error::IllegalParameter);
 }
 
 #[test]
 fn server_accepts_null_compression_method() {
     let ch = fresh_client_hello();
-    let mut s = server(false);
+    let mut s = server(false, NOW_MS);
     let out = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(extract_send(&out, Epoch::Plaintext).is_some());
 }
@@ -440,7 +460,7 @@ fn server_rejects_oversized_session_id() {
     let ch = reencode_ch(&fresh_client_hello(), |ch| {
         ch.legacy_session_id = vec![0u8; 33];
     });
-    let mut s = server(false);
+    let mut s = server(false, NOW_MS);
     let err = s.read(Epoch::Plaintext, &ch).unwrap_err();
     assert_eq!(err, shin::Error::Decode);
 }
@@ -450,14 +470,14 @@ fn server_accepts_max_session_id() {
     let ch = reencode_ch(&fresh_client_hello(), |ch| {
         ch.legacy_session_id = vec![7u8; 32];
     });
-    let mut s = server(false);
+    let mut s = server(false, NOW_MS);
     let out = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(extract_send(&out, Epoch::Plaintext).is_some());
 }
 
 // Drive a server to Done, returning it ready for application-epoch messages.
-fn established_server() -> Server {
-    let mut s = server(false);
+fn established_server() -> Server<TestGuard, TestGuard> {
+    let mut s = server(false, NOW_MS);
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -502,8 +522,7 @@ fn nst_advertises_early_data_when_accept_enabled() {
     use shin::extension::ExtensionType;
     use shin::handshake::Handshake;
 
-    let mut s = server(true);
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
+    let mut s = server(true, NOW_MS);
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
@@ -538,8 +557,7 @@ fn nst_omits_early_data_when_accept_disabled() {
     use shin::extension::ExtensionType;
     use shin::handshake::Handshake;
 
-    let mut s = server(false);
-    s.set_early_data_guard(Box::new(TestGuard::new(NOW_MS)));
+    let mut s = server(false, NOW_MS);
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
     let ch = extract_send(&c1, Epoch::Plaintext).unwrap();

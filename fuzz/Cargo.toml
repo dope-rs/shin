@@ -48,4 +48,25 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "conn_read"
+path = "fuzz_targets/conn_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chain_validate"
+path = "fuzz_targets/chain_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ticket_decrypt"
+path = "fuzz_targets/ticket_decrypt.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
