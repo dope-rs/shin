@@ -4,11 +4,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::cert::Cert;
 use crate::chain::{Chain, TrustAnchor};
-use crate::codec::Reader;
 use crate::extension::{Extension, ExtensionType};
 use crate::handshake::{
     Certificate, CertificateVerify, ClientHello, EncryptedExtensions, Finished, Handshake,
-    RANDOM_LEN, ServerHello, TLS_1_2,
+    HsReassembler, RANDOM_LEN, ServerHello, TLS_1_2,
 };
 use crate::hash::Transcript;
 use crate::hostname::Hostname;
@@ -24,9 +23,6 @@ use crate::time::UnixTime;
 use crate::{Epoch, Error, Event};
 
 mod config;
-
-/// Anti-amplification cap on KeyUpdates accepted per record.
-const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
 
 pub use config::{Config, OwnedTrustAnchor, Resumption, Verifier};
 
@@ -58,6 +54,7 @@ pub struct Client {
     selected_alpn: Option<Vec<u8>>,
     resumption_master: Option<[u8; 32]>,
     psk_used: bool,
+    reasm: HsReassembler,
 }
 
 impl Client {
@@ -77,6 +74,7 @@ impl Client {
             selected_alpn: None,
             resumption_master: None,
             psk_used: false,
+            reasm: HsReassembler::default(),
         }
     }
 
@@ -222,21 +220,10 @@ impl Client {
     }
 
     pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
+        self.reasm.push(epoch, data)?;
         let mut events = Vec::new();
-        let mut r = Reader::new(data);
-        let mut key_updates = 0u32;
-        while !r.is_empty() {
-            let snapshot = r.remaining();
-            let msg = Handshake::decode(&mut r)?;
-            if matches!(msg, Handshake::KeyUpdate(_)) {
-                key_updates += 1;
-                if key_updates > MAX_KEY_UPDATES_PER_RECORD {
-                    return Err(Error::UnexpectedMessage);
-                }
-            }
-            let consumed = snapshot.len() - r.remaining().len();
-            let raw = &snapshot[..consumed];
-            self.process(epoch, msg, raw, &mut events)?;
+        while let Some((msg, raw)) = self.reasm.next_message()? {
+            self.process(epoch, msg, &raw, &mut events)?;
         }
         Ok(events)
     }
