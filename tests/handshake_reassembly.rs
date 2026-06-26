@@ -70,7 +70,10 @@ fn handshake_with_chunking(chunk: usize) {
             done = true;
         }
     }
-    assert!(done, "client must finish even when flight is fragmented (chunk={chunk})");
+    assert!(
+        done,
+        "client must finish even when flight is fragmented (chunk={chunk})"
+    );
     let cf = cf.expect("client Finished");
 
     let s2 = server.read(Epoch::Handshake, &cf).unwrap();

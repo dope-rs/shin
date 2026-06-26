@@ -3,9 +3,10 @@ use crate::asn1::{DerError, Reader, Tag, Tlv};
 mod ext;
 
 pub use ext::{
-    BasicConstraints, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage, OID_EKU_CLIENT_AUTH,
-    OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE,
-    OID_EXT_SAN, is_handled_ext,
+    BasicConstraints, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage, NameConstraints,
+    OID_EKU_CLIENT_AUTH, OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS,
+    OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE, OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, Subtrees,
+    is_handled_ext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

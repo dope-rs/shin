@@ -6,6 +6,7 @@ use crate::cert::CertError;
 pub const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 pub const OID_EXT_SAN: &[u8] = &[0x55, 0x1d, 0x11];
 pub const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+pub const OID_EXT_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 pub const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 
 pub const OID_EKU_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
@@ -14,7 +15,11 @@ pub const OID_EKU_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x0
 pub fn is_handled_ext(oid: &[u8]) -> bool {
     matches!(
         oid,
-        OID_EXT_KEY_USAGE | OID_EXT_SAN | OID_EXT_BASIC_CONSTRAINTS | OID_EXT_EXTENDED_KEY_USAGE
+        OID_EXT_KEY_USAGE
+            | OID_EXT_SAN
+            | OID_EXT_BASIC_CONSTRAINTS
+            | OID_EXT_NAME_CONSTRAINTS
+            | OID_EXT_EXTENDED_KEY_USAGE
     )
 }
 
@@ -221,6 +226,51 @@ impl<'a> GeneralName<'a> {
                     value: tlv.contents,
                 },
             });
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Subtrees<'a> {
+    pub dns: Vec<&'a [u8]>,
+    pub ip: Vec<&'a [u8]>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NameConstraints<'a> {
+    pub permitted: Subtrees<'a>,
+    pub excluded: Subtrees<'a>,
+}
+
+impl<'a> NameConstraints<'a> {
+    pub fn parse(value: &'a [u8]) -> Result<Self, CertError> {
+        let mut r = Reader::new(value);
+        let inner = r.expect(Tag::SEQUENCE)?;
+        r.finish()?;
+        let mut ir = Reader::new(inner);
+        let mut nc = Self::default();
+        if ir.peek_tag() == Some(Tag::context(0, true)) {
+            nc.permitted = Self::parse_subtrees(ir.next()?.contents)?;
+        }
+        if ir.peek_tag() == Some(Tag::context(1, true)) {
+            nc.excluded = Self::parse_subtrees(ir.next()?.contents)?;
+        }
+        ir.finish()?;
+        Ok(nc)
+    }
+
+    fn parse_subtrees(bytes: &'a [u8]) -> Result<Subtrees<'a>, CertError> {
+        let mut r = Reader::new(bytes);
+        let mut out = Subtrees::default();
+        while !r.is_empty() {
+            let subtree = r.expect(Tag::SEQUENCE)?;
+            let base = Reader::new(subtree).next()?;
+            if base.tag == Tag::context(2, false) {
+                out.dns.push(base.contents);
+            } else if base.tag == Tag::context(7, false) {
+                out.ip.push(base.contents);
+            }
         }
         Ok(out)
     }
