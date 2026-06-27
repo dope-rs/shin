@@ -5,10 +5,9 @@ use ring::hmac;
 use crate::codec::{DecodeError, Encode, EncodeError, Reader};
 use crate::hash::HASH_LEN;
 use crate::kdf::Hkdf;
+use crate::kx::KexGroup;
 
 pub(crate) const TLS_1_3: u16 = 0x0304;
-pub(crate) const SUITE_AES_128_GCM_SHA256: u16 = 0x1301;
-pub(crate) const GROUP_X25519: u16 = 0x001d;
 
 pub(crate) const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 pub(crate) const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503;
@@ -58,8 +57,12 @@ pub(crate) struct SupportedGroups;
 
 impl SupportedGroups {
     pub(crate) fn encode() -> Vec<u8> {
-        let mut v = Vec::with_capacity(4);
-        v.put_vec_u16(|o| o.put_u16(GROUP_X25519));
+        let mut v = Vec::with_capacity(6);
+        v.put_vec_u16(|o| {
+            for g in KexGroup::SUPPORTED {
+                o.put_u16(g.to_u16());
+            }
+        });
         v
     }
 
@@ -112,45 +115,49 @@ impl SignatureAlgorithms {
 pub(crate) struct KeyShare;
 
 impl KeyShare {
-    pub(crate) fn client_encode(pubkey: &[u8; 32]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(40);
+    pub(crate) fn client_encode(group: KexGroup, pubkey: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + pubkey.len());
         v.put_vec_u16(|o| {
-            o.put_u16(GROUP_X25519);
+            o.put_u16(group.to_u16());
             o.put_vec_u16(|o| o.put_slice(pubkey));
         });
         v
     }
 
-    pub(crate) fn server_encode(pubkey: &[u8; 32]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(36);
-        v.put_u16(GROUP_X25519);
+    pub(crate) fn server_encode(group: KexGroup, pubkey: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + pubkey.len());
+        v.put_u16(group.to_u16());
         v.put_vec_u16(|o| o.put_slice(pubkey));
         v
     }
 
     /// HelloRetryRequest key_share: the selected group only (RFC 8446 §4.2.8).
-    pub(crate) fn hrr_encode() -> Vec<u8> {
+    pub(crate) fn hrr_encode(group: KexGroup) -> Vec<u8> {
         let mut v = Vec::with_capacity(2);
-        v.put_u16(GROUP_X25519);
+        v.put_u16(group.to_u16());
         v
     }
 
-    pub(crate) fn client_decode(data: &[u8]) -> Result<[u8; 32], DecodeError> {
+    /// The first offered entry whose group is in `prefer` (server-preference
+    /// order), copying only the chosen public key.
+    pub(crate) fn select_client_entry(
+        data: &[u8],
+        prefer: &[KexGroup],
+    ) -> Result<Option<(KexGroup, Vec<u8>)>, DecodeError> {
         let mut r = Reader::new(data);
         let mut entries = r.sub_u16()?;
+        let mut offered: Vec<(u16, &[u8])> = Vec::new();
         while !entries.is_empty() {
             let group = entries.u16()?;
-            let pubkey_bytes = entries.vec_u16()?;
-            if group == GROUP_X25519 {
-                if pubkey_bytes.len() != 32 {
-                    return Err(DecodeError::InvalidEnum);
-                }
-                let mut pubkey = [0u8; 32];
-                pubkey.copy_from_slice(pubkey_bytes);
-                return Ok(pubkey);
-            }
+            offered.push((group, entries.vec_u16()?));
         }
-        Err(DecodeError::InvalidEnum)
+        r.finish()?;
+        Ok(prefer.iter().copied().find_map(|g| {
+            offered
+                .iter()
+                .find(|(eg, _)| *eg == g.to_u16())
+                .map(|(_, pk)| (g, pk.to_vec()))
+        }))
     }
 
     /// A HelloRetryRequest key_share carries only the server's selected group
@@ -162,20 +169,12 @@ impl KeyShare {
         Ok(group)
     }
 
-    pub(crate) fn server_decode(data: &[u8]) -> Result<[u8; 32], DecodeError> {
+    pub(crate) fn server_decode(data: &[u8]) -> Result<(u16, Vec<u8>), DecodeError> {
         let mut r = Reader::new(data);
         let group = r.u16()?;
-        if group != GROUP_X25519 {
-            return Err(DecodeError::InvalidEnum);
-        }
-        let pubkey_bytes = r.vec_u16()?;
-        if pubkey_bytes.len() != 32 {
-            return Err(DecodeError::InvalidEnum);
-        }
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(pubkey_bytes);
+        let pubkey = r.vec_u16()?.to_vec();
         r.finish()?;
-        Ok(pubkey)
+        Ok((group, pubkey))
     }
 }
 

@@ -100,7 +100,7 @@ fn key_schedule_walks_to_handshake_secret() {
 
 #[test]
 fn server_handshake_traffic_keys_match_rfc8448() {
-    let tk = TrafficKeys::aes_128_gcm(&S_HS_TRAFFIC);
+    let tk = TrafficKeys::<16>::derive(&S_HS_TRAFFIC);
     assert_eq!(tk.key, S_HS_KEY);
     assert_eq!(tk.iv, S_HS_IV);
 }

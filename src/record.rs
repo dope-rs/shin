@@ -5,6 +5,47 @@ use crate::schedule::TrafficKeys;
 
 pub const PROTOCOL_VERSION: u16 = 0x0303;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CipherSuite {
+    Aes128GcmSha256,
+    ChaCha20Poly1305Sha256,
+}
+
+impl CipherSuite {
+    pub const SUPPORTED: [CipherSuite; 2] = [
+        CipherSuite::Aes128GcmSha256,
+        CipherSuite::ChaCha20Poly1305Sha256,
+    ];
+
+    pub fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            0x1301 => Some(Self::Aes128GcmSha256),
+            0x1303 => Some(Self::ChaCha20Poly1305Sha256),
+            _ => None,
+        }
+    }
+
+    pub fn to_u16(self) -> u16 {
+        match self {
+            Self::Aes128GcmSha256 => 0x1301,
+            Self::ChaCha20Poly1305Sha256 => 0x1303,
+        }
+    }
+}
+
+fn aead_for_suite(secret: &[u8; 32], suite: CipherSuite) -> AeadKey {
+    match suite {
+        CipherSuite::Aes128GcmSha256 => {
+            let keys = TrafficKeys::<16>::derive(secret);
+            AeadKey::aes_128_gcm(&keys.key, keys.iv)
+        }
+        CipherSuite::ChaCha20Poly1305Sha256 => {
+            let keys = TrafficKeys::<32>::derive(secret);
+            AeadKey::chacha20_poly1305(&keys.key, keys.iv)
+        }
+    }
+}
+
 pub const MAX_PLAINTEXT_BODY: usize = 1 << 14;
 
 pub const MAX_CIPHERTEXT_BODY: usize = (1 << 14) + 256;
@@ -103,9 +144,12 @@ pub struct Sealer {
 
 impl Sealer {
     pub fn from_secret(secret: &[u8; 32]) -> Self {
-        let keys = TrafficKeys::aes_128_gcm(secret);
+        Self::with_suite(secret, CipherSuite::Aes128GcmSha256)
+    }
+
+    pub fn with_suite(secret: &[u8; 32], suite: CipherSuite) -> Self {
         Self {
-            aead: AeadKey::aes_128_gcm(&keys.key, keys.iv),
+            aead: aead_for_suite(secret, suite),
             seq: 0,
         }
     }
@@ -161,9 +205,12 @@ pub struct Opener {
 
 impl Opener {
     pub fn from_secret(secret: &[u8; 32]) -> Self {
-        let keys = TrafficKeys::aes_128_gcm(secret);
+        Self::with_suite(secret, CipherSuite::Aes128GcmSha256)
+    }
+
+    pub fn with_suite(secret: &[u8; 32], suite: CipherSuite) -> Self {
         Self {
-            aead: AeadKey::aes_128_gcm(&keys.key, keys.iv),
+            aead: aead_for_suite(secret, suite),
             seq: 0,
             poisoned: false,
         }
@@ -284,7 +331,7 @@ mod tests {
     }
 
     fn craft_wire(seq: u64, inner_plaintext: &[u8]) -> Vec<u8> {
-        let keys = TrafficKeys::aes_128_gcm(&SECRET);
+        let keys = TrafficKeys::<16>::derive(&SECRET);
         let aead = AeadKey::aes_128_gcm(&keys.key, keys.iv);
         let outer_body_len = inner_plaintext.len() + AEAD_TAG_LEN;
         let mut header = Vec::with_capacity(HEADER_LEN);
