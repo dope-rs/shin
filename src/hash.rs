@@ -2,6 +2,13 @@ use ring::digest::{Context, SHA256, SHA256_OUTPUT_LEN};
 
 pub const HASH_LEN: usize = SHA256_OUTPUT_LEN;
 
+pub fn sha256(data: &[u8]) -> [u8; HASH_LEN] {
+    let d = ring::digest::digest(&SHA256, data);
+    let mut out = [0u8; HASH_LEN];
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
 #[derive(Clone)]
 pub struct Transcript {
     inner: Context,
@@ -26,7 +33,7 @@ impl Transcript {
     }
 
     pub fn hash_empty() -> [u8; HASH_LEN] {
-        Self::new().hash()
+        sha256(&[])
     }
 
     /// RFC 8446 §4.4.1: after a HelloRetryRequest the transcript restarts as

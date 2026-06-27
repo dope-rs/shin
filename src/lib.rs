@@ -61,7 +61,7 @@ pub enum Epoch {
     Application,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Event {
     Send {
         epoch: Epoch,
@@ -96,6 +96,59 @@ pub enum Event {
     EarlyDataAccepted,
     EarlyDataRejected,
     Done,
+}
+
+// Manual Debug so secret material is never written to logs (RFC 8446 §C.2).
+impl core::fmt::Debug for Event {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const REDACTED: &str = "[redacted]";
+        match self {
+            Self::Send { epoch, data } => f
+                .debug_struct("Send")
+                .field("epoch", epoch)
+                .field("data_len", &data.len())
+                .finish(),
+            Self::KeysReady { epoch, .. } => f
+                .debug_struct("KeysReady")
+                .field("epoch", epoch)
+                .field("read_secret", &REDACTED)
+                .field("write_secret", &REDACTED)
+                .finish(),
+            Self::PeerExtension { ty, data } => f
+                .debug_struct("PeerExtension")
+                .field("ty", ty)
+                .field("data_len", &data.len())
+                .finish(),
+            Self::KeyUpdate { direction, .. } => f
+                .debug_struct("KeyUpdate")
+                .field("direction", direction)
+                .field("secret", &REDACTED)
+                .finish(),
+            Self::NewSessionTicket {
+                ticket_lifetime,
+                ticket_age_add,
+                max_early_data,
+                ..
+            } => f
+                .debug_struct("NewSessionTicket")
+                .field("ticket_lifetime", ticket_lifetime)
+                .field("ticket_age_add", ticket_age_add)
+                .field("max_early_data", max_early_data)
+                .field("ticket", &REDACTED)
+                .finish(),
+            Self::ResumptionSecret { .. } => f
+                .debug_struct("ResumptionSecret")
+                .field("psk", &REDACTED)
+                .finish(),
+            Self::ZeroRttKeysReady { .. } => f
+                .debug_struct("ZeroRttKeysReady")
+                .field("secret", &REDACTED)
+                .finish(),
+            Self::EarlyDataAccepted => f.write_str("EarlyDataAccepted"),
+            Self::EarlyDataRejected => f.write_str("EarlyDataRejected"),
+            Self::Done => f.write_str("Done"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +191,9 @@ pub enum Error {
     /// Configuration that cannot authenticate a peer (e.g. X.509 verifier with no
     /// trust anchors). Surfaced by [`Config::validate`](crate::client::Config::validate).
     BadConfig,
+    /// An operation requiring a completed handshake was attempted too early
+    /// (e.g. exporting keying material before the handshake finishes).
+    NotReady,
 }
 
 impl Error {
@@ -169,7 +225,12 @@ impl Error {
             Self::BadCertificateChain(_) => D::BadCertificate,
             Self::BadCertificateVerify | Self::BadFinished => D::DecryptError,
             Self::Kx => D::IllegalParameter,
-            Self::Sig | Self::Spki | Self::Rng | Self::Encode | Self::BadConfig => D::InternalError,
+            Self::Sig
+            | Self::Spki
+            | Self::Rng
+            | Self::Encode
+            | Self::BadConfig
+            | Self::NotReady => D::InternalError,
         };
         Alert::fatal(d)
     }

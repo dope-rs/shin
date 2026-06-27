@@ -9,6 +9,8 @@ use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
+type TestServer = Server<fn() -> u64>;
+
 fn collect_send(events: &[Event], epoch: Epoch) -> Vec<u8> {
     let mut out = Vec::new();
     for e in events {
@@ -21,7 +23,7 @@ fn collect_send(events: &[Event], epoch: Epoch) -> Vec<u8> {
     out
 }
 
-fn client_finished_and_server() -> (Server<fn() -> u64>, Vec<u8>) {
+fn client_finished_and_server() -> (TestServer, Vec<u8>) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing_key = SigningKey::from_seed(&seed).unwrap();

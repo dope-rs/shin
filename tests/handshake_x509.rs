@@ -304,3 +304,36 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
     };
     assert_eq!(empty_host.validate().unwrap_err(), shin::Error::BadConfig);
 }
+
+#[test]
+fn config_validate_rejects_oversized_alpn_and_transport_params() {
+    let base = || ClientConfig {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: [0u8; 32],
+        },
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        resumption: None,
+        enable_early_data: false,
+    };
+
+    let mut over_protocol = base();
+    over_protocol.alpn_protocols = vec![vec![b'x'; 256]];
+    assert_eq!(
+        over_protocol.validate().unwrap_err(),
+        shin::Error::BadConfig
+    );
+
+    let mut empty_protocol = base();
+    empty_protocol.alpn_protocols = vec![Vec::new()];
+    assert_eq!(
+        empty_protocol.validate().unwrap_err(),
+        shin::Error::BadConfig
+    );
+
+    let mut over_tp = base();
+    over_tp.transport_params = vec![0u8; 65536];
+    assert_eq!(over_tp.validate().unwrap_err(), shin::Error::BadConfig);
+
+    base().validate().unwrap();
+}

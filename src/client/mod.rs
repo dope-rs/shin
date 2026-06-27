@@ -55,6 +55,7 @@ pub struct Client<C: Clock> {
     server_leaf_key: Option<LeafKey>,
     selected_alpn: Option<Vec<u8>>,
     resumption_master: Option<[u8; 32]>,
+    exporter_master: Option<[u8; 32]>,
     psk_used: bool,
     early_data_offered: bool,
     early_data_accepted: bool,
@@ -64,6 +65,25 @@ pub struct Client<C: Clock> {
     session_id: Vec<u8>,
     hrr_done: bool,
     reasm: HsReassembler,
+}
+
+impl<C: Clock> Drop for Client<C> {
+    fn drop(&mut self) {
+        for b in [
+            &mut self.handshake_secret,
+            &mut self.c_hs_traffic,
+            &mut self.s_hs_traffic,
+            &mut self.c_ap_traffic,
+            &mut self.s_ap_traffic,
+            &mut self.resumption_master,
+            &mut self.exporter_master,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            crate::schedule::zeroize(b);
+        }
+    }
 }
 
 impl<C: Clock> Client<C> {
@@ -83,6 +103,7 @@ impl<C: Clock> Client<C> {
             server_leaf_key: None,
             selected_alpn: None,
             resumption_master: None,
+            exporter_master: None,
             psk_used: false,
             early_data_offered: false,
             early_data_accepted: false,
@@ -96,6 +117,19 @@ impl<C: Clock> Client<C> {
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
         self.selected_alpn.as_deref()
+    }
+
+    /// RFC 5705 / RFC 8446 §7.5 exported keying material. Available only after
+    /// the handshake completes (the server Finished has been processed).
+    pub fn export_keying_material(
+        &self,
+        label: &str,
+        context: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let em = self.exporter_master.as_ref().ok_or(Error::NotReady)?;
+        crate::schedule::export_keying_material(em, label, context, out);
+        Ok(())
     }
 
     /// Extensions shared by ClientHello1 and the HelloRetryRequest retry,
@@ -200,6 +234,7 @@ impl<C: Clock> Client<C> {
         if self.state != State::Initial {
             return Err(Error::UnexpectedMessage);
         }
+        self.config.validate()?;
         let eph = EphemeralKey::generate(&self.rng).map_err(|_| Error::Kx)?;
 
         let mut client_random = [0u8; RANDOM_LEN];
@@ -389,6 +424,16 @@ impl<C: Clock> Client<C> {
         let tail = &sh.random[RANDOM_LEN - 8..];
         if tail == DOWNGRADE_TLS12 || tail == DOWNGRADE_TLS11 {
             return Err(Error::DowngradeDetected);
+        }
+        // RFC 8446 §4.1.3: legacy fields are fixed and the session_id echo must match.
+        if sh.legacy_version != TLS_1_2 {
+            return Err(Error::IllegalParameter);
+        }
+        if sh.legacy_compression_method != 0 {
+            return Err(Error::IllegalParameter);
+        }
+        if sh.legacy_session_id_echo != self.session_id {
+            return Err(Error::IllegalParameter);
         }
         let sv_data = sh
             .extensions
@@ -716,6 +761,11 @@ impl<C: Clock> Client<C> {
         let s_ap = crate::kdf::Hkdf::derive_secret(&master, "s ap traffic", &h_sf);
         self.c_ap_traffic = Some(c_ap);
         self.s_ap_traffic = Some(s_ap);
+        self.exporter_master = Some(crate::kdf::Hkdf::derive_secret(
+            &master,
+            "exp master",
+            &h_sf,
+        ));
 
         events.push(Event::KeysReady {
             epoch: Epoch::Application,

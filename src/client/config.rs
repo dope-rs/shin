@@ -39,12 +39,26 @@ pub enum Verifier {
 
 impl Config {
     /// Reject obviously-broken configuration before a handshake starts: an X.509
-    /// verifier needs at least one trust anchor and a non-empty server name to
-    /// be able to authenticate anything.
+    /// verifier needs at least one trust anchor and a non-empty server name, and
+    /// lengths that would overflow their wire encodings (and thus panic during
+    /// ClientHello construction) are refused up front.
     pub fn validate(&self) -> Result<(), Error> {
         if let Verifier::X509 { anchors, hostname } = &self.verifier
             && (anchors.is_empty() || hostname.is_empty())
         {
+            return Err(Error::BadConfig);
+        }
+        if self.transport_params.len() > u16::MAX as usize {
+            return Err(Error::BadConfig);
+        }
+        let mut alpn_total = 0usize;
+        for p in &self.alpn_protocols {
+            if p.is_empty() || p.len() > u8::MAX as usize {
+                return Err(Error::BadConfig);
+            }
+            alpn_total += 1 + p.len();
+        }
+        if alpn_total > u16::MAX as usize {
             return Err(Error::BadConfig);
         }
         Ok(())

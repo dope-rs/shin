@@ -3,7 +3,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 use crate::hash::{HASH_LEN, Transcript};
 use crate::kdf::Hkdf;
 
-fn zeroize(bytes: &mut [u8]) {
+pub(crate) fn zeroize(bytes: &mut [u8]) {
     for b in bytes.iter_mut() {
         unsafe {
             core::ptr::write_volatile(b, 0);
@@ -75,6 +75,26 @@ impl KeySchedule {
     pub fn resumption_master_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
         Hkdf::derive_secret(&self.secret, "res master", transcript_hash)
     }
+
+    /// RFC 8446 §7.5: `exporter_master_secret`, derived from the master secret
+    /// over the transcript through the server Finished.
+    pub fn exporter_master_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
+        Hkdf::derive_secret(&self.secret, "exp master", transcript_hash)
+    }
+}
+
+/// RFC 8446 §7.5 / RFC 5705 exported keying material:
+/// `HKDF-Expand-Label(Derive-Secret(exporter_master, label, ""), "exporter",
+/// Hash(context), length)`.
+pub fn export_keying_material(
+    exporter_master: &[u8; HASH_LEN],
+    label: &str,
+    context: &[u8],
+    out: &mut [u8],
+) {
+    let secret = Hkdf::derive_secret(exporter_master, label, &Transcript::hash_empty());
+    let context_hash = crate::hash::sha256(context);
+    Hkdf::expand_label(&secret, "exporter", &context_hash, out);
 }
 
 pub struct ResumptionMaster([u8; HASH_LEN]);
