@@ -59,28 +59,67 @@ impl<'a> TrustAnchor<'a> {
     }
 }
 
+/// Every extension a chain check needs, parsed in one O(exts) pass that also
+/// rejects duplicate and unhandled-critical extensions.
+struct ParsedExt<'a> {
+    basic_constraints: Option<BasicConstraints>,
+    key_usage: Option<KeyUsage>,
+    eku: Option<Vec<&'a [u8]>>,
+    name_constraints: Option<NameConstraints<'a>>,
+    san: LeafSan<'a>,
+}
+
+impl<'a> ParsedExt<'a> {
+    fn parse(cert: &Cert<'a>) -> Result<Self, ChainError> {
+        let exts = cert.extensions_der.unwrap_or(&[]);
+        let mut seen: Vec<&[u8]> = Vec::new();
+        let mut basic_constraints = None;
+        let mut key_usage = None;
+        let mut eku = None;
+        let mut name_constraints = None;
+        let mut dns = Vec::new();
+        let mut ip = Vec::new();
+        for ext in ExtensionIter::new(exts) {
+            let ext = ext?;
+            if seen.contains(&ext.oid) {
+                return Err(ChainError::DuplicateExtension);
+            }
+            seen.push(ext.oid);
+            if ext.critical && !is_handled_ext(ext.oid) {
+                return Err(ChainError::UnhandledCriticalExtension);
+            }
+            if ext.oid == OID_EXT_BASIC_CONSTRAINTS {
+                basic_constraints = Some(BasicConstraints::parse(ext.value)?);
+            } else if ext.oid == OID_EXT_KEY_USAGE {
+                key_usage = Some(KeyUsage::parse(ext.value)?);
+            } else if ext.oid == OID_EXT_EXTENDED_KEY_USAGE {
+                eku = Some(KeyUsage::parse_extended(ext.value)?);
+            } else if ext.oid == OID_EXT_NAME_CONSTRAINTS {
+                name_constraints = Some(NameConstraints::parse(ext.value)?);
+            } else if ext.oid == OID_EXT_SAN {
+                for n in GeneralName::parse_alt_names(ext.value)? {
+                    match n {
+                        GeneralName::DnsName(d) => dns.push(Chain::ascii_lower(d)),
+                        GeneralName::IpAddress(p) => ip.push(p),
+                        GeneralName::Other { .. } => {}
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            basic_constraints,
+            key_usage,
+            eku,
+            name_constraints,
+            san: LeafSan { dns, ip },
+        })
+    }
+}
+
 #[derive(Clone)]
 struct LeafSan<'a> {
     dns: Vec<Vec<u8>>,
     ip: Vec<&'a [u8]>,
-}
-
-impl<'a> LeafSan<'a> {
-    fn collect(leaf: &Cert<'a>) -> Result<Self, ChainError> {
-        let exts = leaf.extensions_der.unwrap_or(&[]);
-        let mut dns = Vec::new();
-        let mut ip = Vec::new();
-        if let Some((_, san_val)) = ExtensionIter::find(exts, OID_EXT_SAN)? {
-            for n in GeneralName::parse_alt_names(san_val)? {
-                match n {
-                    GeneralName::DnsName(d) => dns.push(Chain::ascii_lower(d)),
-                    GeneralName::IpAddress(p) => ip.push(p),
-                    GeneralName::Other { .. } => {}
-                }
-            }
-        }
-        Ok(Self { dns, ip })
-    }
 }
 
 pub struct Chain;
@@ -99,64 +138,49 @@ impl Chain {
             return Err(ChainError::ChainTooLong);
         }
 
+        let parsed: Vec<ParsedExt> = chain
+            .iter()
+            .map(ParsedExt::parse)
+            .collect::<Result<_, _>>()?;
         for c in chain {
             Self::check_validity(c, now)?;
-            Self::check_critical_extensions(c)?;
-            Self::check_no_duplicate_extensions(c)?;
         }
 
-        let leaf = &chain[0];
-        Self::check_end_entity(leaf)?;
-        Self::check_server_auth(leaf)?;
-        let leaf_san = LeafSan::collect(leaf)?;
-        Self::check_hostname(&leaf_san, hostname_dns_id)?;
+        Self::check_end_entity(&parsed[0])?;
+        Self::check_server_auth(&parsed[0])?;
+        Self::check_hostname(&parsed[0].san, hostname_dns_id)?;
 
         let order = Self::order_chain(chain);
-        let ordered: Vec<&Cert> = order.iter().map(|&i| &chain[i]).collect();
-        let all_linked = ordered.len() == chain.len();
+        let all_linked = order.len() == chain.len();
 
-        let mut constrained = false;
-        for c in &ordered {
-            constrained |= Self::has_name_constraints(c)?;
-        }
-        let sans: Vec<LeafSan> = if constrained {
-            core::iter::once(Ok(leaf_san.clone()))
-                .chain(ordered[1..].iter().map(|c| LeafSan::collect(c)))
-                .collect::<Result<_, _>>()?
-        } else {
-            Vec::new()
-        };
-
-        for i in 0..ordered.len() {
-            let subject = ordered[i];
+        for (pos, &idx) in order.iter().enumerate() {
+            let subject = &chain[idx];
             if Self::verifies_against_anchor(subject, trust_anchors) {
                 return Ok(());
             }
-            if i + 1 >= ordered.len() {
+            if pos + 1 >= order.len() {
                 return Err(if all_linked {
                     ChainError::NoTrustAnchor
                 } else {
                     ChainError::IssuerSubjectMismatch
                 });
             }
-            let issuer = ordered[i + 1];
+            let issuer = &chain[order[pos + 1]];
+            let issuer_ext = &parsed[order[pos + 1]];
             if subject.issuer_der != issuer.subject_der {
                 return Err(ChainError::IssuerSubjectMismatch);
             }
-            Self::check_issuer_is_ca(issuer)?;
-            Self::check_ca_eku(issuer)?;
-            Self::check_path_len(issuer, i)?;
-            if constrained {
-                Self::check_name_constraints(issuer, &sans[..=i])?;
+            Self::check_issuer_is_ca(issuer_ext)?;
+            Self::check_ca_eku(issuer_ext)?;
+            Self::check_path_len(issuer_ext, pos)?;
+            if issuer_ext.name_constraints.is_some() {
+                let subordinate_sans: Vec<&LeafSan> =
+                    order[..=pos].iter().map(|&i| &parsed[i].san).collect();
+                Self::check_name_constraints(issuer_ext, &subordinate_sans)?;
             }
             subject.verify_signature(&issuer.spki)?;
         }
         Err(ChainError::NoTrustAnchor)
-    }
-
-    fn has_name_constraints(c: &Cert<'_>) -> Result<bool, ChainError> {
-        let exts = c.extensions_der.unwrap_or(&[]);
-        Ok(ExtensionIter::find(exts, OID_EXT_NAME_CONSTRAINTS)?.is_some())
     }
 
     /// Leaf→up ordering by issuer/subject linkage (RFC 8446 §4.4.2 allows
@@ -189,27 +213,12 @@ impl Chain {
         path
     }
 
-    fn check_no_duplicate_extensions(c: &Cert<'_>) -> Result<(), ChainError> {
-        let exts = c.extensions_der.unwrap_or(&[]);
-        let mut seen: Vec<&[u8]> = Vec::new();
-        for ext in ExtensionIter::new(exts) {
-            let ext = ext?;
-            if seen.contains(&ext.oid) {
-                return Err(ChainError::DuplicateExtension);
-            }
-            seen.push(ext.oid);
-        }
-        Ok(())
-    }
-
     /// EKU chaining: an intermediate's EKU, if present, must permit serverAuth
     /// or anyExtendedKeyUsage.
-    fn check_ca_eku(ca: &Cert<'_>) -> Result<(), ChainError> {
-        let exts = ca.extensions_der.unwrap_or(&[]);
-        let Some((_, val)) = ExtensionIter::find(exts, OID_EXT_EXTENDED_KEY_USAGE)? else {
+    fn check_ca_eku(ext: &ParsedExt<'_>) -> Result<(), ChainError> {
+        let Some(ekus) = &ext.eku else {
             return Ok(());
         };
-        let ekus = KeyUsage::parse_extended(val)?;
         if ekus.contains(&OID_EKU_SERVER_AUTH) || ekus.contains(&OID_EKU_ANY) {
             Ok(())
         } else {
@@ -226,14 +235,12 @@ impl Chain {
     /// RFC 5280 §4.2.1.10: a CA's name constraints bind every subordinate SAN
     /// below it, not just the leaf.
     fn check_name_constraints(
-        ca: &Cert<'_>,
-        subordinates: &[LeafSan<'_>],
+        ext: &ParsedExt<'_>,
+        subordinates: &[&LeafSan<'_>],
     ) -> Result<(), ChainError> {
-        let exts = ca.extensions_der.unwrap_or(&[]);
-        let Some((_, val)) = ExtensionIter::find(exts, OID_EXT_NAME_CONSTRAINTS)? else {
+        let Some(nc) = &ext.name_constraints else {
             return Ok(());
         };
-        let nc = NameConstraints::parse(val)?;
         let permitted_dns: Vec<Vec<u8>> = nc
             .permitted
             .dns
@@ -316,34 +323,19 @@ impl Chain {
         Ok(())
     }
 
-    fn check_critical_extensions(c: &Cert<'_>) -> Result<(), ChainError> {
-        let exts = c.extensions_der.unwrap_or(&[]);
-        for ext in ExtensionIter::new(exts) {
-            let ext = ext?;
-            if ext.critical && !is_handled_ext(ext.oid) {
-                return Err(ChainError::UnhandledCriticalExtension);
-            }
+    fn check_end_entity(ext: &ParsedExt<'_>) -> Result<(), ChainError> {
+        if let Some(bc) = ext.basic_constraints
+            && bc.ca
+        {
+            return Err(ChainError::NotEndEntity);
         }
         Ok(())
     }
 
-    fn check_end_entity(c: &Cert<'_>) -> Result<(), ChainError> {
-        let exts = c.extensions_der.unwrap_or(&[]);
-        if let Some((_, val)) = ExtensionIter::find(exts, OID_EXT_BASIC_CONSTRAINTS)? {
-            let bc = BasicConstraints::parse(val)?;
-            if bc.ca {
-                return Err(ChainError::NotEndEntity);
-            }
-        }
-        Ok(())
-    }
-
-    fn check_server_auth(c: &Cert<'_>) -> Result<(), ChainError> {
-        let exts = c.extensions_der.unwrap_or(&[]);
-        let Some((_, val)) = ExtensionIter::find(exts, OID_EXT_EXTENDED_KEY_USAGE)? else {
+    fn check_server_auth(ext: &ParsedExt<'_>) -> Result<(), ChainError> {
+        let Some(ekus) = &ext.eku else {
             return Ok(());
         };
-        let ekus = KeyUsage::parse_extended(val)?;
         if ekus.contains(&OID_EKU_SERVER_AUTH) {
             Ok(())
         } else {
@@ -372,33 +364,25 @@ impl Chain {
         Err(ChainError::HostnameMismatch)
     }
 
-    fn check_issuer_is_ca(issuer: &Cert<'_>) -> Result<(), ChainError> {
-        let exts = issuer.extensions_der.unwrap_or(&[]);
-        let bc_val = ExtensionIter::find(exts, OID_EXT_BASIC_CONSTRAINTS)?
-            .ok_or(ChainError::IssuerNotCa)?
-            .1;
-        if !BasicConstraints::parse(bc_val)?.ca {
+    fn check_issuer_is_ca(ext: &ParsedExt<'_>) -> Result<(), ChainError> {
+        let bc = ext.basic_constraints.ok_or(ChainError::IssuerNotCa)?;
+        if !bc.ca {
             return Err(ChainError::IssuerNotCa);
         }
-        if let Some((_, ku_val)) = ExtensionIter::find(exts, OID_EXT_KEY_USAGE)? {
-            let ku = KeyUsage::parse(ku_val)?;
-            if !ku.has(KeyUsage::KEY_CERT_SIGN) {
-                return Err(ChainError::NoKeyCertSign);
-            }
+        if let Some(ku) = ext.key_usage
+            && !ku.has(KeyUsage::KEY_CERT_SIGN)
+        {
+            return Err(ChainError::NoKeyCertSign);
         }
         Ok(())
     }
 
-    fn check_path_len(issuer: &Cert<'_>, subject_index: usize) -> Result<(), ChainError> {
-        let exts = issuer.extensions_der.unwrap_or(&[]);
-        if let Some((_, bc_val)) = ExtensionIter::find(exts, OID_EXT_BASIC_CONSTRAINTS)? {
-            let bc = BasicConstraints::parse(bc_val)?;
-            if let Some(max_following) = bc.path_len_constraint {
-                let following_intermediates = subject_index as u64;
-                if following_intermediates > max_following {
-                    return Err(ChainError::PathLenExceeded);
-                }
-            }
+    fn check_path_len(ext: &ParsedExt<'_>, subject_index: usize) -> Result<(), ChainError> {
+        if let Some(bc) = ext.basic_constraints
+            && let Some(max_following) = bc.path_len_constraint
+            && subject_index as u64 > max_following
+        {
+            return Err(ChainError::PathLenExceeded);
         }
         Ok(())
     }

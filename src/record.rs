@@ -220,15 +220,15 @@ impl Opener {
 
         self.seq += 1;
 
-        if plaintext_len > MAX_PLAINTEXT_BODY + 1 {
-            return Err(RecordError::RecordOverflow);
-        }
-
         let inner_slice = &input[HEADER_LEN..HEADER_LEN + plaintext_len];
         let inner_type_pos = inner_slice
             .iter()
             .rposition(|&b| b != 0)
             .ok_or(RecordError::AllZeroInner)?;
+        // RFC 8446 §5.4: the 2^14 limit is on de-padded content, not the padded plaintext.
+        if inner_type_pos > MAX_PLAINTEXT_BODY {
+            return Err(RecordError::RecordOverflow);
+        }
         let inner_type = ContentType::from_u8(inner_slice[inner_type_pos])?;
 
         let plaintext_start = HEADER_LEN;
@@ -315,5 +315,16 @@ mod tests {
         let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
         assert_eq!(inner_type, ContentType::ApplicationData);
         assert_eq!(range.len(), MAX_PLAINTEXT_BODY);
+    }
+
+    #[test]
+    fn open_accepts_short_content_with_large_padding() {
+        let mut inner = alloc::vec![b'h', b'i', ContentType::ApplicationData as u8];
+        inner.resize(MAX_PLAINTEXT_BODY + 200, 0);
+        let mut wire = craft_wire(0, &inner);
+        let mut opener = Opener::from_secret(&SECRET);
+        let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
+        assert_eq!(inner_type, ContentType::ApplicationData);
+        assert_eq!(&wire[range], b"hi");
     }
 }

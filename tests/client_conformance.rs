@@ -97,11 +97,15 @@ fn key_share_ext() -> Extension {
     Extension::new(ExtensionType::KEY_SHARE, data)
 }
 
-fn server_hello(random: [u8; RANDOM_LEN], extensions: Vec<Extension>) -> Vec<u8> {
+fn server_hello(
+    random: [u8; RANDOM_LEN],
+    session_id_echo: Vec<u8>,
+    extensions: Vec<Extension>,
+) -> Vec<u8> {
     let sh = ServerHello {
         legacy_version: TLS_1_2,
         random,
-        legacy_session_id_echo: Vec::new(),
+        legacy_session_id_echo: session_id_echo,
         cipher_suite: SUITE_AES_128_GCM_SHA256,
         legacy_compression_method: 0,
         extensions,
@@ -109,6 +113,14 @@ fn server_hello(random: [u8; RANDOM_LEN], extensions: Vec<Extension>) -> Vec<u8>
     let mut out = Vec::new();
     Handshake::ServerHello(sh).encode(&mut out);
     out
+}
+
+fn ch_session_id(ch_bytes: &[u8]) -> Vec<u8> {
+    let mut r = Reader::new(ch_bytes);
+    let Handshake::ClientHello(ch) = Handshake::decode(&mut r).unwrap() else {
+        panic!("expected ClientHello");
+    };
+    ch.legacy_session_id
 }
 
 fn hrr_key_share_ext() -> Extension {
@@ -132,6 +144,7 @@ fn client_answers_hello_retry_request_echoing_cookie() {
     let cookie = cookie_ext(b"server-supplied-cookie");
     let sh = server_hello(
         HRR_RANDOM,
+        Vec::new(),
         vec![
             supported_versions_ext(),
             hrr_key_share_ext(),
@@ -162,11 +175,13 @@ fn client_rejects_second_hello_retry_request() {
     c.start().unwrap();
     let sh = server_hello(
         HRR_RANDOM,
+        Vec::new(),
         vec![supported_versions_ext(), hrr_key_share_ext()],
     );
     c.read(Epoch::Plaintext, &sh).expect("first HRR answered");
     let sh2 = server_hello(
         HRR_RANDOM,
+        Vec::new(),
         vec![supported_versions_ext(), hrr_key_share_ext()],
     );
     assert_eq!(
@@ -178,10 +193,11 @@ fn client_rejects_second_hello_retry_request() {
 #[test]
 fn client_rejects_unsolicited_server_hello_extension() {
     let mut c = rpk_client();
-    c.start().unwrap();
+    let sid = ch_session_id(&send(&c.start().unwrap(), Epoch::Plaintext));
     // ALPN belongs in EncryptedExtensions, never ServerHello.
     let sh = server_hello(
         [0x42u8; RANDOM_LEN],
+        sid,
         vec![
             supported_versions_ext(),
             key_share_ext(),
@@ -200,9 +216,10 @@ fn client_rejects_unsolicited_server_hello_extension() {
 #[test]
 fn client_accepts_normal_server_hello_with_only_allowed_extensions() {
     let mut c = rpk_client();
-    c.start().unwrap();
+    let sid = ch_session_id(&send(&c.start().unwrap(), Epoch::Plaintext));
     let sh = server_hello(
         [0x42u8; RANDOM_LEN],
+        sid,
         vec![supported_versions_ext(), key_share_ext()],
     );
     assert!(c.read(Epoch::Plaintext, &sh).is_ok());

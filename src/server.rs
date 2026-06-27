@@ -113,7 +113,25 @@ pub struct Server<C: Clock, G: EarlyDataGuard = NoGuard> {
     early_data_guard: Option<G>,
     clock: C,
     hrr_done: bool,
+    exporter_master: Option<[u8; 32]>,
     reasm: HsReassembler,
+}
+
+impl<C: Clock, G: EarlyDataGuard> Drop for Server<C, G> {
+    fn drop(&mut self) {
+        for b in [
+            &mut self.c_hs_traffic,
+            &mut self.expected_client_finished,
+            &mut self.c_ap_traffic,
+            &mut self.s_ap_traffic,
+            &mut self.exporter_master,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            crate::schedule::zeroize(b);
+        }
+    }
 }
 
 impl<C: Clock> Server<C, NoGuard> {
@@ -145,12 +163,26 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             selected_alpn: None,
             master: None,
             hrr_done: false,
+            exporter_master: None,
             reasm: HsReassembler::default(),
         }
     }
 
     fn now_ms(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// RFC 5705 / RFC 8446 §7.5 exported keying material. Available only after
+    /// the handshake completes (the server Finished has been sent).
+    pub fn export_keying_material(
+        &self,
+        label: &str,
+        context: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let em = self.exporter_master.as_ref().ok_or(Error::NotReady)?;
+        crate::schedule::export_keying_material(em, label, context, out);
+        Ok(())
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
@@ -519,6 +551,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         let s_ap = ks_master.server_application_traffic_secret(&h_sf);
         self.c_ap_traffic = Some(c_ap);
         self.s_ap_traffic = Some(s_ap);
+        self.exporter_master = Some(ks_master.exporter_master_secret(&h_sf));
         self.master = Some(ks_master);
 
         events.push(Event::KeysReady {
