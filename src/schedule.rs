@@ -123,21 +123,21 @@ impl Default for KeySchedule {
     }
 }
 
-pub struct TrafficKeys {
-    pub key: [u8; 16],
+pub struct TrafficKeys<const K: usize> {
+    pub key: [u8; K],
     pub iv: [u8; 12],
 }
 
-impl Drop for TrafficKeys {
+impl<const K: usize> Drop for TrafficKeys<K> {
     fn drop(&mut self) {
         zeroize(&mut self.key);
         zeroize(&mut self.iv);
     }
 }
 
-impl TrafficKeys {
-    pub fn aes_128_gcm(secret: &[u8]) -> Self {
-        let mut key = [0u8; 16];
+impl<const K: usize> TrafficKeys<K> {
+    pub fn derive(secret: &[u8]) -> Self {
+        let mut key = [0u8; K];
         let mut iv = [0u8; 12];
         Hkdf::expand_label(secret, "key", &[], &mut key);
         Hkdf::expand_label(secret, "iv", &[], &mut iv);

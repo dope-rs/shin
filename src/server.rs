@@ -10,12 +10,13 @@ use crate::handshake::{
     ServerHello, TLS_1_2,
 };
 use crate::hash::Transcript;
-use crate::kx::EphemeralKey;
+use crate::kx::{EphemeralKey, KexGroup};
 use crate::proto::{
     Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertType, CertVerify,
-    Finished as FinishedProto, GROUP_X25519, KeyShare, SUITE_AES_128_GCM_SHA256,
-    SignatureAlgorithms, SupportedGroups, SupportedVersions, TLS_1_3,
+    Finished as FinishedProto, KeyShare, SignatureAlgorithms, SupportedGroups, SupportedVersions,
+    TLS_1_3,
 };
+use crate::record::CipherSuite;
 use crate::schedule::KeySchedule;
 use crate::sig::SigningKey;
 use crate::spki;
@@ -114,6 +115,7 @@ pub struct Server<C: Clock, G: EarlyDataGuard = NoGuard> {
     clock: C,
     hrr_done: bool,
     exporter_master: Option<[u8; 32]>,
+    negotiated_suite: Option<crate::record::CipherSuite>,
     reasm: HsReassembler,
 }
 
@@ -164,6 +166,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             master: None,
             hrr_done: false,
             exporter_master: None,
+            negotiated_suite: None,
             reasm: HsReassembler::default(),
         }
     }
@@ -187,6 +190,12 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
         self.selected_alpn.as_deref()
+    }
+
+    /// The negotiated record-protection suite, available once the ClientHello is
+    /// processed. The embedder builds its record sealer/opener for this suite.
+    pub fn negotiated_cipher_suite(&self) -> Option<crate::record::CipherSuite> {
+        self.negotiated_suite
     }
 
     pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
@@ -264,9 +273,12 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         raw: &[u8],
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
-        if !ch.cipher_suites.contains(&SUITE_AES_128_GCM_SHA256) {
-            return Err(Error::UnsupportedCipherSuite);
-        }
+        let selected_suite = CipherSuite::SUPPORTED
+            .iter()
+            .copied()
+            .find(|s| ch.cipher_suites.contains(&s.to_u16()))
+            .ok_or(Error::UnsupportedCipherSuite)?;
+        self.negotiated_suite = Some(selected_suite);
         if ch.legacy_compression_methods != [0] {
             return Err(Error::IllegalParameter);
         }
@@ -286,9 +298,12 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             .iter()
             .find(|e| e.ty == ExtensionType::SUPPORTED_GROUPS)
             .ok_or(Error::MissingExtension)?;
-        if !SupportedGroups::decode(&groups.data)?.contains(&GROUP_X25519) {
-            return Err(Error::UnsupportedGroup);
-        }
+        let client_groups = SupportedGroups::decode(&groups.data)?;
+        let hrr_group = KexGroup::SUPPORTED
+            .iter()
+            .copied()
+            .find(|g| client_groups.contains(&g.to_u16()))
+            .ok_or(Error::UnsupportedGroup)?;
         let sigs = ch
             .extensions
             .iter()
@@ -298,17 +313,24 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         if !SignatureAlgorithms::decode(&sigs.data)?.contains(&local_sig_scheme) {
             return Err(Error::UnsupportedSigScheme);
         }
-        let peer_pubkey = match ch
+        let chosen_share = ch
             .extensions
             .iter()
             .find(|e| e.ty == ExtensionType::KEY_SHARE)
-            .map(|ks| KeyShare::client_decode(&ks.data))
-        {
-            Some(Ok(pk)) => pk,
-            _ if !self.hrr_done => {
-                return self.send_hello_retry_request(raw, &ch.legacy_session_id, events);
+            .map(|ks| KeyShare::select_client_entry(&ks.data, &KexGroup::SUPPORTED))
+            .transpose()?
+            .flatten();
+        let (kex_group, peer_pubkey) = match chosen_share {
+            Some(v) => v,
+            None if !self.hrr_done => {
+                return self.send_hello_retry_request(
+                    raw,
+                    &ch.legacy_session_id,
+                    hrr_group,
+                    events,
+                );
             }
-            _ => return Err(Error::MissingExtension),
+            None => return Err(Error::MissingExtension),
         };
 
         // RFC 7250 §4.1 — server MUST NOT echo the cert_type extensions
@@ -377,7 +399,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
 
         let session_id_echo = ch.legacy_session_id.clone();
 
-        let server_eph = EphemeralKey::generate(&self.rng).map_err(|_| Error::Kx)?;
+        let server_eph = EphemeralKey::generate(kex_group, &self.rng).map_err(|_| Error::Kx)?;
         let mut server_random = [0u8; RANDOM_LEN];
         self.rng.fill(&mut server_random).map_err(|_| Error::Rng)?;
 
@@ -388,7 +410,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             ),
             Extension::new(
                 ExtensionType::KEY_SHARE,
-                KeyShare::server_encode(server_eph.pubkey())
+                KeyShare::server_encode(kex_group, server_eph.pubkey())
             ),
         ];
         if psk_accepted.is_some() {
@@ -401,7 +423,10 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             legacy_version: TLS_1_2,
             random: server_random,
             legacy_session_id_echo: session_id_echo,
-            cipher_suite: SUITE_AES_128_GCM_SHA256,
+            cipher_suite: self
+                .negotiated_suite
+                .expect("suite selected in CH")
+                .to_u16(),
             legacy_compression_method: 0,
             extensions: sh_extensions,
         };
@@ -576,20 +601,27 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         &mut self,
         ch_raw: &[u8],
         session_id_echo: &[u8],
+        request_group: KexGroup,
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         let hrr = ServerHello {
             legacy_version: TLS_1_2,
             random: HELLO_RETRY_REQUEST_RANDOM,
             legacy_session_id_echo: session_id_echo.to_vec(),
-            cipher_suite: SUITE_AES_128_GCM_SHA256,
+            cipher_suite: self
+                .negotiated_suite
+                .expect("suite selected in CH")
+                .to_u16(),
             legacy_compression_method: 0,
             extensions: alloc::vec![
                 Extension::new(
                     ExtensionType::SUPPORTED_VERSIONS,
                     crate::proto::SupportedVersions::server_encode(),
                 ),
-                Extension::new(ExtensionType::KEY_SHARE, KeyShare::hrr_encode()),
+                Extension::new(
+                    ExtensionType::KEY_SHARE,
+                    KeyShare::hrr_encode(request_group)
+                ),
             ],
         };
         let mut hrr_bytes = Vec::new();

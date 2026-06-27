@@ -11,12 +11,13 @@ use crate::handshake::{
 };
 use crate::hash::Transcript;
 use crate::hostname::Hostname;
-use crate::kx::EphemeralKey;
+use crate::kx::{EphemeralKey, KexGroup};
 use crate::proto::{
     Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertType, CertVerify,
-    Finished as FinishedProto, GROUP_X25519, KeyShare, SUITE_AES_128_GCM_SHA256, ServerName,
-    SignatureAlgorithms, SupportedGroups, SupportedVersions, TLS_1_3,
+    Finished as FinishedProto, KeyShare, ServerName, SignatureAlgorithms, SupportedGroups,
+    SupportedVersions, TLS_1_3,
 };
+use crate::record::CipherSuite;
 use crate::schedule::KeySchedule;
 use crate::spki;
 use crate::time::UnixTime;
@@ -47,6 +48,7 @@ pub struct Client<C: Clock> {
     transcript: Transcript,
     rng: SystemRandom,
     eph: Option<EphemeralKey>,
+    kex_group: KexGroup,
     handshake_secret: Option<[u8; 32]>,
     c_hs_traffic: Option<[u8; 32]>,
     s_hs_traffic: Option<[u8; 32]>,
@@ -56,6 +58,7 @@ pub struct Client<C: Clock> {
     selected_alpn: Option<Vec<u8>>,
     resumption_master: Option<[u8; 32]>,
     exporter_master: Option<[u8; 32]>,
+    negotiated_suite: Option<CipherSuite>,
     psk_used: bool,
     early_data_offered: bool,
     early_data_accepted: bool,
@@ -95,6 +98,7 @@ impl<C: Clock> Client<C> {
             transcript: Transcript::new(),
             rng: SystemRandom::new(),
             eph: None,
+            kex_group: KexGroup::X25519,
             handshake_secret: None,
             c_hs_traffic: None,
             s_hs_traffic: None,
@@ -104,6 +108,7 @@ impl<C: Clock> Client<C> {
             selected_alpn: None,
             resumption_master: None,
             exporter_master: None,
+            negotiated_suite: None,
             psk_used: false,
             early_data_offered: false,
             early_data_accepted: false,
@@ -115,8 +120,21 @@ impl<C: Clock> Client<C> {
         }
     }
 
+    /// Choose the (EC)DHE group to offer (default X25519). Must be set before
+    /// `start`.
+    pub fn set_kex_group(&mut self, group: KexGroup) {
+        self.kex_group = group;
+    }
+
     pub fn selected_alpn(&self) -> Option<&[u8]> {
         self.selected_alpn.as_deref()
+    }
+
+    /// The negotiated record-protection suite, available once the ServerHello is
+    /// processed. The embedder builds its record [`Sealer`]/[`Opener`] for this
+    /// suite. ([`Sealer`]: crate::record::Sealer, [`Opener`]: crate::record::Opener)
+    pub fn negotiated_cipher_suite(&self) -> Option<CipherSuite> {
+        self.negotiated_suite
     }
 
     /// RFC 5705 / RFC 8446 §7.5 exported keying material. Available only after
@@ -137,7 +155,7 @@ impl<C: Clock> Client<C> {
     /// appended by the caller since their binders depend on the final layout.
     fn base_extensions(
         &self,
-        kx_pubkey: &[u8; 32],
+        kx_pubkey: &[u8],
         cookie: Option<&[u8]>,
     ) -> Result<Vec<Extension>, Error> {
         let server_cert_type = match self.config.verifier {
@@ -157,7 +175,10 @@ impl<C: Clock> Client<C> {
                     Verifier::X509 { .. } => SignatureAlgorithms::x509_encode(),
                 }
             ),
-            Extension::new(ExtensionType::KEY_SHARE, KeyShare::client_encode(kx_pubkey)),
+            Extension::new(
+                ExtensionType::KEY_SHARE,
+                KeyShare::client_encode(self.kex_group, kx_pubkey),
+            ),
         ];
 
         if matches!(self.config.verifier, Verifier::RawPublicKey { .. }) {
@@ -206,7 +227,7 @@ impl<C: Clock> Client<C> {
             legacy_version: TLS_1_2,
             random: self.client_random,
             legacy_session_id: self.session_id.clone(),
-            cipher_suites: alloc::vec![SUITE_AES_128_GCM_SHA256],
+            cipher_suites: CipherSuite::SUPPORTED.iter().map(|s| s.to_u16()).collect(),
             legacy_compression_methods: alloc::vec![0],
             extensions,
         }
@@ -235,7 +256,7 @@ impl<C: Clock> Client<C> {
             return Err(Error::UnexpectedMessage);
         }
         self.config.validate()?;
-        let eph = EphemeralKey::generate(&self.rng).map_err(|_| Error::Kx)?;
+        let eph = EphemeralKey::generate(self.kex_group, &self.rng).map_err(|_| Error::Kx)?;
 
         let mut client_random = [0u8; RANDOM_LEN];
         self.rng.fill(&mut client_random).map_err(|_| Error::Rng)?;
@@ -413,12 +434,11 @@ impl<C: Clock> Client<C> {
         raw: &[u8],
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
-        if sh.cipher_suite != SUITE_AES_128_GCM_SHA256 {
-            return Err(Error::UnsupportedCipherSuite);
-        }
+        let suite = CipherSuite::from_u16(sh.cipher_suite).ok_or(Error::UnsupportedCipherSuite)?;
         if sh.random == HRR_RANDOM {
             return self.handle_hello_retry_request(sh, raw, events);
         }
+        self.negotiated_suite = Some(suite);
         const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
         const DOWNGRADE_TLS11: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
         let tail = &sh.random[RANDOM_LEN - 8..];
@@ -452,7 +472,7 @@ impl<C: Clock> Client<C> {
             .ok_or(Error::MissingExtension)?
             .data
             .as_slice();
-        let server_pubkey = KeyShare::server_decode(ks_data)?;
+        let (server_group, server_pubkey) = KeyShare::server_decode(ks_data)?;
 
         // RFC 8446 §4.1.3: only these extensions are legal in ServerHello.
         for ext in &sh.extensions {
@@ -478,6 +498,9 @@ impl<C: Clock> Client<C> {
         self.transcript.update(raw);
 
         let eph = self.eph.take().ok_or(Error::UnexpectedMessage)?;
+        if eph.group().to_u16() != server_group {
+            return Err(Error::IllegalParameter);
+        }
         let dhe = eph.agree(&server_pubkey).map_err(|_| Error::Kx)?;
 
         let ks_handshake = if self.psk_used {
@@ -546,15 +569,25 @@ impl<C: Clock> Client<C> {
         if !saw_supported_versions {
             return Err(Error::MissingExtension);
         }
-        if selected_group.ok_or(Error::MissingExtension)? != GROUP_X25519 {
-            return Err(Error::UnsupportedGroup);
-        }
+        let selected = selected_group.ok_or(Error::MissingExtension)?;
+        let group = KexGroup::from_u16(selected)
+            .filter(|g| KexGroup::SUPPORTED.contains(g))
+            .ok_or(Error::UnsupportedGroup)?;
 
         let h1 = self.transcript.hash();
         self.transcript = Transcript::restart_with_message_hash(h1);
         self.transcript.update(raw);
 
-        let eph_pub = *self.eph.as_ref().ok_or(Error::UnexpectedMessage)?.pubkey();
+        if self.eph.as_ref().map(|e| e.group()) != Some(group) {
+            self.eph = Some(EphemeralKey::generate(group, &self.rng).map_err(|_| Error::Kx)?);
+            self.kex_group = group;
+        }
+        let eph_pub = self
+            .eph
+            .as_ref()
+            .ok_or(Error::UnexpectedMessage)?
+            .pubkey()
+            .to_vec();
         let extensions = self.base_extensions(&eph_pub, cookie.as_deref())?;
         let ch_bytes = self.encode_client_hello(extensions);
         self.transcript.update(&ch_bytes);
