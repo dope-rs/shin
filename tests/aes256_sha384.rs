@@ -4,6 +4,9 @@ use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
+mod common;
+use common::send;
+
 type TestClient = Client<fn() -> u64>;
 type TestServer = Server<fn() -> u64>;
 
@@ -43,16 +46,6 @@ fn client() -> TestClient {
         },
         clock,
     )
-}
-
-fn send(events: &[Event], epoch: Epoch) -> Vec<u8> {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-            _ => None,
-        })
-        .expect("expected a Send")
 }
 
 fn app_secrets(events: &[Event]) -> Option<(shin::hash::Digest, shin::hash::Digest)> {

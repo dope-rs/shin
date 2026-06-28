@@ -1,25 +1,13 @@
-use ring::rand::{SecureRandom, SystemRandom};
 use shin::client::{Client, Config as ClientConfig};
 use shin::hash::Digest;
 use shin::server::{Config as ServerConfig, Server};
-use shin::sig::SigningKey;
 use shin::{Epoch, Event};
+
+mod common;
+use common::{find_send, has_done, random_signing_key};
 
 const SERVER_TP: &[u8] = b"server-transport-params";
 const CLIENT_TP: &[u8] = b"client-transport-params";
-
-fn sample_signing_key() -> SigningKey {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    SigningKey::from_seed(&seed).unwrap()
-}
-
-fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
-    events.iter().find_map(|e| match e {
-        Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-        _ => None,
-    })
-}
 
 fn extract_keys(events: &[Event], epoch: Epoch) -> Option<(Digest, Digest)> {
     events.iter().find_map(|e| match e {
@@ -39,15 +27,11 @@ fn extract_peer_ext(events: &[Event], ty: u16) -> Option<Vec<u8>> {
     })
 }
 
-fn has_done(events: &[Event]) -> bool {
-    events.iter().any(|e| matches!(e, Event::Done))
-}
-
 const QUIC_TRANSPORT_PARAMETERS: u16 = 57;
 
 #[test]
 fn handshake_completes_in_process() {
-    let server_key = sample_signing_key();
+    let server_key = random_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(
@@ -77,11 +61,11 @@ fn handshake_completes_in_process() {
     );
 
     let c1 = client.start().unwrap();
-    let ch_bytes = extract_send(&c1, Epoch::Plaintext).expect("ClientHello");
+    let ch_bytes = find_send(&c1, Epoch::Plaintext).expect("ClientHello");
 
     let s1 = server.read(Epoch::Plaintext, &ch_bytes).unwrap();
-    let sh_bytes = extract_send(&s1, Epoch::Plaintext).expect("ServerHello");
-    let server_hs_blob = extract_send(&s1, Epoch::Handshake).expect("server EE+Cert+CV+SF");
+    let sh_bytes = find_send(&s1, Epoch::Plaintext).expect("ServerHello");
+    let server_hs_blob = find_send(&s1, Epoch::Handshake).expect("server EE+Cert+CV+SF");
     let (server_read_hs, server_write_hs) =
         extract_keys(&s1, Epoch::Handshake).expect("server handshake keys");
     let (server_read_ap, server_write_ap) =
@@ -100,7 +84,7 @@ fn handshake_completes_in_process() {
     let c3 = client.read(Epoch::Handshake, &server_hs_blob).unwrap();
     let (client_read_ap, client_write_ap) =
         extract_keys(&c3, Epoch::Application).expect("client application keys");
-    let cf_bytes = extract_send(&c3, Epoch::Handshake).expect("client Finished");
+    let cf_bytes = find_send(&c3, Epoch::Handshake).expect("client Finished");
     let client_saw_server_tp = extract_peer_ext(&c3, QUIC_TRANSPORT_PARAMETERS)
         .expect("client captured server transport_params");
     assert_eq!(client_saw_server_tp, SERVER_TP);
@@ -118,7 +102,7 @@ fn handshake_completes_in_process() {
 
 #[test]
 fn client_rejects_wrong_server_pubkey() {
-    let server_key = sample_signing_key();
+    let server_key = random_signing_key();
     let mut server = Server::new(
         ServerConfig {
             source: shin::server::CertSource::RawPublicKey {
@@ -147,10 +131,10 @@ fn client_rejects_wrong_server_pubkey() {
     );
 
     let c1 = client.start().unwrap();
-    let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch_bytes = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch_bytes).unwrap();
-    let sh_bytes = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let server_hs_blob = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh_bytes = find_send(&s1, Epoch::Plaintext).unwrap();
+    let server_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
 
     client.read(Epoch::Plaintext, &sh_bytes).unwrap();
     let result = client.read(Epoch::Handshake, &server_hs_blob);
@@ -162,7 +146,7 @@ fn client_rejects_wrong_server_pubkey() {
 
 #[test]
 fn server_rejects_tampered_client_finished() {
-    let server_key = sample_signing_key();
+    let server_key = random_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
 
     let mut server = Server::new(
@@ -191,13 +175,13 @@ fn server_rejects_tampered_client_finished() {
     );
 
     let c1 = client.start().unwrap();
-    let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch_bytes = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch_bytes).unwrap();
-    let sh_bytes = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let server_hs_blob = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh_bytes = find_send(&s1, Epoch::Plaintext).unwrap();
+    let server_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
     client.read(Epoch::Plaintext, &sh_bytes).unwrap();
     let c3 = client.read(Epoch::Handshake, &server_hs_blob).unwrap();
-    let mut cf_bytes = extract_send(&c3, Epoch::Handshake).unwrap();
+    let mut cf_bytes = find_send(&c3, Epoch::Handshake).unwrap();
     let last = cf_bytes.len() - 1;
     cf_bytes[last] ^= 0x01;
 
@@ -206,7 +190,7 @@ fn server_rejects_tampered_client_finished() {
 
 #[test]
 fn keys_diverge_across_independent_handshakes() {
-    let server_key = sample_signing_key();
+    let server_key = random_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
 
     let do_handshake = || -> (Digest, Digest) {
@@ -236,13 +220,13 @@ fn keys_diverge_across_independent_handshakes() {
         );
 
         let c1 = client.start().unwrap();
-        let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
+        let ch_bytes = find_send(&c1, Epoch::Plaintext).unwrap();
         let s1 = server.read(Epoch::Plaintext, &ch_bytes).unwrap();
-        let sh_bytes = extract_send(&s1, Epoch::Plaintext).unwrap();
-        let hs_blob = extract_send(&s1, Epoch::Handshake).unwrap();
+        let sh_bytes = find_send(&s1, Epoch::Plaintext).unwrap();
+        let hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
         client.read(Epoch::Plaintext, &sh_bytes).unwrap();
         let c3 = client.read(Epoch::Handshake, &hs_blob).unwrap();
-        let cf = extract_send(&c3, Epoch::Handshake).unwrap();
+        let cf = find_send(&c3, Epoch::Handshake).unwrap();
         server.read(Epoch::Handshake, &cf).unwrap();
 
         extract_keys(&c3, Epoch::Application).unwrap()

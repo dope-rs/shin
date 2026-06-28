@@ -1,10 +1,13 @@
+use shin::Epoch;
 use shin::client::{Client, Config as ClientConfig, Verifier};
 use shin::codec::Reader;
 use shin::handshake::Handshake;
 use shin::record::CipherSuite;
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+
+mod common;
+use common::send;
 
 type TestClient = Client<fn() -> u64>;
 type TestServer = Server<fn() -> u64>;
@@ -45,16 +48,6 @@ fn client() -> TestClient {
         },
         clock,
     )
-}
-
-fn send(events: &[Event], epoch: Epoch) -> Vec<u8> {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-            _ => None,
-        })
-        .expect("expected a Send")
 }
 
 fn ch_with_suites(ch_bytes: &[u8], suites: Vec<u16>) -> Vec<u8> {

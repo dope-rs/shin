@@ -24,6 +24,7 @@ pub mod spki;
 pub mod ticket;
 pub mod time;
 
+mod peer;
 mod proto;
 
 pub mod client;
@@ -166,6 +167,10 @@ pub enum Error {
     /// field, downgrade sentinel (alert `illegal_parameter`).
     IllegalParameter,
     UnexpectedMessage,
+    /// The client sent more 0-RTT early data than the advertised
+    /// max_early_data_size, or sent it outside the early-data window
+    /// (alert `unexpected_message`, RFC 8446 §4.6.1).
+    EarlyDataLimitExceeded,
     UnsupportedCipherSuite,
     UnsupportedGroup,
     UnsupportedSigScheme,
@@ -182,6 +187,12 @@ pub enum Error {
     BadCertificateChain(crate::chain::ChainError),
     NoTrustAnchorForIssuer(Vec<u8>),
     BadCertificateVerify,
+    /// Client auth was `Required` but the client sent an empty Certificate
+    /// (alert `certificate_required`, RFC 8446 §4.4.2.4).
+    ClientCertRequired,
+    /// The embedder's client-certificate verifier rejected an otherwise valid,
+    /// possession-proven client identity (alert `access_denied`).
+    AccessDenied,
     BadFinished,
     Kx,
     Sig,
@@ -206,7 +217,7 @@ impl Error {
             Self::IllegalParameter | Self::DowngradeDetected | Self::SigSchemeNotOffered => {
                 D::IllegalParameter
             }
-            Self::UnexpectedMessage => D::UnexpectedMessage,
+            Self::UnexpectedMessage | Self::EarlyDataLimitExceeded => D::UnexpectedMessage,
             Self::UnsupportedCipherSuite | Self::UnsupportedGroup | Self::UnsupportedSigScheme => {
                 D::HandshakeFailure
             }
@@ -223,6 +234,8 @@ impl Error {
             Self::NoTrustAnchorForIssuer(_)
             | Self::BadCertificateChain(ChainError::NoTrustAnchor) => D::UnknownCa,
             Self::BadCertificateChain(_) => D::BadCertificate,
+            Self::ClientCertRequired => D::CertificateRequired,
+            Self::AccessDenied => D::AccessDenied,
             Self::BadCertificateVerify | Self::BadFinished => D::DecryptError,
             Self::Kx => D::IllegalParameter,
             Self::Sig

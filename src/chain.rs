@@ -23,6 +23,7 @@ pub enum ChainError {
     NotEndEntity,
     IssuerSubjectMismatch,
     NoServerAuth,
+    LeafKeyUsageInvalid,
     HostnameMismatch,
     NameConstraintViolation,
     NoTrustAnchor,
@@ -241,6 +242,9 @@ impl Chain {
         let Some(nc) = &ext.name_constraints else {
             return Ok(());
         };
+        if nc.permitted.has_unsupported || nc.excluded.has_unsupported {
+            return Err(ChainError::NameConstraintViolation);
+        }
         let permitted_dns: Vec<Vec<u8>> = nc
             .permitted
             .dns
@@ -328,6 +332,11 @@ impl Chain {
             && bc.ca
         {
             return Err(ChainError::NotEndEntity);
+        }
+        if let Some(ku) = ext.key_usage
+            && !ku.has(KeyUsage::DIGITAL_SIGNATURE)
+        {
+            return Err(ChainError::LeafKeyUsageInvalid);
         }
         Ok(())
     }

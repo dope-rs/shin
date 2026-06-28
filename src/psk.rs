@@ -72,6 +72,9 @@ impl Offer {
             binders.push(bs_sub.vec_u8()?.to_vec());
         }
         r.finish()?;
+        if identities.len() != binders.len() {
+            return Err(DecodeError::Trailing);
+        }
         Ok((identities, binders))
     }
 }

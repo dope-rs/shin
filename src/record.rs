@@ -106,6 +106,9 @@ pub enum RecordError {
     AllZeroInner,
     NotCipherTextOuter,
     SeqExhausted,
+    /// A decrypted record carried an inner ChangeCipherSpec, which RFC 8446 §5
+    /// forbids; the connection must abort with unexpected_message.
+    UnexpectedChangeCipherSpec,
     /// A prior open failed authentication; the opener rejects all further use
     /// (RFC 8446 §5.2 — a failed open is fatal).
     Poisoned,
@@ -292,6 +295,9 @@ impl Opener {
             return Err(RecordError::RecordOverflow);
         }
         let inner_type = ContentType::from_u8(inner_slice[inner_type_pos])?;
+        if inner_type == ContentType::ChangeCipherSpec {
+            return Err(RecordError::UnexpectedChangeCipherSpec);
+        }
 
         let plaintext_start = HEADER_LEN;
         let plaintext_end = HEADER_LEN + inner_type_pos;

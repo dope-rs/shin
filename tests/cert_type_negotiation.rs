@@ -32,6 +32,9 @@ use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
+mod common;
+use common::find_send;
+
 const HOSTNAME: &str = "host.local";
 
 fn ed25519_self_signed() -> (Vec<u8>, SigningKey) {
@@ -74,19 +77,12 @@ fn cert_validity_midpoint(cert_der: &[u8]) -> u64 {
     (nb.0 + na.0) / 2
 }
 
-fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
-    events.iter().find_map(|e| match e {
-        Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-        _ => None,
-    })
-}
-
 /// Pull the EE extensions out of the server's plaintext handshake
 /// flight. shin emits the concatenation EE+Cert+CV+SF as a single
 /// `Event::Send { Handshake }` payload — record-layer encryption is
 /// layered on top elsewhere, so the bytes here are directly decodable.
 fn server_ee_extensions(server_events: &[Event]) -> Vec<(u16, Vec<u8>)> {
-    let blob = extract_send(server_events, Epoch::Handshake)
+    let blob = find_send(server_events, Epoch::Handshake)
         .expect("server should emit a Handshake-epoch Send");
     let mut r = CodecReader::new(&blob);
     while !r.is_empty() {
@@ -160,7 +156,7 @@ fn x509_server_omits_cert_type_and_quic_tp_when_client_did_not_offer() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
 
     let ee = server_ee_extensions(&s1);
@@ -179,8 +175,8 @@ fn x509_server_omits_cert_type_and_quic_tp_when_client_did_not_offer() {
 
     // Sanity: the handshake actually finishes. Validates that
     // suppressing those extensions didn't break the flow.
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
     client.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = client.read(Epoch::Handshake, &s_hs).unwrap();
     assert!(c3.iter().any(|e| matches!(e, Event::Done)));
@@ -225,7 +221,7 @@ fn x509_server_with_transport_params_does_not_leak_to_tcp_tls_client() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
 
     let ee = server_ee_extensions(&s1);
@@ -270,7 +266,7 @@ fn quic_transport_params_round_trip_when_client_offers() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
 
     let ee = server_ee_extensions(&s1);
@@ -314,7 +310,7 @@ fn rpk_handshake_echoes_cert_type_extensions() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
 
     let ee = server_ee_extensions(&s1);
@@ -333,8 +329,8 @@ fn rpk_handshake_echoes_cert_type_extensions() {
         "server should pick CERT_TYPE_RAW_PUBLIC_KEY (=2)"
     );
 
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
     client.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = client.read(Epoch::Handshake, &s_hs).unwrap();
     assert!(c3.iter().any(|e| matches!(e, Event::Done)));
@@ -377,7 +373,7 @@ fn x509_server_rejects_rpk_only_client_offer() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let result = server.read(Epoch::Plaintext, &ch);
     assert!(
         result.is_err(),
@@ -420,7 +416,7 @@ fn alpn_intersection_emits_extension() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
     let ee = server_ee_extensions(&s1);
 
@@ -471,7 +467,7 @@ fn alpn_no_overlap_aborts() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     assert_eq!(
         server.read(Epoch::Plaintext, &ch).unwrap_err(),
         shin::Error::NoApplicationProtocol,
@@ -513,7 +509,7 @@ fn alpn_client_silent_omits_extension() {
     );
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
     let ee = server_ee_extensions(&s1);
 

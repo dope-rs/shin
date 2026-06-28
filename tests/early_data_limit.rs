@@ -2,16 +2,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::hash::Digest;
 use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, Server};
 use shin::sig::SigningKey;
-use shin::{Clock, Epoch, Event};
+use shin::{Clock, Epoch, Error, Event};
 
 mod common;
 use common::find_send;
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
 const NOW_MS: u64 = 1_700_000_000_000;
+const MAX_EARLY_DATA_SIZE: u32 = 16384;
 
 #[derive(Clone)]
 struct TestGuard {
@@ -47,21 +47,6 @@ impl EarlyDataGuard for TestGuard {
 
 fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x99u8; 32]).unwrap()
-}
-
-fn app_keys(events: &[Event]) -> Option<(Digest, Digest)> {
-    events.iter().find_map(|e| match e {
-        Event::KeysReady {
-            epoch: Epoch::Application,
-            read_secret,
-            write_secret,
-        } => Some((*read_secret, *write_secret)),
-        _ => None,
-    })
-}
-
-fn has(events: &[Event], want: &Event) -> bool {
-    events.iter().any(|e| e == want)
 }
 
 fn server(accept: bool) -> Server<TestGuard, TestGuard> {
@@ -132,90 +117,77 @@ fn issue_ticket() -> Resumption {
     }
 }
 
-#[test]
-fn full_zero_rtt_handshake_completes_via_end_of_early_data() {
+fn early_accepted_server() -> Server<TestGuard, TestGuard> {
     let mut c = client(Some(issue_ticket()), true);
     let mut s = server(true);
-
     let c1 = c.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
-    let client_cets = c1.iter().find_map(|e| match e {
-        Event::ZeroRttKeysReady { secret } => Some(*secret),
-        _ => None,
-    });
-    assert!(client_cets.is_some(), "client must emit 0-RTT keys");
+    let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
+    assert!(
+        s1.iter()
+            .any(|e| matches!(e, Event::ZeroRttKeysReady { .. })),
+        "server must accept 0-RTT for this fixture"
+    );
+    s
+}
 
+#[test]
+fn limit_is_exposed_only_while_window_open() {
+    let mut c = client(Some(issue_ticket()), true);
+    let mut s = server(true);
+    let c1 = c.start().unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
     let sh = find_send(&s1, Epoch::Plaintext).unwrap();
     let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
-    let (s_app_read, s_app_write) = app_keys(&s1).unwrap();
-
     c.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
+    let eod = find_send(&c3, Epoch::EarlyData).unwrap();
 
-    assert!(has(&c3, &Event::EarlyDataAccepted));
-    let eod =
-        find_send(&c3, Epoch::EarlyData).expect("client sends EndOfEarlyData under early epoch");
-    let cf = find_send(&c3, Epoch::Handshake).expect("client Finished under handshake epoch");
-    assert!(has(&c3, &Event::Done));
-    let (c_app_read, c_app_write) = app_keys(&c3).unwrap();
-
-    assert_eq!(c_app_read, s_app_write);
-    assert_eq!(c_app_write, s_app_read);
-
+    assert_eq!(s.max_early_data_size(), Some(MAX_EARLY_DATA_SIZE));
     s.read(Epoch::EarlyData, &eod).unwrap();
-    let s2 = s.read(Epoch::Handshake, &cf).unwrap();
-    assert!(
-        has(&s2, &Event::Done),
-        "server completes after client Finished"
-    );
-    assert!(c.is_done());
-    assert!(s.is_done());
-}
-
-#[test]
-fn server_rejecting_early_data_yields_rejected_and_no_eod() {
-    let mut c = client(Some(issue_ticket()), true);
-    let mut s = server(false);
-
-    let c1 = c.start().unwrap();
-    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
-    let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
-
-    c.read(Epoch::Plaintext, &sh).unwrap();
-    let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
-
-    assert!(has(&c3, &Event::EarlyDataRejected));
-    assert!(
-        find_send(&c3, Epoch::EarlyData).is_none(),
-        "no EndOfEarlyData when rejected"
-    );
-    let cf = find_send(&c3, Epoch::Handshake).unwrap();
-    assert!(has(&c3, &Event::Done));
-
-    let s2 = s.read(Epoch::Handshake, &cf).unwrap();
-    assert!(has(&s2, &Event::Done));
-    assert!(s.is_done());
-}
-
-#[test]
-fn server_rejects_finished_before_end_of_early_data() {
-    let mut c = client(Some(issue_ticket()), true);
-    let mut s = server(true);
-
-    let c1 = c.start().unwrap();
-    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
-    let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
-    c.read(Epoch::Plaintext, &sh).unwrap();
-    let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
-    let cf = find_send(&c3, Epoch::Handshake).unwrap();
-
     assert_eq!(
-        s.read(Epoch::Handshake, &cf).unwrap_err(),
-        shin::Error::UnexpectedMessage
+        s.max_early_data_size(),
+        None,
+        "window closes after EndOfEarlyData"
+    );
+    assert_eq!(s.note_early_data(1), Err(Error::EarlyDataLimitExceeded));
+}
+
+#[test]
+fn early_data_within_limit_succeeds_then_overflow_is_fatal() {
+    let mut s = early_accepted_server();
+    assert!(s.note_early_data(8192).is_ok());
+    assert!(s.note_early_data(8192).is_ok());
+    assert_eq!(
+        s.note_early_data(1),
+        Err(Error::EarlyDataLimitExceeded),
+        "one byte past the limit must be fatal"
+    );
+    assert_eq!(s.max_early_data_size(), None, "window closes on overflow");
+}
+
+#[test]
+fn single_oversized_chunk_is_fatal() {
+    let mut s = early_accepted_server();
+    assert_eq!(
+        s.note_early_data((MAX_EARLY_DATA_SIZE as usize) + 1),
+        Err(Error::EarlyDataLimitExceeded)
+    );
+}
+
+#[test]
+fn note_early_data_rejected_when_not_accepted() {
+    let mut s = server(true);
+    assert_eq!(s.max_early_data_size(), None);
+    assert_eq!(s.note_early_data(1), Err(Error::EarlyDataLimitExceeded));
+}
+
+#[test]
+fn overflow_error_maps_to_unexpected_message_alert() {
+    use shin::alert::AlertDescription;
+    assert_eq!(
+        Error::EarlyDataLimitExceeded.alert().description,
+        AlertDescription::UnexpectedMessage
     );
 }

@@ -1,7 +1,10 @@
+use shin::Epoch;
 use shin::client::{Client, Config as ClientConfig, Verifier};
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+
+mod common;
+use common::send;
 
 type TestClient = Client<fn() -> u64>;
 type TestServer = Server<fn() -> u64>;
@@ -12,16 +15,6 @@ fn signing_key() -> SigningKey {
 
 fn clock() -> u64 {
     1_000_000
-}
-
-fn send(events: &[Event], epoch: Epoch) -> Vec<u8> {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-            _ => None,
-        })
-        .expect("expected a Send")
 }
 
 fn server() -> TestServer {

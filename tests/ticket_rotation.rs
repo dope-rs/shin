@@ -3,16 +3,12 @@ use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
 use shin::ticket::{TicketKeys, TicketRotator};
-use shin::{Clock, Epoch, Event};
+use shin::{Epoch, Event};
+
+mod common;
+use common::{FixedClock, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
-
-struct FixedClock(u64);
-impl Clock for FixedClock {
-    fn now_ms(&self) -> u64 {
-        self.0
-    }
-}
 
 fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x55u8; 32]).unwrap()
@@ -48,30 +44,23 @@ fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
     )
 }
 
-fn send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
-    events.iter().find_map(|e| match e {
-        Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-        _ => None,
-    })
-}
-
 fn full_handshake(client: &mut Client<fn() -> u64>, server: &mut Server<FixedClock>) -> Vec<Event> {
     let mut client_events = Vec::new();
     let c1 = client.start().unwrap();
-    let ch = send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     client_events.extend(c1);
 
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
 
     client_events.extend(client.read(Epoch::Plaintext, &sh).unwrap());
     let c3 = client.read(Epoch::Handshake, &s_hs).unwrap();
-    let cf = send(&c3, Epoch::Handshake).unwrap();
+    let cf = find_send(&c3, Epoch::Handshake).unwrap();
     client_events.extend(c3);
 
     let s2 = server.read(Epoch::Handshake, &cf).unwrap();
-    if let Some(nst) = send(&s2, Epoch::Application) {
+    if let Some(nst) = find_send(&s2, Epoch::Application) {
         client_events.extend(client.read(Epoch::Application, &nst).unwrap());
     }
     client_events
@@ -106,9 +95,9 @@ fn server_resumed(server: &mut Server<FixedClock>, resumption: Resumption) -> bo
 
     let mut client = fresh_client(Some(resumption));
     let c1 = client.start().unwrap();
-    let ch = send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let s_hs = send(&s1, Epoch::Handshake).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
 
     let mut r = Reader::new(&s_hs);
     let mut saw_cert = false;

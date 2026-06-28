@@ -5,16 +5,12 @@ use shin::handshake::{HELLO_RETRY_REQUEST_RANDOM, Handshake};
 use shin::record::CipherSuite;
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
-use shin::{Clock, Epoch, Error, Event};
+use shin::{Epoch, Error, Event};
+
+mod common;
+use common::{FixedClock, send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
-
-struct FixedClock(u64);
-impl Clock for FixedClock {
-    fn now_ms(&self) -> u64 {
-        self.0
-    }
-}
 
 fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x77u8; 32]).unwrap()
@@ -50,16 +46,6 @@ fn client(suites: &[CipherSuite]) -> Client<fn() -> u64> {
     );
     c.set_cipher_suites(suites);
     c
-}
-
-fn send(events: &[Event], epoch: Epoch) -> Vec<u8> {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-            _ => None,
-        })
-        .expect("expected a Send")
 }
 
 fn drive(client: &mut Client<fn() -> u64>, server: &mut Server<FixedClock>) -> Vec<Event> {

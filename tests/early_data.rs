@@ -8,6 +8,9 @@ use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, NoGuard, 
 use shin::sig::SigningKey;
 use shin::{Clock, Epoch, Event};
 
+mod common;
+use common::find_send;
+
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
 
 // Fixed clock so the measured ticket age is ~0 in happy-path tests.
@@ -48,13 +51,6 @@ impl EarlyDataGuard for TestGuard {
 
 fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x99u8; 32]).unwrap()
-}
-
-fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
-    events.iter().find_map(|e| match e {
-        Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-        _ => None,
-    })
 }
 
 fn cets(events: &[Event]) -> Option<Digest> {
@@ -136,15 +132,15 @@ fn first_handshake_ticket_cfg(alpn_protocols: Vec<Vec<u8>>, now_ms: u64) -> Resu
     // Issue with a guard so the ticket carries a real issued-at timestamp.
     let mut c = client_alpn(None, false, alpn_protocols);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
     let _ = c.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
-    let cf = extract_send(&c3, Epoch::Handshake).unwrap();
+    let cf = find_send(&c3, Epoch::Handshake).unwrap();
     let s2 = s.read(Epoch::Handshake, &cf).unwrap();
-    let nst = extract_send(&s2, Epoch::Application).unwrap();
+    let nst = find_send(&s2, Epoch::Application).unwrap();
     let extra = c.read(Epoch::Application, &nst).unwrap();
 
     let mut psk: Option<[u8; 32]> = None;
@@ -183,7 +179,7 @@ fn client_offers_early_data_emits_cets_and_ext() {
     let mut c = client(Some(resumption), true);
     let evs = c.start().unwrap();
 
-    let ch_bytes = extract_send(&evs, Epoch::Plaintext).unwrap();
+    let ch_bytes = find_send(&evs, Epoch::Plaintext).unwrap();
     use shin::codec::Reader;
     use shin::handshake::Handshake;
     let mut r = Reader::new(&ch_bytes);
@@ -210,7 +206,7 @@ fn server_accepts_early_data_emits_matching_cets_and_ee_ext() {
     let mut s = server(true, NOW_MS);
 
     let c1 = c.start().unwrap();
-    let ch_bytes = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch_bytes = find_send(&c1, Epoch::Plaintext).unwrap();
     let client_cets = cets(&c1).expect("client CETS");
 
     let s1 = s.read(Epoch::Plaintext, &ch_bytes).unwrap();
@@ -218,7 +214,7 @@ fn server_accepts_early_data_emits_matching_cets_and_ee_ext() {
 
     assert_eq!(client_cets, server_cets, "CETS must match across sides");
 
-    let s_hs_blob = extract_send(&s1, Epoch::Handshake).unwrap();
+    let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
     use shin::codec::Reader;
     use shin::handshake::Handshake;
     let mut r = Reader::new(&s_hs_blob);
@@ -244,7 +240,7 @@ fn server_with_accept_off_skips_cets_even_with_offer() {
     let mut s = server(false, NOW_MS);
 
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(
         cets(&s1).is_none(),
@@ -259,7 +255,7 @@ fn server_without_guard_refuses_early_data() {
     let mut c = client(Some(resumption), true);
     let mut s = server_no_guard(true, NOW_MS);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(cets(&s1).is_none(), "no guard => early data refused");
 }
@@ -272,7 +268,7 @@ fn replayed_early_data_is_rejected() {
 
     let mut c = client(Some(resumption), true);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
 
     let mut s1 = server_with_guard(true, NOW_MS, guard.clone());
     let out1 = s1.read(Epoch::Plaintext, &ch).unwrap();
@@ -291,7 +287,7 @@ fn stale_ticket_outside_freshness_window_rejected() {
     let resumption = first_handshake_ticket();
     let mut c = client(Some(resumption), true);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
 
     // Server clock far ahead of issued-at; client claims age ~0 -> exceeds skew.
     let mut s = server(true, NOW_MS + 60_000);
@@ -306,7 +302,7 @@ fn early_data_rejected_when_claimed_ticket_age_is_implausible() {
     resumption.age_millis = 3_600_000;
     let mut c = client(Some(resumption), true);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
 
     let mut s = server(true, NOW_MS);
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
@@ -315,7 +311,7 @@ fn early_data_rejected_when_claimed_ticket_age_is_implausible() {
         "implausible claimed ticket age must reject 0-RTT"
     );
     // 1-RTT resumption still proceeds: the binder itself is valid.
-    assert!(extract_send(&s1, Epoch::Plaintext).is_some());
+    assert!(find_send(&s1, Epoch::Plaintext).is_some());
 }
 
 #[test]
@@ -326,7 +322,7 @@ fn early_data_accepted_when_resumed_alpn_matches() {
     let mut s = server_alpn(true, alloc_vec(b"h2"), NOW_MS);
 
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(cets(&s1).is_some(), "matching ALPN => early data accepted");
 }
@@ -339,7 +335,7 @@ fn early_data_rejected_when_resumed_alpn_mismatches() {
     let mut s = server_alpn(true, alloc_vec(b"http/1.1"), NOW_MS);
 
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
     assert!(
         cets(&s1).is_none(),
@@ -347,11 +343,11 @@ fn early_data_rejected_when_resumed_alpn_mismatches() {
     );
     // Handshake still proceeds (1-RTT): ServerHello + handshake messages emitted.
     assert!(
-        extract_send(&s1, Epoch::Plaintext).is_some(),
+        find_send(&s1, Epoch::Plaintext).is_some(),
         "server still completes 1-RTT handshake"
     );
     assert!(
-        extract_send(&s1, Epoch::Handshake).is_some(),
+        find_send(&s1, Epoch::Handshake).is_some(),
         "server emits handshake messages for 1-RTT fallback"
     );
 }
@@ -366,11 +362,11 @@ fn expired_ticket_does_not_resume_via_psk() {
     let mut s = server(false, NOW_MS + 8 * 86_400_000);
 
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
 
     // PSK rejected => full handshake => Certificate is sent in the handshake blob.
-    let s_hs_blob = extract_send(&s1, Epoch::Handshake).unwrap();
+    let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
     use shin::codec::Reader;
     use shin::handshake::{Handshake, HandshakeType};
     let mut r = Reader::new(&s_hs_blob);
@@ -394,10 +390,10 @@ fn fresh_ticket_still_resumes_via_psk() {
     let mut s = server(false, NOW_MS + 1000);
 
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
 
-    let s_hs_blob = extract_send(&s1, Epoch::Handshake).unwrap();
+    let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
     use shin::codec::Reader;
     use shin::handshake::{Handshake, HandshakeType};
     let mut r = Reader::new(&s_hs_blob);
@@ -419,7 +415,7 @@ fn alloc_vec(s: &[u8]) -> Vec<Vec<u8>> {
 fn fresh_client_hello() -> Vec<u8> {
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
-    extract_send(&c1, Epoch::Plaintext).unwrap()
+    find_send(&c1, Epoch::Plaintext).unwrap()
 }
 
 fn reencode_ch<F: FnOnce(&mut shin::handshake::ClientHello)>(
@@ -453,7 +449,7 @@ fn server_accepts_null_compression_method() {
     let ch = fresh_client_hello();
     let mut s = server(false, NOW_MS);
     let out = s.read(Epoch::Plaintext, &ch).unwrap();
-    assert!(extract_send(&out, Epoch::Plaintext).is_some());
+    assert!(find_send(&out, Epoch::Plaintext).is_some());
 }
 
 #[test]
@@ -473,7 +469,7 @@ fn server_accepts_max_session_id() {
     });
     let mut s = server(false, NOW_MS);
     let out = s.read(Epoch::Plaintext, &ch).unwrap();
-    assert!(extract_send(&out, Epoch::Plaintext).is_some());
+    assert!(find_send(&out, Epoch::Plaintext).is_some());
 }
 
 // Drive a server to Done, returning it ready for application-epoch messages.
@@ -481,13 +477,13 @@ fn established_server() -> Server<TestGuard, TestGuard> {
     let mut s = server(false, NOW_MS);
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
     let _ = c.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
-    let cf = extract_send(&c3, Epoch::Handshake).unwrap();
+    let cf = find_send(&c3, Epoch::Handshake).unwrap();
     let _ = s.read(Epoch::Handshake, &cf).unwrap();
     assert!(s.is_done());
     s
@@ -526,15 +522,15 @@ fn nst_advertises_early_data_when_accept_enabled() {
     let mut s = server(true, NOW_MS);
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
     let _ = c.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
-    let cf = extract_send(&c3, Epoch::Handshake).unwrap();
+    let cf = find_send(&c3, Epoch::Handshake).unwrap();
     let s2 = s.read(Epoch::Handshake, &cf).unwrap();
-    let nst_bytes = extract_send(&s2, Epoch::Application).unwrap();
+    let nst_bytes = find_send(&s2, Epoch::Application).unwrap();
 
     let mut r = Reader::new(&nst_bytes);
     let Handshake::NewSessionTicket(nst) = Handshake::decode(&mut r).unwrap() else {
@@ -561,15 +557,15 @@ fn nst_omits_early_data_when_accept_disabled() {
     let mut s = server(false, NOW_MS);
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
     let _ = c.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
-    let cf = extract_send(&c3, Epoch::Handshake).unwrap();
+    let cf = find_send(&c3, Epoch::Handshake).unwrap();
     let s2 = s.read(Epoch::Handshake, &cf).unwrap();
-    let nst_bytes = extract_send(&s2, Epoch::Application).unwrap();
+    let nst_bytes = find_send(&s2, Epoch::Application).unwrap();
 
     let mut r = Reader::new(&nst_bytes);
     let Handshake::NewSessionTicket(nst) = Handshake::decode(&mut r).unwrap() else {

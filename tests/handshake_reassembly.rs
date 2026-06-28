@@ -1,31 +1,16 @@
-use ring::rand::{SecureRandom, SystemRandom};
 use shin::client::{Client, Config as ClientConfig};
 use shin::server::{Config as ServerConfig, Server};
-use shin::sig::SigningKey;
-use shin::{Epoch, Error, Event};
+use shin::{Epoch, Error};
+
+mod common;
+use common::{find_send, has_done, random_signing_key};
 
 const SERVER_TP: &[u8] = b"server-transport-params";
 const CLIENT_TP: &[u8] = b"client-transport-params";
 
-fn sample_signing_key() -> SigningKey {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    SigningKey::from_seed(&seed).unwrap()
-}
-
-fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
-    events.iter().find_map(|e| match e {
-        Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-        _ => None,
-    })
-}
-
-fn has_done(events: &[Event]) -> bool {
-    events.iter().any(|e| matches!(e, Event::Done))
-}
-
+#[allow(clippy::type_complexity)]
 fn make_pair() -> (Client<fn() -> u64>, Server<fn() -> u64>) {
-    let server_key = sample_signing_key();
+    let server_key = random_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
     let server: Server<fn() -> u64> = Server::new(
         ServerConfig {
@@ -58,10 +43,10 @@ fn handshake_with_chunking(chunk: usize) {
     let (mut client, mut server) = make_pair();
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let server_flight = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let server_flight = find_send(&s1, Epoch::Handshake).unwrap();
 
     client.read(Epoch::Plaintext, &sh).unwrap();
 
@@ -69,7 +54,7 @@ fn handshake_with_chunking(chunk: usize) {
     let mut done = false;
     for piece in server_flight.chunks(chunk.max(1)) {
         let evs = client.read(Epoch::Handshake, piece).unwrap();
-        if let Some(b) = extract_send(&evs, Epoch::Handshake) {
+        if let Some(b) = find_send(&evs, Epoch::Handshake) {
             cf = Some(b);
         }
         if has_done(&evs) {
@@ -104,10 +89,10 @@ fn reassembles_server_flight_various_chunk_sizes() {
 fn incomplete_message_buffers_without_error_or_done() {
     let (mut client, mut server) = make_pair();
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let server_flight = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let server_flight = find_send(&s1, Epoch::Handshake).unwrap();
     client.read(Epoch::Plaintext, &sh).unwrap();
 
     let head = &server_flight[..server_flight.len() - 1];
@@ -125,10 +110,10 @@ fn incomplete_message_buffers_without_error_or_done() {
 fn partial_message_must_not_span_epoch_change() {
     let (mut client, mut server) = make_pair();
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let server_flight = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let server_flight = find_send(&s1, Epoch::Handshake).unwrap();
     client.read(Epoch::Plaintext, &sh).unwrap();
 
     let head = &server_flight[..4];

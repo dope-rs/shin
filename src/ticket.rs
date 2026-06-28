@@ -11,9 +11,10 @@ const TICKET_TAG_LEN: usize = 16;
 const PSK_LEN: usize = 32;
 const AGE_ADD_LEN: usize = 4;
 const ISSUED_AT_LEN: usize = 8;
+const SUITE_LEN: usize = 2;
 const ALPN_LEN_LEN: usize = 1;
 const MAX_ALPN_LEN: usize = 255;
-const FIXED_PLAINTEXT_LEN: usize = PSK_LEN + AGE_ADD_LEN + ISSUED_AT_LEN + ALPN_LEN_LEN;
+const FIXED_PLAINTEXT_LEN: usize = PSK_LEN + AGE_ADD_LEN + ISSUED_AT_LEN + SUITE_LEN + ALPN_LEN_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketError {
@@ -43,6 +44,7 @@ impl TicketSecret {
         psk: &[u8; PSK_LEN],
         age_add: u32,
         issued_at_ms: u64,
+        suite: u16,
         alpn: &[u8],
         rng: &impl SecureRandom,
     ) -> Result<Vec<u8>, TicketError> {
@@ -59,6 +61,7 @@ impl TicketSecret {
         buf.extend_from_slice(psk);
         buf.extend_from_slice(&age_add.to_be_bytes());
         buf.extend_from_slice(&issued_at_ms.to_be_bytes());
+        buf.extend_from_slice(&suite.to_be_bytes());
         buf.push(alpn.len() as u8);
         buf.extend_from_slice(alpn);
         key.seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut buf)
@@ -70,10 +73,7 @@ impl TicketSecret {
         Ok(out)
     }
 
-    pub fn decrypt(
-        &self,
-        ticket: &[u8],
-    ) -> Result<([u8; PSK_LEN], u32, u64, Vec<u8>), TicketError> {
+    pub fn decrypt(&self, ticket: &[u8]) -> Result<DecryptedTicket, TicketError> {
         if ticket.len() < TICKET_NONCE_LEN + FIXED_PLAINTEXT_LEN + TICKET_TAG_LEN {
             return Err(TicketError::BadFormat);
         }
@@ -94,23 +94,33 @@ impl TicketSecret {
         let mut age_bytes = [0u8; AGE_ADD_LEN];
         age_bytes.copy_from_slice(&plain[PSK_LEN..PSK_LEN + AGE_ADD_LEN]);
         let mut issued_bytes = [0u8; ISSUED_AT_LEN];
-        issued_bytes
-            .copy_from_slice(&plain[PSK_LEN + AGE_ADD_LEN..PSK_LEN + AGE_ADD_LEN + ISSUED_AT_LEN]);
+        let issued_at_off = PSK_LEN + AGE_ADD_LEN;
+        issued_bytes.copy_from_slice(&plain[issued_at_off..issued_at_off + ISSUED_AT_LEN]);
+        let suite_off = issued_at_off + ISSUED_AT_LEN;
+        let suite = u16::from_be_bytes([plain[suite_off], plain[suite_off + 1]]);
         let alpn_len = plain[FIXED_PLAINTEXT_LEN - ALPN_LEN_LEN] as usize;
         if plain.len() != FIXED_PLAINTEXT_LEN + alpn_len {
             return Err(TicketError::BadFormat);
         }
         let alpn = plain[FIXED_PLAINTEXT_LEN..].to_vec();
-        Ok((
+        Ok(DecryptedTicket {
             psk,
-            u32::from_be_bytes(age_bytes),
-            u64::from_be_bytes(issued_bytes),
+            age_add: u32::from_be_bytes(age_bytes),
+            issued_at_ms: u64::from_be_bytes(issued_bytes),
+            suite,
             alpn,
-        ))
+        })
     }
 }
 
-pub type DecryptedTicket = ([u8; PSK_LEN], u32, u64, Vec<u8>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptedTicket {
+    pub psk: [u8; PSK_LEN],
+    pub age_add: u32,
+    pub issued_at_ms: u64,
+    pub suite: u16,
+    pub alpn: Vec<u8>,
+}
 
 /// Two-generation key set: seal under `current`, still open `previous` for one
 /// rotation window. Produced by [`TicketRotator`].
@@ -137,10 +147,11 @@ impl TicketKeys {
         psk: &[u8; PSK_LEN],
         age_add: u32,
         issued_at_ms: u64,
+        suite: u16,
         alpn: &[u8],
         rng: &impl SecureRandom,
     ) -> Result<Vec<u8>, TicketError> {
-        TicketSecret::new(self.current).encrypt(psk, age_add, issued_at_ms, alpn, rng)
+        TicketSecret::new(self.current).encrypt(psk, age_add, issued_at_ms, suite, alpn, rng)
     }
 
     pub fn decrypt(&self, ticket: &[u8]) -> Result<DecryptedTicket, TicketError> {

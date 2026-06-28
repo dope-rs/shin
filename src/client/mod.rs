@@ -6,8 +6,8 @@ use crate::cert::Cert;
 use crate::chain::{Chain, TrustAnchor};
 use crate::extension::{Extension, ExtensionType};
 use crate::handshake::{
-    Certificate, CertificateVerify, ClientHello, EncryptedExtensions, Finished, Handshake,
-    HsReassembler, RANDOM_LEN, ServerHello, TLS_1_2,
+    Certificate, CertificateEntry, CertificateRequest, CertificateVerify, ClientHello,
+    EncryptedExtensions, Finished, Handshake, HsReassembler, RANDOM_LEN, ServerHello, TLS_1_2,
 };
 use crate::hash::{Digest, HashAlg, MAX_HASH_LEN, Transcript};
 use crate::hostname::Hostname;
@@ -25,9 +25,13 @@ use crate::{Clock, Epoch, Error, Event};
 
 mod config;
 
-pub use config::{Config, OwnedTrustAnchor, Resumption, Verifier};
+/// RFC 8446 §4.6.1: a client MUST NOT cache a ticket longer than 7 days, and a
+/// server MUST NOT send a larger lifetime.
+const MAX_TICKET_LIFETIME_SECS: u32 = 604_800;
 
-use config::{LeafKey, LeafKeyKind};
+pub use config::{ClientCertSource, Config, OwnedTrustAnchor, Resumption, Verifier};
+
+use crate::peer::{LeafKey, LeafKeyKind};
 
 use crate::handshake::HELLO_RETRY_REQUEST_RANDOM as HRR_RANDOM;
 
@@ -69,6 +73,19 @@ pub struct Client<C: Clock> {
     session_id: Vec<u8>,
     hrr_done: bool,
     reasm: HsReassembler,
+    /// Identity to present if the server sends a CertificateRequest (mutual TLS).
+    client_cert: Option<ClientCertSource>,
+    /// Set when the server requested client auth; carries the context to echo
+    /// and the signature schemes it will accept in our CertificateVerify.
+    cert_request: Option<CertRequest>,
+    /// Post-handshake KeyUpdates received since the last application-data record;
+    /// reset by `note_application_data`. Bounds rekey flooding across records.
+    key_updates_since_app_data: u32,
+}
+
+struct CertRequest {
+    context: Vec<u8>,
+    schemes: Vec<u16>,
 }
 
 impl<C: Clock> Drop for Client<C> {
@@ -119,6 +136,9 @@ impl<C: Clock> Client<C> {
             session_id: Vec::new(),
             hrr_done: false,
             reasm: HsReassembler::default(),
+            client_cert: None,
+            cert_request: None,
+            key_updates_since_app_data: 0,
         }
     }
 
@@ -132,6 +152,13 @@ impl<C: Clock> Client<C> {
     /// first). Must be set before `start`.
     pub fn set_cipher_suites(&mut self, suites: &[CipherSuite]) {
         self.offered_suites = suites.to_vec();
+    }
+
+    /// Present this identity if the server requests client authentication
+    /// (mutual TLS). Must be set before `start`. Without it, a server that only
+    /// *requests* (not requires) client auth gets an empty Certificate.
+    pub fn set_client_cert(&mut self, source: ClientCertSource) {
+        self.client_cert = Some(source);
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
@@ -201,14 +228,26 @@ impl<C: Clock> Client<C> {
             ),
         ];
 
+        // X.509 is the RFC 7250 default and needs no extension; offer one only
+        // for a non-X.509 identity or a RawPublicKey server verifier.
+        let client_cert_type_offer = match &self.client_cert {
+            Some(src) => Some(src.cert_type()),
+            None if matches!(self.config.verifier, Verifier::RawPublicKey { .. }) => {
+                Some(CERT_TYPE_RAW_PUBLIC_KEY)
+            }
+            None => None,
+        };
+
         if matches!(self.config.verifier, Verifier::RawPublicKey { .. }) {
             extensions.push(Extension::new(
                 ExtensionType::SERVER_CERTIFICATE_TYPE,
                 CertType::encode_list(server_cert_type),
             ));
+        }
+        if let Some(ct) = client_cert_type_offer {
             extensions.push(Extension::new(
                 ExtensionType::CLIENT_CERTIFICATE_TYPE,
-                CertType::encode_list(CERT_TYPE_RAW_PUBLIC_KEY),
+                CertType::encode_list(ct),
             ));
         }
 
@@ -271,6 +310,36 @@ impl<C: Clock> Client<C> {
         ch_bytes
     }
 
+    fn push_psk_offer(extensions: &mut Vec<Extension>, r: &Resumption) {
+        extensions.push(Extension::new(
+            ExtensionType::PSK_KEY_EXCHANGE_MODES,
+            crate::psk::KxModes::encode(&[crate::psk::KX_MODE_PSK_DHE]),
+        ));
+        let identity = crate::psk::PskIdentity {
+            identity: r.ticket.clone(),
+            obfuscated_ticket_age: r.age_millis.wrapping_add(r.ticket_age_add),
+        };
+        extensions.push(Extension::new(
+            ExtensionType::PRE_SHARED_KEY,
+            crate::psk::Offer::encode(&[identity], &[alloc::vec![0u8; 32]]),
+        ));
+    }
+
+    /// Splice the resumption binder into the trailing 32 bytes of an encoded
+    /// ClientHello, over the transcript so far plus the ClientHello truncated
+    /// before its binders field (RFC 8446 §4.2.11.2: list_len 2 + len 1 + 32).
+    /// On the initial flight the transcript is empty; after a HelloRetryRequest
+    /// it already holds `message_hash(CH1) ‖ HRR`.
+    fn splice_psk_binder(&self, ch_bytes: &mut [u8], psk: &[u8; 32]) {
+        const BINDERS_FIELD_LEN: usize = 2 + 1 + 32;
+        let n = ch_bytes.len();
+        let mut t = self.transcript.clone();
+        t.update(&ch_bytes[..n - BINDERS_FIELD_LEN]);
+        let partial_hash = t.hash(crate::psk::RESUMPTION_HASH);
+        let binder = crate::psk::ResumptionBinder::compute(psk, partial_hash.as_slice());
+        ch_bytes[n - 32..].copy_from_slice(&binder);
+    }
+
     pub fn start(&mut self) -> Result<Vec<Event>, Error> {
         if self.state != State::Initial {
             return Err(Error::UnexpectedMessage);
@@ -294,35 +363,13 @@ impl<C: Clock> Client<C> {
             if early_data_offered {
                 extensions.push(Extension::new(ExtensionType::EARLY_DATA, Vec::new()));
             }
-            extensions.push(Extension::new(
-                ExtensionType::PSK_KEY_EXCHANGE_MODES,
-                crate::psk::KxModes::encode(&[crate::psk::KX_MODE_PSK_DHE]),
-            ));
-            let identity = crate::psk::PskIdentity {
-                identity: r.ticket.clone(),
-                obfuscated_ticket_age: r.age_millis.wrapping_add(r.ticket_age_add),
-            };
-            let placeholder = alloc::vec![0u8; 32];
-            extensions.push(Extension::new(
-                ExtensionType::PRE_SHARED_KEY,
-                crate::psk::Offer::encode(&[identity], &[placeholder]),
-            ));
-            let _ = r;
+            Self::push_psk_offer(&mut extensions, r);
         }
 
         let mut ch_bytes = self.encode_client_hello(extensions);
 
         if let Some(r) = &resumption {
-            let n = ch_bytes.len();
-            // RFC 8446 §4.2.11.2: binder covers the CH minus the binders field
-            // (list_len 2 + binder_len 1 + binder 32).
-            const BINDERS_FIELD_LEN: usize = 2 + 1 + 32;
-            let partial = &ch_bytes[..n - BINDERS_FIELD_LEN];
-            let mut t = Transcript::new();
-            t.update(partial);
-            let partial_hash = t.hash(crate::psk::RESUMPTION_HASH);
-            let binder = crate::psk::ResumptionBinder::compute(&r.psk, partial_hash.as_slice());
-            ch_bytes[n - 32..].copy_from_slice(&binder);
+            self.splice_psk_binder(&mut ch_bytes, &r.psk);
         }
 
         self.transcript.update(&ch_bytes);
@@ -334,7 +381,8 @@ impl<C: Clock> Client<C> {
         if early_data_offered {
             let psk = resumption.as_ref().expect("resumption present").psk;
             let h_ch = self.transcript.hash(crate::psk::RESUMPTION_HASH);
-            let cets = crate::schedule::client_early_traffic_secret(&psk, h_ch.as_slice());
+            let cets =
+                crate::schedule::client_early_traffic_secret(&psk, h_ch.as_slice()).to_digest();
             events.push(Event::ZeroRttKeysReady { secret: cets });
         }
 
@@ -353,6 +401,18 @@ impl<C: Clock> Client<C> {
         Ok(events)
     }
 
+    /// Record that an `Epoch::Application` application-data record was received,
+    /// marking forward progress that resets the post-handshake KeyUpdate flood
+    /// counter (see [`MAX_KEY_UPDATES_WITHOUT_APP_DATA`]). The embedder SHOULD call
+    /// this for every application-data record it decrypts; without it, a peer that
+    /// floods KeyUpdates with no intervening application data is aborted once the
+    /// cap is reached.
+    ///
+    /// [`MAX_KEY_UPDATES_WITHOUT_APP_DATA`]: crate::handshake::MAX_KEY_UPDATES_WITHOUT_APP_DATA
+    pub fn note_application_data(&mut self) {
+        self.key_updates_since_app_data = 0;
+    }
+
     fn process(
         &mut self,
         epoch: Epoch,
@@ -369,6 +429,11 @@ impl<C: Clock> Client<C> {
             {
                 self.handle_encrypted_extensions(ee, raw, events)
             }
+            (State::ExpectCertificate, Handshake::CertificateRequest(cr))
+                if epoch == Epoch::Handshake =>
+            {
+                self.handle_certificate_request(cr, raw)
+            }
             (State::ExpectCertificate, Handshake::Certificate(c)) if epoch == Epoch::Handshake => {
                 self.handle_certificate(c, raw)
             }
@@ -384,6 +449,9 @@ impl<C: Clock> Client<C> {
                 self.handle_key_update(ku, events)
             }
             (State::Done, Handshake::NewSessionTicket(nst)) if epoch == Epoch::Application => {
+                if nst.ticket_lifetime > MAX_TICKET_LIFETIME_SECS {
+                    return Err(Error::IllegalParameter);
+                }
                 if let Some(rms) = self.resumption_master.as_ref()
                     && self.hash_alg() == crate::psk::RESUMPTION_HASH
                 {
@@ -420,8 +488,12 @@ impl<C: Clock> Client<C> {
         ku: crate::handshake::KeyUpdate,
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
+        self.key_updates_since_app_data += 1;
+        if self.key_updates_since_app_data > crate::handshake::MAX_KEY_UPDATES_WITHOUT_APP_DATA {
+            return Err(Error::UnexpectedMessage);
+        }
         let s_ap = self.s_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-        let new_s_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &s_ap);
+        let new_s_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &s_ap).to_digest();
         self.s_ap_traffic = Some(new_s_ap);
         events.push(Event::KeyUpdate {
             direction: crate::KeyDirection::Read,
@@ -437,7 +509,7 @@ impl<C: Clock> Client<C> {
                 data: bytes,
             });
             let c_ap = self.c_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-            let new_c_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &c_ap);
+            let new_c_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &c_ap).to_digest();
             self.c_ap_traffic = Some(new_c_ap);
             events.push(Event::KeyUpdate {
                 direction: crate::KeyDirection::Write,
@@ -515,14 +587,21 @@ impl<C: Clock> Client<C> {
             }
         }
 
-        let psk_selected = sh
+        let psk_ext = sh
             .extensions
             .iter()
-            .any(|e| e.ty == ExtensionType::PRE_SHARED_KEY);
-        if psk_selected && self.config.resumption.is_none() {
-            return Err(Error::UnexpectedMessage);
+            .find(|e| e.ty == ExtensionType::PRE_SHARED_KEY);
+        if let Some(ext) = psk_ext {
+            if self.config.resumption.is_none() {
+                return Err(Error::UnexpectedMessage);
+            }
+            let selected = crate::psk::SelectedIdentity::decode(&ext.data)
+                .map_err(|_| Error::IllegalParameter)?;
+            if selected != 0 {
+                return Err(Error::IllegalParameter);
+            }
         }
-        self.psk_used = psk_selected;
+        self.psk_used = psk_ext.is_some();
 
         self.transcript.update(raw);
 
@@ -545,10 +624,14 @@ impl<C: Clock> Client<C> {
             KeySchedule::new(alg).into_handshake(dhe.as_slice())
         };
         let h_chsh = self.transcript.hash(alg);
-        let c_hs = ks_handshake.client_handshake_traffic_secret(h_chsh.as_slice());
-        let s_hs = ks_handshake.server_handshake_traffic_secret(h_chsh.as_slice());
+        let c_hs = ks_handshake
+            .client_handshake_traffic_secret(h_chsh.as_slice())
+            .to_digest();
+        let s_hs = ks_handshake
+            .server_handshake_traffic_secret(h_chsh.as_slice())
+            .to_digest();
 
-        self.handshake_secret = Some(*ks_handshake.secret());
+        self.handshake_secret = Some(ks_handshake.secret().to_digest());
         self.c_hs_traffic = Some(c_hs);
         self.s_hs_traffic = Some(s_hs);
 
@@ -564,7 +647,8 @@ impl<C: Clock> Client<C> {
 
     /// Handle a HelloRetryRequest (RFC 8446 §4.1.4): resend the ClientHello with
     /// the same key share and the echoed cookie over the rewritten transcript. At
-    /// most one HRR, only for our single group; resumption + HRR is unsupported.
+    /// most one HRR. When resuming, the PSK is re-offered with its binder taken
+    /// over `message_hash(CH1) ‖ HRR ‖ Truncate(CH2)` (RFC 8446 §4.2.11.2).
     fn handle_hello_retry_request(
         &mut self,
         hrr: ServerHello,
@@ -573,9 +657,6 @@ impl<C: Clock> Client<C> {
     ) -> Result<(), Error> {
         if self.hrr_done {
             return Err(Error::UnexpectedMessage);
-        }
-        if self.config.resumption.is_some() {
-            return Err(Error::HelloRetryRequest);
         }
 
         let mut saw_supported_versions = false;
@@ -618,8 +699,19 @@ impl<C: Clock> Client<C> {
             .ok_or(Error::UnexpectedMessage)?
             .client_share()
             .to_vec();
-        let extensions = self.base_extensions(&eph_share, cookie.as_deref())?;
-        let ch_bytes = self.encode_client_hello(extensions);
+        let mut extensions = self.base_extensions(&eph_share, cookie.as_deref())?;
+
+        let resumption = self.config.resumption.clone();
+        if let Some(r) = &resumption {
+            Self::push_psk_offer(&mut extensions, r);
+        }
+
+        let mut ch_bytes = self.encode_client_hello(extensions);
+
+        if let Some(r) = &resumption {
+            self.splice_psk_binder(&mut ch_bytes, &r.psk);
+        }
+
         self.transcript.update(&ch_bytes);
         self.hrr_done = true;
         events.push(Event::Send {
@@ -691,6 +783,86 @@ impl<C: Clock> Client<C> {
             State::ExpectCertificate
         };
         Ok(())
+    }
+
+    /// RFC 8446 §4.3.2: the server asks us to authenticate. Record the context
+    /// to echo and the signature schemes it will accept; the Certificate and
+    /// CertificateVerify themselves are sent after we verify the server, in the
+    /// same flight as our Finished.
+    fn handle_certificate_request(
+        &mut self,
+        cr: CertificateRequest,
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        let sigs = cr
+            .extensions
+            .iter()
+            .find(|e| e.ty == ExtensionType::SIGNATURE_ALGORITHMS)
+            .ok_or(Error::MissingExtension)?;
+        let schemes = SignatureAlgorithms::decode(&sigs.data)?;
+        self.cert_request = Some(CertRequest {
+            context: cr.certificate_request_context.clone(),
+            schemes,
+        });
+        self.transcript.update(raw);
+        Ok(())
+    }
+
+    /// Build our client Certificate (+ CertificateVerify if we hold an identity)
+    /// in response to a CertificateRequest, appending each to the transcript so
+    /// the subsequent client Finished covers them (RFC 8446 §4.4).
+    fn client_auth_flight(&mut self, alg: HashAlg) -> Result<Vec<u8>, Error> {
+        let req = self
+            .cert_request
+            .as_ref()
+            .expect("called only when requested");
+        let certificate_list: Vec<CertificateEntry> = match &self.client_cert {
+            Some(ClientCertSource::RawPublicKey { signing_key }) => {
+                let pubkey = signing_key.pubkey().ok_or(Error::Sig)?;
+                alloc::vec![CertificateEntry {
+                    cert_data: spki::SubjectPublicKey::Ed25519(*pubkey)
+                        .encode()
+                        .map_err(|_| Error::Spki)?,
+                    extensions: Vec::new(),
+                }]
+            }
+            Some(ClientCertSource::X509 { chain_der, .. }) => chain_der
+                .iter()
+                .map(|der| CertificateEntry {
+                    cert_data: der.clone(),
+                    extensions: Vec::new(),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let cert = Certificate {
+            certificate_request_context: req.context.clone(),
+            certificate_list,
+        };
+        let mut out = Vec::new();
+        let mut cert_bytes = Vec::new();
+        Handshake::Certificate(cert).encode(&mut cert_bytes);
+        self.transcript.update(&cert_bytes);
+        out.extend_from_slice(&cert_bytes);
+
+        if let Some(src) = &self.client_cert {
+            let scheme = src.signing_key().sig_scheme();
+            if !req.schemes.contains(&scheme) {
+                return Err(Error::SigSchemeNotOffered);
+            }
+            let h = self.transcript.hash(alg);
+            let cv_msg = CertVerify::message(h.as_slice(), false);
+            let signature = src.signing_key().sign(&cv_msg).map_err(|_| Error::Sig)?;
+            let cv = CertificateVerify {
+                algorithm: scheme,
+                signature,
+            };
+            let mut cv_bytes = Vec::new();
+            Handshake::CertificateVerify(cv).encode(&mut cv_bytes);
+            self.transcript.update(&cv_bytes);
+            out.extend_from_slice(&cv_bytes);
+        }
+        Ok(out)
     }
 
     fn handle_certificate(&mut self, cert: Certificate, raw: &[u8]) -> Result<(), Error> {
@@ -834,21 +1006,21 @@ impl<C: Clock> Client<C> {
             master.as_slice(),
             "c ap traffic",
             h_sf.as_slice(),
-        );
+        )
+        .to_digest();
         let s_ap = crate::kdf::Hkdf::derive_secret(
             alg,
             master.as_slice(),
             "s ap traffic",
             h_sf.as_slice(),
-        );
+        )
+        .to_digest();
         self.c_ap_traffic = Some(c_ap);
         self.s_ap_traffic = Some(s_ap);
-        self.exporter_master = Some(crate::kdf::Hkdf::derive_secret(
-            alg,
-            master.as_slice(),
-            "exp master",
-            h_sf.as_slice(),
-        ));
+        self.exporter_master = Some(
+            crate::kdf::Hkdf::derive_secret(alg, master.as_slice(), "exp master", h_sf.as_slice())
+                .to_digest(),
+        );
 
         events.push(Event::KeysReady {
             epoch: Epoch::Application,
@@ -866,6 +1038,11 @@ impl<C: Clock> Client<C> {
             });
         }
 
+        let mut flight = Vec::new();
+        if self.cert_request.is_some() {
+            flight = self.client_auth_flight(alg)?;
+        }
+
         let h_pre_cf = self.transcript.hash(alg);
         let cf_data = FinishedProto::verify_data(alg, c_hs.as_slice(), h_pre_cf.as_slice());
         let cf = Finished {
@@ -876,12 +1053,14 @@ impl<C: Clock> Client<C> {
         self.transcript.update(&cf_bytes);
         let h_cf = self.transcript.hash(alg);
         let rms =
-            crate::kdf::Hkdf::derive_secret(alg, master.as_slice(), "res master", h_cf.as_slice());
+            crate::kdf::Hkdf::derive_secret(alg, master.as_slice(), "res master", h_cf.as_slice())
+                .to_digest();
         self.resumption_master = Some(rms);
 
+        flight.extend_from_slice(&cf_bytes);
         events.push(Event::Send {
             epoch: Epoch::Handshake,
-            data: cf_bytes,
+            data: flight,
         });
         events.push(Event::Done);
 
@@ -898,7 +1077,7 @@ impl<C: Clock> Client<C> {
             return Err(Error::UnexpectedMessage);
         }
         let c_ap = self.c_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-        let new_c_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &c_ap);
+        let new_c_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &c_ap).to_digest();
         self.c_ap_traffic = Some(new_c_ap);
 
         let ku = crate::handshake::KeyUpdate {
