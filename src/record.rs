@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 use crate::aead::AeadKey;
+use crate::hash::HashAlg;
 use crate::schedule::TrafficKeys;
 
 pub const PROTOCOL_VERSION: u16 = 0x0303;
@@ -9,18 +10,23 @@ pub const PROTOCOL_VERSION: u16 = 0x0303;
 pub enum CipherSuite {
     Aes128GcmSha256,
     ChaCha20Poly1305Sha256,
+    Aes256GcmSha384,
 }
 
 impl CipherSuite {
-    pub const SUPPORTED: [CipherSuite; 2] = [
+    /// Server preference order (AES-128 first keeps embedders that hardcode it
+    /// interoperable).
+    pub const SUPPORTED: [CipherSuite; 3] = [
         CipherSuite::Aes128GcmSha256,
         CipherSuite::ChaCha20Poly1305Sha256,
+        CipherSuite::Aes256GcmSha384,
     ];
 
     pub fn from_u16(v: u16) -> Option<Self> {
         match v {
             0x1301 => Some(Self::Aes128GcmSha256),
             0x1303 => Some(Self::ChaCha20Poly1305Sha256),
+            0x1302 => Some(Self::Aes256GcmSha384),
             _ => None,
         }
     }
@@ -29,19 +35,32 @@ impl CipherSuite {
         match self {
             Self::Aes128GcmSha256 => 0x1301,
             Self::ChaCha20Poly1305Sha256 => 0x1303,
+            Self::Aes256GcmSha384 => 0x1302,
+        }
+    }
+
+    pub fn hash_alg(self) -> HashAlg {
+        match self {
+            Self::Aes128GcmSha256 | Self::ChaCha20Poly1305Sha256 => HashAlg::Sha256,
+            Self::Aes256GcmSha384 => HashAlg::Sha384,
         }
     }
 }
 
-fn aead_for_suite(secret: &[u8; 32], suite: CipherSuite) -> AeadKey {
+fn aead_for_suite(secret: &[u8], suite: CipherSuite) -> AeadKey {
+    let alg = suite.hash_alg();
     match suite {
         CipherSuite::Aes128GcmSha256 => {
-            let keys = TrafficKeys::<16>::derive(secret);
+            let keys = TrafficKeys::<16>::derive(alg, secret);
             AeadKey::aes_128_gcm(&keys.key, keys.iv)
         }
         CipherSuite::ChaCha20Poly1305Sha256 => {
-            let keys = TrafficKeys::<32>::derive(secret);
+            let keys = TrafficKeys::<32>::derive(alg, secret);
             AeadKey::chacha20_poly1305(&keys.key, keys.iv)
+        }
+        CipherSuite::Aes256GcmSha384 => {
+            let keys = TrafficKeys::<32>::derive(alg, secret);
+            AeadKey::aes_256_gcm(&keys.key, keys.iv)
         }
     }
 }
@@ -147,7 +166,7 @@ impl Sealer {
         Self::with_suite(secret, CipherSuite::Aes128GcmSha256)
     }
 
-    pub fn with_suite(secret: &[u8; 32], suite: CipherSuite) -> Self {
+    pub fn with_suite(secret: &[u8], suite: CipherSuite) -> Self {
         Self {
             aead: aead_for_suite(secret, suite),
             seq: 0,
@@ -208,7 +227,7 @@ impl Opener {
         Self::with_suite(secret, CipherSuite::Aes128GcmSha256)
     }
 
-    pub fn with_suite(secret: &[u8; 32], suite: CipherSuite) -> Self {
+    pub fn with_suite(secret: &[u8], suite: CipherSuite) -> Self {
         Self {
             aead: aead_for_suite(secret, suite),
             seq: 0,
@@ -331,7 +350,7 @@ mod tests {
     }
 
     fn craft_wire(seq: u64, inner_plaintext: &[u8]) -> Vec<u8> {
-        let keys = TrafficKeys::<16>::derive(&SECRET);
+        let keys = TrafficKeys::<16>::derive(HashAlg::Sha256, &SECRET);
         let aead = AeadKey::aes_128_gcm(&keys.key, keys.iv);
         let outer_body_len = inner_plaintext.len() + AEAD_TAG_LEN;
         let mut header = Vec::with_capacity(HEADER_LEN);

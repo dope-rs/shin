@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
 use shin::extension::ExtensionType;
+use shin::hash::Digest;
 use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, NoGuard, Server};
 use shin::sig::SigningKey;
 use shin::{Clock, Epoch, Event};
@@ -56,7 +57,7 @@ fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
     })
 }
 
-fn cets(events: &[Event]) -> Option<[u8; 32]> {
+fn cets(events: &[Event]) -> Option<Digest> {
     events.iter().find_map(|e| match e {
         Event::ZeroRttKeysReady { secret } => Some(*secret),
         _ => None,
@@ -198,7 +199,7 @@ fn client_offers_early_data_emits_cets_and_ext() {
     );
 
     let secret = cets(&evs).expect("CETS emitted");
-    assert!(!secret.iter().all(|&b| b == 0));
+    assert!(!secret.as_slice().iter().all(|&b| b == 0));
 }
 
 #[test]

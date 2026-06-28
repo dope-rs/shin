@@ -1,5 +1,6 @@
 use ring::rand::{SecureRandom, SystemRandom};
 use shin::client::{Client, Config as ClientConfig};
+use shin::hash::Digest;
 use shin::server::{Config as ServerConfig, Server};
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
@@ -20,7 +21,7 @@ fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
     })
 }
 
-fn extract_keys(events: &[Event], epoch: Epoch) -> Option<([u8; 32], [u8; 32])> {
+fn extract_keys(events: &[Event], epoch: Epoch) -> Option<(Digest, Digest)> {
     events.iter().find_map(|e| match e {
         Event::KeysReady {
             epoch: ep,
@@ -208,7 +209,7 @@ fn keys_diverge_across_independent_handshakes() {
     let server_key = sample_signing_key();
     let server_pubkey = *server_key.pubkey().unwrap();
 
-    let do_handshake = || -> ([u8; 32], [u8; 32]) {
+    let do_handshake = || -> (Digest, Digest) {
         let mut server = Server::new(
             ServerConfig {
                 source: shin::server::CertSource::RawPublicKey {

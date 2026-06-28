@@ -1,5 +1,5 @@
 use shin::aead::{AeadError, AeadKey};
-use shin::hash::Transcript;
+use shin::hash::{HashAlg, Transcript};
 use shin::kdf::Hkdf;
 use shin::schedule::{KeySchedule, TrafficKeys};
 
@@ -68,82 +68,101 @@ fn sha256_empty_string_matches_known_value() {
         0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
         0xb8, 0x55,
     ];
-    assert_eq!(Transcript::hash_empty(), KNOWN);
+    assert_eq!(
+        Transcript::hash_empty(HashAlg::Sha256).as_slice(),
+        &KNOWN[..]
+    );
 }
 
 #[test]
 fn early_secret_matches_rfc8448() {
     let zero = [0u8; 32];
-    let early = Hkdf::extract(&zero, &zero);
-    assert_eq!(early, EARLY_SECRET);
+    let early = Hkdf::extract(HashAlg::Sha256, &zero, &zero);
+    assert_eq!(early.as_slice(), &EARLY_SECRET[..]);
 }
 
 #[test]
 fn derive_secret_for_handshake_matches_rfc8448() {
-    let derived = Hkdf::derive_secret(&EARLY_SECRET, "derived", &Transcript::hash_empty());
-    assert_eq!(derived, DERIVED_FOR_HANDSHAKE);
+    let derived = Hkdf::derive_secret(
+        HashAlg::Sha256,
+        &EARLY_SECRET,
+        "derived",
+        Transcript::hash_empty(HashAlg::Sha256).as_slice(),
+    );
+    assert_eq!(derived.as_slice(), &DERIVED_FOR_HANDSHAKE[..]);
 }
 
 #[test]
 fn handshake_secret_matches_rfc8448() {
-    let hs_secret = Hkdf::extract(&DERIVED_FOR_HANDSHAKE, &DHE_SHARED);
-    assert_eq!(hs_secret, HANDSHAKE_SECRET);
+    let hs_secret = Hkdf::extract(HashAlg::Sha256, &DERIVED_FOR_HANDSHAKE, &DHE_SHARED);
+    assert_eq!(hs_secret.as_slice(), &HANDSHAKE_SECRET[..]);
 }
 
 #[test]
 fn key_schedule_walks_to_handshake_secret() {
-    let ks = KeySchedule::new();
-    assert_eq!(ks.secret(), &EARLY_SECRET);
+    let ks = KeySchedule::new(HashAlg::Sha256);
+    assert_eq!(ks.secret().as_slice(), &EARLY_SECRET[..]);
     let ks = ks.into_handshake(&DHE_SHARED);
-    assert_eq!(ks.secret(), &HANDSHAKE_SECRET);
+    assert_eq!(ks.secret().as_slice(), &HANDSHAKE_SECRET[..]);
 }
 
 #[test]
 fn server_handshake_traffic_keys_match_rfc8448() {
-    let tk = TrafficKeys::<16>::derive(&S_HS_TRAFFIC);
+    let tk = TrafficKeys::<16>::derive(HashAlg::Sha256, &S_HS_TRAFFIC);
     assert_eq!(tk.key, S_HS_KEY);
     assert_eq!(tk.iv, S_HS_IV);
 }
 
 #[test]
 fn master_secret_matches_rfc8448() {
-    let derived = Hkdf::derive_secret(&HANDSHAKE_SECRET, "derived", &Transcript::hash_empty());
-    assert_eq!(derived, DERIVED_FOR_MASTER);
+    let derived = Hkdf::derive_secret(
+        HashAlg::Sha256,
+        &HANDSHAKE_SECRET,
+        "derived",
+        Transcript::hash_empty(HashAlg::Sha256).as_slice(),
+    );
+    assert_eq!(derived.as_slice(), &DERIVED_FOR_MASTER[..]);
     let zero = [0u8; 32];
-    let master = Hkdf::extract(&derived, &zero);
-    assert_eq!(master, MASTER_SECRET);
+    let master = Hkdf::extract(HashAlg::Sha256, derived.as_slice(), &zero);
+    assert_eq!(master.as_slice(), &MASTER_SECRET[..]);
 }
 
 #[test]
 fn key_schedule_walks_to_master_secret() {
-    let ks = KeySchedule::new().into_handshake(&DHE_SHARED).into_master();
-    assert_eq!(ks.secret(), &MASTER_SECRET);
+    let ks = KeySchedule::new(HashAlg::Sha256)
+        .into_handshake(&DHE_SHARED)
+        .into_master();
+    assert_eq!(ks.secret().as_slice(), &MASTER_SECRET[..]);
 }
 
 #[test]
 fn application_traffic_secrets_match_rfc8448() {
-    let ks = KeySchedule::new().into_handshake(&DHE_SHARED).into_master();
+    let ks = KeySchedule::new(HashAlg::Sha256)
+        .into_handshake(&DHE_SHARED)
+        .into_master();
     assert_eq!(
-        ks.client_application_traffic_secret(&TRANSCRIPT_HASH_SF),
-        C_AP_TRAFFIC
+        ks.client_application_traffic_secret(&TRANSCRIPT_HASH_SF)
+            .as_slice(),
+        &C_AP_TRAFFIC[..]
     );
     assert_eq!(
-        ks.server_application_traffic_secret(&TRANSCRIPT_HASH_SF),
-        S_AP_TRAFFIC
+        ks.server_application_traffic_secret(&TRANSCRIPT_HASH_SF)
+            .as_slice(),
+        &S_AP_TRAFFIC[..]
     );
 }
 
 #[test]
 fn hkdf_expand_label_matches_explicit_info() {
     let mut from_label = [0u8; 16];
-    Hkdf::expand_label(&S_HS_TRAFFIC, "key", &[], &mut from_label);
+    Hkdf::expand_label(HashAlg::Sha256, &S_HS_TRAFFIC, "key", &[], &mut from_label);
     assert_eq!(from_label, S_HS_KEY);
 
     let mut from_explicit = [0u8; 16];
     let info = [
         0x00, 0x10, 0x09, b't', b'l', b's', b'1', b'3', b' ', b'k', b'e', b'y', 0x00,
     ];
-    shin::kdf::Hkdf::expand(&S_HS_TRAFFIC, &info, &mut from_explicit);
+    shin::kdf::Hkdf::expand(HashAlg::Sha256, &S_HS_TRAFFIC, &info, &mut from_explicit);
     assert_eq!(from_explicit, S_HS_KEY);
 
     assert_eq!(from_label, from_explicit);

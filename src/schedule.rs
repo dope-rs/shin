@@ -1,6 +1,6 @@
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use crate::hash::{HASH_LEN, Transcript};
+use crate::hash::{Digest, HASH_LEN, HashAlg, MAX_HASH_LEN, Transcript};
 use crate::kdf::Hkdf;
 
 pub(crate) fn zeroize(bytes: &mut [u8]) {
@@ -13,73 +13,125 @@ pub(crate) fn zeroize(bytes: &mut [u8]) {
 }
 
 pub struct KeySchedule {
-    secret: [u8; HASH_LEN],
+    alg: HashAlg,
+    secret: Digest,
 }
 
 impl Drop for KeySchedule {
     fn drop(&mut self) {
-        zeroize(&mut self.secret);
+        zeroize(self.secret.as_mut_slice());
     }
 }
 
 impl KeySchedule {
-    pub fn new() -> Self {
-        let zero = [0u8; HASH_LEN];
+    pub fn new(alg: HashAlg) -> Self {
+        let zero = [0u8; MAX_HASH_LEN];
+        let z = &zero[..alg.output_len()];
         Self {
-            secret: Hkdf::extract(&zero, &zero),
+            alg,
+            secret: Hkdf::extract(alg, z, z),
         }
     }
 
-    pub fn new_psk(psk: &[u8; HASH_LEN]) -> Self {
-        let zero = [0u8; HASH_LEN];
+    pub fn new_psk(alg: HashAlg, psk: &[u8]) -> Self {
+        let zero = [0u8; MAX_HASH_LEN];
+        let z = &zero[..alg.output_len()];
         Self {
-            secret: Hkdf::extract(&zero, psk),
+            alg,
+            secret: Hkdf::extract(alg, z, psk),
         }
+    }
+
+    pub fn hash_alg(&self) -> HashAlg {
+        self.alg
     }
 
     pub fn into_handshake(self, dhe: &[u8]) -> Self {
-        let derived = Hkdf::derive_secret(&self.secret, "derived", &Transcript::hash_empty());
+        let derived = Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "derived",
+            Transcript::hash_empty(self.alg).as_slice(),
+        );
         Self {
-            secret: Hkdf::extract(&derived, dhe),
+            alg: self.alg,
+            secret: Hkdf::extract(self.alg, derived.as_slice(), dhe),
         }
     }
 
     pub fn into_master(self) -> Self {
-        let derived = Hkdf::derive_secret(&self.secret, "derived", &Transcript::hash_empty());
-        let zero = [0u8; HASH_LEN];
+        let derived = Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "derived",
+            Transcript::hash_empty(self.alg).as_slice(),
+        );
+        let zero = [0u8; MAX_HASH_LEN];
+        let z = &zero[..self.alg.output_len()];
         Self {
-            secret: Hkdf::extract(&derived, &zero),
+            alg: self.alg,
+            secret: Hkdf::extract(self.alg, derived.as_slice(), z),
         }
     }
 
-    pub fn secret(&self) -> &[u8; HASH_LEN] {
+    pub fn secret(&self) -> &Digest {
         &self.secret
     }
 
-    pub fn client_handshake_traffic_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
-        Hkdf::derive_secret(&self.secret, "c hs traffic", transcript_hash)
+    pub fn client_handshake_traffic_secret(&self, transcript_hash: &[u8]) -> Digest {
+        Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "c hs traffic",
+            transcript_hash,
+        )
     }
 
-    pub fn server_handshake_traffic_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
-        Hkdf::derive_secret(&self.secret, "s hs traffic", transcript_hash)
+    pub fn server_handshake_traffic_secret(&self, transcript_hash: &[u8]) -> Digest {
+        Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "s hs traffic",
+            transcript_hash,
+        )
     }
 
-    pub fn client_application_traffic_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
-        Hkdf::derive_secret(&self.secret, "c ap traffic", transcript_hash)
+    pub fn client_application_traffic_secret(&self, transcript_hash: &[u8]) -> Digest {
+        Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "c ap traffic",
+            transcript_hash,
+        )
     }
 
-    pub fn server_application_traffic_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
-        Hkdf::derive_secret(&self.secret, "s ap traffic", transcript_hash)
+    pub fn server_application_traffic_secret(&self, transcript_hash: &[u8]) -> Digest {
+        Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "s ap traffic",
+            transcript_hash,
+        )
     }
 
-    pub fn resumption_master_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
-        Hkdf::derive_secret(&self.secret, "res master", transcript_hash)
+    pub fn resumption_master_secret(&self, transcript_hash: &[u8]) -> Digest {
+        Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "res master",
+            transcript_hash,
+        )
     }
 
     /// RFC 8446 §7.5: `exporter_master_secret`, derived from the master secret
     /// over the transcript through the server Finished.
-    pub fn exporter_master_secret(&self, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
-        Hkdf::derive_secret(&self.secret, "exp master", transcript_hash)
+    pub fn exporter_master_secret(&self, transcript_hash: &[u8]) -> Digest {
+        Hkdf::derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            "exp master",
+            transcript_hash,
+        )
     }
 }
 
@@ -87,14 +139,39 @@ impl KeySchedule {
 /// `HKDF-Expand-Label(Derive-Secret(exporter_master, label, ""), "exporter",
 /// Hash(context), length)`.
 pub fn export_keying_material(
-    exporter_master: &[u8; HASH_LEN],
+    alg: HashAlg,
+    exporter_master: &[u8],
     label: &str,
     context: &[u8],
     out: &mut [u8],
 ) {
-    let secret = Hkdf::derive_secret(exporter_master, label, &Transcript::hash_empty());
-    let context_hash = crate::hash::sha256(context);
-    Hkdf::expand_label(&secret, "exporter", &context_hash, out);
+    let secret = Hkdf::derive_secret(
+        alg,
+        exporter_master,
+        label,
+        Transcript::hash_empty(alg).as_slice(),
+    );
+    let context_hash = alg.hash(context);
+    Hkdf::expand_label(
+        alg,
+        secret.as_slice(),
+        "exporter",
+        context_hash.as_slice(),
+        out,
+    );
+}
+
+/// RFC 8446 §7.1: `client_early_traffic_secret` for 0-RTT, derived from the
+/// resumption PSK over the transcript through ClientHello.
+pub fn client_early_traffic_secret(psk: &[u8], transcript_hash: &[u8]) -> Digest {
+    let zero = [0u8; HASH_LEN];
+    let early = Hkdf::extract(crate::psk::RESUMPTION_HASH, &zero, psk);
+    Hkdf::derive_secret(
+        crate::psk::RESUMPTION_HASH,
+        early.as_slice(),
+        "c e traffic",
+        transcript_hash,
+    )
 }
 
 pub struct ResumptionMaster([u8; HASH_LEN]);
@@ -106,20 +183,22 @@ impl Drop for ResumptionMaster {
 }
 
 impl ResumptionMaster {
-    pub fn new(secret: [u8; HASH_LEN]) -> Self {
-        Self(secret)
+    pub fn from_secret(secret: &Digest) -> Self {
+        let mut bytes = [0u8; HASH_LEN];
+        bytes.copy_from_slice(secret.as_slice());
+        Self(bytes)
     }
 
     pub fn psk(&self, nonce: &[u8]) -> [u8; HASH_LEN] {
         let mut out = [0u8; HASH_LEN];
-        Hkdf::expand_label(&self.0, "resumption", nonce, &mut out);
+        Hkdf::expand_label(
+            crate::psk::RESUMPTION_HASH,
+            &self.0,
+            "resumption",
+            nonce,
+            &mut out,
+        );
         out
-    }
-}
-
-impl Default for KeySchedule {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -136,11 +215,11 @@ impl<const K: usize> Drop for TrafficKeys<K> {
 }
 
 impl<const K: usize> TrafficKeys<K> {
-    pub fn derive(secret: &[u8]) -> Self {
+    pub fn derive(alg: HashAlg, secret: &[u8]) -> Self {
         let mut key = [0u8; K];
         let mut iv = [0u8; 12];
-        Hkdf::expand_label(secret, "key", &[], &mut key);
-        Hkdf::expand_label(secret, "iv", &[], &mut iv);
+        Hkdf::expand_label(alg, secret, "key", &[], &mut key);
+        Hkdf::expand_label(alg, secret, "iv", &[], &mut iv);
         Self { key, iv }
     }
 }

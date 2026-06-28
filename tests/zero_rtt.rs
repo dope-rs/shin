@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
+use shin::hash::Digest;
 use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, Server};
 use shin::sig::SigningKey;
 use shin::{Clock, Epoch, Event};
@@ -52,7 +53,7 @@ fn send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
     })
 }
 
-fn app_keys(events: &[Event]) -> Option<([u8; 32], [u8; 32])> {
+fn app_keys(events: &[Event]) -> Option<(Digest, Digest)> {
     events.iter().find_map(|e| match e {
         Event::KeysReady {
             epoch: Epoch::Application,

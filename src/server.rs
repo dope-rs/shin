@@ -9,13 +9,14 @@ use crate::handshake::{
     HELLO_RETRY_REQUEST_RANDOM, Handshake, HsReassembler, NewSessionTicket, RANDOM_LEN,
     ServerHello, TLS_1_2,
 };
-use crate::hash::Transcript;
-use crate::kx::{EphemeralKey, KexGroup};
+use crate::hash::{Digest, HashAlg, Transcript};
+use crate::kx::KexGroup;
 use crate::proto::{
     Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertType, CertVerify,
     Finished as FinishedProto, KeyShare, SignatureAlgorithms, SupportedGroups, SupportedVersions,
     TLS_1_3,
 };
+use crate::psk::RESUMPTION_HASH;
 use crate::record::CipherSuite;
 use crate::schedule::KeySchedule;
 use crate::sig::SigningKey;
@@ -105,16 +106,16 @@ pub struct Server<C: Clock, G: EarlyDataGuard = NoGuard> {
     state: State,
     transcript: Transcript,
     rng: SystemRandom,
-    c_hs_traffic: Option<[u8; 32]>,
-    expected_client_finished: Option<[u8; 32]>,
-    c_ap_traffic: Option<[u8; 32]>,
-    s_ap_traffic: Option<[u8; 32]>,
+    c_hs_traffic: Option<Digest>,
+    expected_client_finished: Option<Digest>,
+    c_ap_traffic: Option<Digest>,
+    s_ap_traffic: Option<Digest>,
     selected_alpn: Option<Vec<u8>>,
     master: Option<KeySchedule>,
     early_data_guard: Option<G>,
     clock: C,
     hrr_done: bool,
-    exporter_master: Option<[u8; 32]>,
+    exporter_master: Option<Digest>,
     negotiated_suite: Option<crate::record::CipherSuite>,
     reasm: HsReassembler,
 }
@@ -131,7 +132,7 @@ impl<C: Clock, G: EarlyDataGuard> Drop for Server<C, G> {
         .into_iter()
         .flatten()
         {
-            crate::schedule::zeroize(b);
+            crate::schedule::zeroize(b.as_mut_slice());
         }
     }
 }
@@ -184,7 +185,13 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         out: &mut [u8],
     ) -> Result<(), Error> {
         let em = self.exporter_master.as_ref().ok_or(Error::NotReady)?;
-        crate::schedule::export_keying_material(em, label, context, out);
+        crate::schedule::export_keying_material(
+            self.hash_alg(),
+            em.as_slice(),
+            label,
+            context,
+            out,
+        );
         Ok(())
     }
 
@@ -233,14 +240,19 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         }
     }
 
+    fn hash_alg(&self) -> HashAlg {
+        self.negotiated_suite
+            .map(|s| s.hash_alg())
+            .unwrap_or(HashAlg::Sha256)
+    }
+
     fn handle_key_update(
         &mut self,
         ku: crate::handshake::KeyUpdate,
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         let c_ap = self.c_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-        let mut new_c_ap = [0u8; 32];
-        crate::kdf::Hkdf::expand_label(&c_ap, "traffic upd", &[], &mut new_c_ap);
+        let new_c_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &c_ap);
         self.c_ap_traffic = Some(new_c_ap);
         events.push(Event::KeyUpdate {
             direction: crate::KeyDirection::Read,
@@ -256,8 +268,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
                 data: bytes,
             });
             let s_ap = self.s_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-            let mut new_s_ap = [0u8; 32];
-            crate::kdf::Hkdf::expand_label(&s_ap, "traffic upd", &[], &mut new_s_ap);
+            let new_s_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &s_ap);
             self.s_ap_traffic = Some(new_s_ap);
             events.push(Event::KeyUpdate {
                 direction: crate::KeyDirection::Write,
@@ -279,6 +290,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             .find(|s| ch.cipher_suites.contains(&s.to_u16()))
             .ok_or(Error::UnsupportedCipherSuite)?;
         self.negotiated_suite = Some(selected_suite);
+        let hash_alg = selected_suite.hash_alg();
         if ch.legacy_compression_methods != [0] {
             return Err(Error::IllegalParameter);
         }
@@ -370,7 +382,11 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             }
         }
 
-        let psk_accepted = self.try_accept_psk(&ch, raw);
+        let psk_accepted = if hash_alg == RESUMPTION_HASH {
+            self.try_accept_psk(&ch, raw)
+        } else {
+            None
+        };
         let client_offered_early = ch
             .extensions
             .iter()
@@ -390,16 +406,15 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         self.transcript.update(raw);
 
         if let (Some(p), true) = (psk_accepted.as_ref(), early_accepted) {
-            let zero = [0u8; 32];
-            let early_secret = crate::kdf::Hkdf::extract(&zero, &p.psk);
-            let h_ch = self.transcript.hash();
-            let cets = crate::kdf::Hkdf::derive_secret(&early_secret, "c e traffic", &h_ch);
+            let h_ch = self.transcript.hash(RESUMPTION_HASH);
+            let cets = crate::schedule::client_early_traffic_secret(&p.psk, h_ch.as_slice());
             events.push(Event::ZeroRttKeysReady { secret: cets });
         }
 
         let session_id_echo = ch.legacy_session_id.clone();
 
-        let server_eph = EphemeralKey::generate(kex_group, &self.rng).map_err(|_| Error::Kx)?;
+        let (server_share, dhe) =
+            crate::kx::responder(kex_group, &peer_pubkey, &self.rng).map_err(|_| Error::Kx)?;
         let mut server_random = [0u8; RANDOM_LEN];
         self.rng.fill(&mut server_random).map_err(|_| Error::Rng)?;
 
@@ -410,7 +425,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             ),
             Extension::new(
                 ExtensionType::KEY_SHARE,
-                KeyShare::server_encode(kex_group, server_eph.pubkey())
+                KeyShare::server_encode(kex_group, &server_share)
             ),
         ];
         if psk_accepted.is_some() {
@@ -439,14 +454,13 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             data: sh_bytes,
         });
 
-        let dhe = server_eph.agree(&peer_pubkey).map_err(|_| Error::Kx)?;
         let ks_handshake = match &psk_accepted {
-            Some(p) => KeySchedule::new_psk(&p.psk).into_handshake(&dhe),
-            None => KeySchedule::new().into_handshake(&dhe),
+            Some(p) => KeySchedule::new_psk(RESUMPTION_HASH, &p.psk).into_handshake(dhe.as_slice()),
+            None => KeySchedule::new(hash_alg).into_handshake(dhe.as_slice()),
         };
-        let h_chsh = self.transcript.hash();
-        let c_hs = ks_handshake.client_handshake_traffic_secret(&h_chsh);
-        let s_hs = ks_handshake.server_handshake_traffic_secret(&h_chsh);
+        let h_chsh = self.transcript.hash(hash_alg);
+        let c_hs = ks_handshake.client_handshake_traffic_secret(h_chsh.as_slice());
+        let s_hs = ks_handshake.server_handshake_traffic_secret(h_chsh.as_slice());
 
         events.push(Event::KeysReady {
             epoch: Epoch::Handshake,
@@ -535,8 +549,8 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             Handshake::Certificate(cert).encode(&mut cert_bytes);
             self.transcript.update(&cert_bytes);
 
-            let h_pre_cv = self.transcript.hash();
-            let cv_msg = CertVerify::message(&h_pre_cv, true);
+            let h_pre_cv = self.transcript.hash(hash_alg);
+            let cv_msg = CertVerify::message(h_pre_cv.as_slice(), true);
             let sig = self
                 .config
                 .source
@@ -555,10 +569,10 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             hs_blob.extend_from_slice(&cv_bytes);
         }
 
-        let h_pre_sf = self.transcript.hash();
-        let sf_data = FinishedProto::verify_data(&s_hs, &h_pre_sf);
+        let h_pre_sf = self.transcript.hash(hash_alg);
+        let sf_data = FinishedProto::verify_data(hash_alg, s_hs.as_slice(), h_pre_sf.as_slice());
         let sf = Finished {
-            verify_data: sf_data.to_vec(),
+            verify_data: sf_data.as_slice().to_vec(),
         };
         let mut sf_bytes = Vec::new();
         Handshake::Finished(sf).encode(&mut sf_bytes);
@@ -570,13 +584,13 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             data: hs_blob,
         });
 
-        let h_sf = self.transcript.hash();
+        let h_sf = self.transcript.hash(hash_alg);
         let ks_master = ks_handshake.into_master();
-        let c_ap = ks_master.client_application_traffic_secret(&h_sf);
-        let s_ap = ks_master.server_application_traffic_secret(&h_sf);
+        let c_ap = ks_master.client_application_traffic_secret(h_sf.as_slice());
+        let s_ap = ks_master.server_application_traffic_secret(h_sf.as_slice());
         self.c_ap_traffic = Some(c_ap);
         self.s_ap_traffic = Some(s_ap);
-        self.exporter_master = Some(ks_master.exporter_master_secret(&h_sf));
+        self.exporter_master = Some(ks_master.exporter_master_secret(h_sf.as_slice()));
         self.master = Some(ks_master);
 
         events.push(Event::KeysReady {
@@ -589,7 +603,11 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         if early_accepted {
             self.state = State::ExpectEndOfEarlyData;
         } else {
-            self.expected_client_finished = Some(FinishedProto::verify_data(&c_hs, &h_sf));
+            self.expected_client_finished = Some(FinishedProto::verify_data(
+                hash_alg,
+                c_hs.as_slice(),
+                h_sf.as_slice(),
+            ));
             self.state = State::ExpectClientFinished;
         }
         Ok(())
@@ -629,7 +647,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
 
         let mut t = Transcript::new();
         t.update(ch_raw);
-        self.transcript = Transcript::restart_with_message_hash(t.hash());
+        self.transcript = Transcript::restart_with_message_hash(&t.hash(self.hash_alg()));
         self.transcript.update(&hrr_bytes);
 
         self.hrr_done = true;
@@ -643,8 +661,12 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
     fn handle_end_of_early_data(&mut self, raw: &[u8]) -> Result<(), Error> {
         let c_hs = self.c_hs_traffic.ok_or(Error::UnexpectedMessage)?;
         self.transcript.update(raw);
-        let h = self.transcript.hash();
-        self.expected_client_finished = Some(FinishedProto::verify_data(&c_hs, &h));
+        let h = self.transcript.hash(self.hash_alg());
+        self.expected_client_finished = Some(FinishedProto::verify_data(
+            self.hash_alg(),
+            c_hs.as_slice(),
+            h.as_slice(),
+        ));
         self.state = State::ExpectClientFinished;
         Ok(())
     }
@@ -685,8 +707,8 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         }
         let mut t = Transcript::new();
         t.update(&raw[..n - binders_field]);
-        let partial_hash = t.hash();
-        let expected = crate::psk::ResumptionBinder::compute(&psk, &partial_hash);
+        let partial_hash = t.hash(RESUMPTION_HASH);
+        let expected = crate::psk::ResumptionBinder::compute(&psk, partial_hash.as_slice());
         if !crate::ct_eq(expected.as_slice(), bind.as_slice()) {
             return None;
         }
@@ -729,7 +751,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         let expected = self
             .expected_client_finished
             .ok_or(Error::UnexpectedMessage)?;
-        if !crate::ct_eq(f.verify_data.as_slice(), &expected) {
+        if !crate::ct_eq(f.verify_data.as_slice(), expected.as_slice()) {
             return Err(Error::BadFinished);
         }
         self.transcript.update(raw);
@@ -747,15 +769,18 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
         let Some(keys) = self.config.ticket_keys.as_ref() else {
             return Ok(());
         };
+        if master.hash_alg() != RESUMPTION_HASH {
+            return Ok(());
+        }
         let issued_at_ms = self.now_ms();
-        let h_cf = self.transcript.hash();
-        let rms = master.resumption_master_secret(&h_cf);
+        let h_cf = self.transcript.hash(RESUMPTION_HASH);
+        let rms_digest = master.resumption_master_secret(h_cf.as_slice());
         let mut nonce = [0u8; 8];
         let mut age_add_bytes = [0u8; 4];
         self.rng.fill(&mut nonce).map_err(|_| Error::Rng)?;
         self.rng.fill(&mut age_add_bytes).map_err(|_| Error::Rng)?;
         let age_add = u32::from_be_bytes(age_add_bytes);
-        let psk = crate::schedule::ResumptionMaster::new(rms).psk(&nonce);
+        let psk = crate::schedule::ResumptionMaster::from_secret(&rms_digest).psk(&nonce);
         let alpn = self.selected_alpn.clone().unwrap_or_default();
         let ticket = keys
             .encrypt(&psk, age_add, issued_at_ms, &alpn, &self.rng)
@@ -792,8 +817,7 @@ impl<C: Clock, G: EarlyDataGuard> Server<C, G> {
             return Err(Error::UnexpectedMessage);
         }
         let s_ap = self.s_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-        let mut new_s_ap = [0u8; 32];
-        crate::kdf::Hkdf::expand_label(&s_ap, "traffic upd", &[], &mut new_s_ap);
+        let new_s_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &s_ap);
         self.s_ap_traffic = Some(new_s_ap);
 
         let ku = crate::handshake::KeyUpdate {

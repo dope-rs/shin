@@ -3,10 +3,14 @@ use alloc::vec::Vec;
 use ring::hmac;
 
 use crate::codec::{DecodeError, Encode, Reader};
-use crate::hash::{HASH_LEN, Transcript};
+use crate::hash::{HASH_LEN, HashAlg, Transcript};
 use crate::kdf::Hkdf;
 
 pub const KX_MODE_PSK_DHE: u8 = 1;
+
+/// Resumption PSKs are always 32-byte / SHA-256 in this implementation, so
+/// SHA-384 sessions are not resumable (RFC 8446 §4.2.11).
+pub(crate) const RESUMPTION_HASH: HashAlg = HashAlg::Sha256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PskIdentity {
@@ -94,12 +98,22 @@ pub struct ResumptionBinder;
 impl ResumptionBinder {
     pub fn compute(psk: &[u8; HASH_LEN], partial_ch_hash: &[u8]) -> [u8; HASH_LEN] {
         let zero = [0u8; HASH_LEN];
-        let early_secret = Hkdf::extract(&zero, psk);
-        let binder_key =
-            Hkdf::derive_secret(&early_secret, "res binder", &Transcript::hash_empty());
+        let early_secret = Hkdf::extract(RESUMPTION_HASH, &zero, psk);
+        let binder_key = Hkdf::derive_secret(
+            RESUMPTION_HASH,
+            early_secret.as_slice(),
+            "res binder",
+            Transcript::hash_empty(RESUMPTION_HASH).as_slice(),
+        );
         let mut finished_key = [0u8; HASH_LEN];
-        Hkdf::expand_label(&binder_key, "finished", &[], &mut finished_key);
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &finished_key);
+        Hkdf::expand_label(
+            RESUMPTION_HASH,
+            binder_key.as_slice(),
+            "finished",
+            &[],
+            &mut finished_key,
+        );
+        let key = hmac::Key::new(crate::kdf::hmac_alg(RESUMPTION_HASH), &finished_key);
         let tag = hmac::sign(&key, partial_ch_hash);
         let mut out = [0u8; HASH_LEN];
         out.copy_from_slice(tag.as_ref());

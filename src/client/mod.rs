@@ -9,7 +9,7 @@ use crate::handshake::{
     Certificate, CertificateVerify, ClientHello, EncryptedExtensions, Finished, Handshake,
     HsReassembler, RANDOM_LEN, ServerHello, TLS_1_2,
 };
-use crate::hash::Transcript;
+use crate::hash::{Digest, HashAlg, MAX_HASH_LEN, Transcript};
 use crate::hostname::Hostname;
 use crate::kx::{EphemeralKey, KexGroup};
 use crate::proto::{
@@ -49,15 +49,16 @@ pub struct Client<C: Clock> {
     rng: SystemRandom,
     eph: Option<EphemeralKey>,
     kex_group: KexGroup,
-    handshake_secret: Option<[u8; 32]>,
-    c_hs_traffic: Option<[u8; 32]>,
-    s_hs_traffic: Option<[u8; 32]>,
-    c_ap_traffic: Option<[u8; 32]>,
-    s_ap_traffic: Option<[u8; 32]>,
+    offered_suites: Vec<CipherSuite>,
+    handshake_secret: Option<Digest>,
+    c_hs_traffic: Option<Digest>,
+    s_hs_traffic: Option<Digest>,
+    c_ap_traffic: Option<Digest>,
+    s_ap_traffic: Option<Digest>,
     server_leaf_key: Option<LeafKey>,
     selected_alpn: Option<Vec<u8>>,
-    resumption_master: Option<[u8; 32]>,
-    exporter_master: Option<[u8; 32]>,
+    resumption_master: Option<Digest>,
+    exporter_master: Option<Digest>,
     negotiated_suite: Option<CipherSuite>,
     psk_used: bool,
     early_data_offered: bool,
@@ -84,7 +85,7 @@ impl<C: Clock> Drop for Client<C> {
         .into_iter()
         .flatten()
         {
-            crate::schedule::zeroize(b);
+            crate::schedule::zeroize(b.as_mut_slice());
         }
     }
 }
@@ -99,6 +100,7 @@ impl<C: Clock> Client<C> {
             rng: SystemRandom::new(),
             eph: None,
             kex_group: KexGroup::X25519,
+            offered_suites: CipherSuite::SUPPORTED.to_vec(),
             handshake_secret: None,
             c_hs_traffic: None,
             s_hs_traffic: None,
@@ -126,6 +128,12 @@ impl<C: Clock> Client<C> {
         self.kex_group = group;
     }
 
+    /// Restrict the cipher suites offered (default: all supported, AES-128
+    /// first). Must be set before `start`.
+    pub fn set_cipher_suites(&mut self, suites: &[CipherSuite]) {
+        self.offered_suites = suites.to_vec();
+    }
+
     pub fn selected_alpn(&self) -> Option<&[u8]> {
         self.selected_alpn.as_deref()
     }
@@ -146,8 +154,20 @@ impl<C: Clock> Client<C> {
         out: &mut [u8],
     ) -> Result<(), Error> {
         let em = self.exporter_master.as_ref().ok_or(Error::NotReady)?;
-        crate::schedule::export_keying_material(em, label, context, out);
+        crate::schedule::export_keying_material(
+            self.hash_alg(),
+            em.as_slice(),
+            label,
+            context,
+            out,
+        );
         Ok(())
+    }
+
+    fn hash_alg(&self) -> HashAlg {
+        self.negotiated_suite
+            .map(|s| s.hash_alg())
+            .unwrap_or(HashAlg::Sha256)
     }
 
     /// Extensions shared by ClientHello1 and the HelloRetryRequest retry,
@@ -227,7 +247,7 @@ impl<C: Clock> Client<C> {
             legacy_version: TLS_1_2,
             random: self.client_random,
             legacy_session_id: self.session_id.clone(),
-            cipher_suites: CipherSuite::SUPPORTED.iter().map(|s| s.to_u16()).collect(),
+            cipher_suites: self.offered_suites.iter().map(|s| s.to_u16()).collect(),
             legacy_compression_methods: alloc::vec![0],
             extensions,
         }
@@ -265,7 +285,7 @@ impl<C: Clock> Client<C> {
         self.client_random = client_random;
         self.session_id = session_id.to_vec();
 
-        let mut extensions = self.base_extensions(eph.pubkey(), None)?;
+        let mut extensions = self.base_extensions(eph.client_share(), None)?;
 
         let resumption = self.config.resumption.clone();
         let early_data_offered = self.config.enable_early_data && resumption.is_some();
@@ -300,8 +320,8 @@ impl<C: Clock> Client<C> {
             let partial = &ch_bytes[..n - BINDERS_FIELD_LEN];
             let mut t = Transcript::new();
             t.update(partial);
-            let partial_hash = t.hash();
-            let binder = crate::psk::ResumptionBinder::compute(&r.psk, &partial_hash);
+            let partial_hash = t.hash(crate::psk::RESUMPTION_HASH);
+            let binder = crate::psk::ResumptionBinder::compute(&r.psk, partial_hash.as_slice());
             ch_bytes[n - 32..].copy_from_slice(&binder);
         }
 
@@ -313,10 +333,8 @@ impl<C: Clock> Client<C> {
         }];
         if early_data_offered {
             let psk = resumption.as_ref().expect("resumption present").psk;
-            let zero = [0u8; 32];
-            let early_secret = crate::kdf::Hkdf::extract(&zero, &psk);
-            let h_ch = self.transcript.hash();
-            let cets = crate::kdf::Hkdf::derive_secret(&early_secret, "c e traffic", &h_ch);
+            let h_ch = self.transcript.hash(crate::psk::RESUMPTION_HASH);
+            let cets = crate::schedule::client_early_traffic_secret(&psk, h_ch.as_slice());
             events.push(Event::ZeroRttKeysReady { secret: cets });
         }
 
@@ -366,8 +384,11 @@ impl<C: Clock> Client<C> {
                 self.handle_key_update(ku, events)
             }
             (State::Done, Handshake::NewSessionTicket(nst)) if epoch == Epoch::Application => {
-                if let Some(rms) = self.resumption_master {
-                    let psk = crate::schedule::ResumptionMaster::new(rms).psk(&nst.ticket_nonce);
+                if let Some(rms) = self.resumption_master.as_ref()
+                    && self.hash_alg() == crate::psk::RESUMPTION_HASH
+                {
+                    let psk =
+                        crate::schedule::ResumptionMaster::from_secret(rms).psk(&nst.ticket_nonce);
                     events.push(Event::ResumptionSecret { psk });
                 }
                 let max_early_data = nst
@@ -400,8 +421,7 @@ impl<C: Clock> Client<C> {
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         let s_ap = self.s_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-        let mut new_s_ap = [0u8; 32];
-        crate::kdf::Hkdf::expand_label(&s_ap, "traffic upd", &[], &mut new_s_ap);
+        let new_s_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &s_ap);
         self.s_ap_traffic = Some(new_s_ap);
         events.push(Event::KeyUpdate {
             direction: crate::KeyDirection::Read,
@@ -417,8 +437,7 @@ impl<C: Clock> Client<C> {
                 data: bytes,
             });
             let c_ap = self.c_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-            let mut new_c_ap = [0u8; 32];
-            crate::kdf::Hkdf::expand_label(&c_ap, "traffic upd", &[], &mut new_c_ap);
+            let new_c_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &c_ap);
             self.c_ap_traffic = Some(new_c_ap);
             events.push(Event::KeyUpdate {
                 direction: crate::KeyDirection::Write,
@@ -435,10 +454,20 @@ impl<C: Clock> Client<C> {
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         let suite = CipherSuite::from_u16(sh.cipher_suite).ok_or(Error::UnsupportedCipherSuite)?;
+        if !self.offered_suites.contains(&suite) {
+            return Err(Error::IllegalParameter);
+        }
+        // Recorded before the HRR branch so the transcript hash uses the right
+        // algorithm; a ServerHello after HRR must not change the suite.
+        if let Some(prev) = self.negotiated_suite
+            && prev != suite
+        {
+            return Err(Error::IllegalParameter);
+        }
+        self.negotiated_suite = Some(suite);
         if sh.random == HRR_RANDOM {
             return self.handle_hello_retry_request(sh, raw, events);
         }
-        self.negotiated_suite = Some(suite);
         const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
         const DOWNGRADE_TLS11: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
         let tail = &sh.random[RANDOM_LEN - 8..];
@@ -503,6 +532,7 @@ impl<C: Clock> Client<C> {
         }
         let dhe = eph.agree(&server_pubkey).map_err(|_| Error::Kx)?;
 
+        let alg = self.hash_alg();
         let ks_handshake = if self.psk_used {
             let psk = self
                 .config
@@ -510,13 +540,13 @@ impl<C: Clock> Client<C> {
                 .as_ref()
                 .expect("psk_used implies resumption")
                 .psk;
-            KeySchedule::new_psk(&psk).into_handshake(&dhe)
+            KeySchedule::new_psk(alg, &psk).into_handshake(dhe.as_slice())
         } else {
-            KeySchedule::new().into_handshake(&dhe)
+            KeySchedule::new(alg).into_handshake(dhe.as_slice())
         };
-        let h_chsh = self.transcript.hash();
-        let c_hs = ks_handshake.client_handshake_traffic_secret(&h_chsh);
-        let s_hs = ks_handshake.server_handshake_traffic_secret(&h_chsh);
+        let h_chsh = self.transcript.hash(alg);
+        let c_hs = ks_handshake.client_handshake_traffic_secret(h_chsh.as_slice());
+        let s_hs = ks_handshake.server_handshake_traffic_secret(h_chsh.as_slice());
 
         self.handshake_secret = Some(*ks_handshake.secret());
         self.c_hs_traffic = Some(c_hs);
@@ -574,21 +604,21 @@ impl<C: Clock> Client<C> {
             .filter(|g| KexGroup::SUPPORTED.contains(g))
             .ok_or(Error::UnsupportedGroup)?;
 
-        let h1 = self.transcript.hash();
-        self.transcript = Transcript::restart_with_message_hash(h1);
+        let h1 = self.transcript.hash(self.hash_alg());
+        self.transcript = Transcript::restart_with_message_hash(&h1);
         self.transcript.update(raw);
 
         if self.eph.as_ref().map(|e| e.group()) != Some(group) {
             self.eph = Some(EphemeralKey::generate(group, &self.rng).map_err(|_| Error::Kx)?);
             self.kex_group = group;
         }
-        let eph_pub = self
+        let eph_share = self
             .eph
             .as_ref()
             .ok_or(Error::UnexpectedMessage)?
-            .pubkey()
+            .client_share()
             .to_vec();
-        let extensions = self.base_extensions(&eph_pub, cookie.as_deref())?;
+        let extensions = self.base_extensions(&eph_share, cookie.as_deref())?;
         let ch_bytes = self.encode_client_hello(extensions);
         self.transcript.update(&ch_bytes);
         self.hrr_done = true;
@@ -759,8 +789,8 @@ impl<C: Clock> Client<C> {
             .server_leaf_key
             .as_ref()
             .ok_or(Error::BadCertificateVerify)?;
-        let h_pre_cv = self.transcript.hash();
-        let msg = CertVerify::message(&h_pre_cv, true);
+        let h_pre_cv = self.transcript.hash(self.hash_alg());
+        let msg = CertVerify::message(h_pre_cv.as_slice(), true);
         leaf.verify(cv.algorithm, &msg, &cv.signature)?;
         self.transcript.update(raw);
         self.state = State::ExpectServerFinished;
@@ -777,27 +807,47 @@ impl<C: Clock> Client<C> {
         let c_hs = self.c_hs_traffic.ok_or(Error::UnexpectedMessage)?;
         let hs_secret = self.handshake_secret.ok_or(Error::UnexpectedMessage)?;
 
-        let h_pre_sf = self.transcript.hash();
-        let expected = FinishedProto::verify_data(&s_hs, &h_pre_sf);
-        if !crate::ct_eq(sf.verify_data.as_slice(), &expected) {
+        let alg = self.hash_alg();
+        let h_pre_sf = self.transcript.hash(alg);
+        let expected = FinishedProto::verify_data(alg, s_hs.as_slice(), h_pre_sf.as_slice());
+        if !crate::ct_eq(sf.verify_data.as_slice(), expected.as_slice()) {
             return Err(Error::BadFinished);
         }
         self.transcript.update(raw);
 
-        let h_sf = self.transcript.hash();
+        let h_sf = self.transcript.hash(alg);
 
-        let derived_for_master =
-            crate::kdf::Hkdf::derive_secret(&hs_secret, "derived", &Transcript::hash_empty());
-        let zero = [0u8; 32];
-        let master = crate::kdf::Hkdf::extract(&derived_for_master, &zero);
-        let c_ap = crate::kdf::Hkdf::derive_secret(&master, "c ap traffic", &h_sf);
-        let s_ap = crate::kdf::Hkdf::derive_secret(&master, "s ap traffic", &h_sf);
+        let derived_for_master = crate::kdf::Hkdf::derive_secret(
+            alg,
+            hs_secret.as_slice(),
+            "derived",
+            Transcript::hash_empty(alg).as_slice(),
+        );
+        let zero = [0u8; MAX_HASH_LEN];
+        let master = crate::kdf::Hkdf::extract(
+            alg,
+            derived_for_master.as_slice(),
+            &zero[..alg.output_len()],
+        );
+        let c_ap = crate::kdf::Hkdf::derive_secret(
+            alg,
+            master.as_slice(),
+            "c ap traffic",
+            h_sf.as_slice(),
+        );
+        let s_ap = crate::kdf::Hkdf::derive_secret(
+            alg,
+            master.as_slice(),
+            "s ap traffic",
+            h_sf.as_slice(),
+        );
         self.c_ap_traffic = Some(c_ap);
         self.s_ap_traffic = Some(s_ap);
         self.exporter_master = Some(crate::kdf::Hkdf::derive_secret(
-            &master,
+            alg,
+            master.as_slice(),
             "exp master",
-            &h_sf,
+            h_sf.as_slice(),
         ));
 
         events.push(Event::KeysReady {
@@ -816,16 +866,17 @@ impl<C: Clock> Client<C> {
             });
         }
 
-        let h_pre_cf = self.transcript.hash();
-        let cf_data = FinishedProto::verify_data(&c_hs, &h_pre_cf);
+        let h_pre_cf = self.transcript.hash(alg);
+        let cf_data = FinishedProto::verify_data(alg, c_hs.as_slice(), h_pre_cf.as_slice());
         let cf = Finished {
-            verify_data: cf_data.to_vec(),
+            verify_data: cf_data.as_slice().to_vec(),
         };
         let mut cf_bytes = Vec::new();
         Handshake::Finished(cf).encode(&mut cf_bytes);
         self.transcript.update(&cf_bytes);
-        let h_cf = self.transcript.hash();
-        let rms = crate::kdf::Hkdf::derive_secret(&master, "res master", &h_cf);
+        let h_cf = self.transcript.hash(alg);
+        let rms =
+            crate::kdf::Hkdf::derive_secret(alg, master.as_slice(), "res master", h_cf.as_slice());
         self.resumption_master = Some(rms);
 
         events.push(Event::Send {
@@ -847,8 +898,7 @@ impl<C: Clock> Client<C> {
             return Err(Error::UnexpectedMessage);
         }
         let c_ap = self.c_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-        let mut new_c_ap = [0u8; 32];
-        crate::kdf::Hkdf::expand_label(&c_ap, "traffic upd", &[], &mut new_c_ap);
+        let new_c_ap = crate::kdf::Hkdf::traffic_update(self.hash_alg(), &c_ap);
         self.c_ap_traffic = Some(new_c_ap);
 
         let ku = crate::handshake::KeyUpdate {
