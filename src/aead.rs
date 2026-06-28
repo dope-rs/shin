@@ -7,6 +7,8 @@ pub enum AeadError {
     OpenFailed,
 }
 
+const SEAL_INFALLIBLE: &str = "AEAD seal is infallible with a unique 12-byte nonce";
+
 pub struct AeadKey {
     inner: aead::LessSafeKey,
     iv: [u8; 12],
@@ -49,13 +51,26 @@ impl AeadKey {
         nonce
     }
 
+    fn nonce_for(&self, seq: u64) -> aead::Nonce {
+        aead::Nonce::assume_unique_for_key(self.nonce(seq))
+    }
+
     pub fn seal(&self, seq: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let nonce = aead::Nonce::assume_unique_for_key(self.nonce(seq));
         let mut buf = plaintext.to_vec();
         self.inner
-            .seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut buf)
-            .expect("AES-128-GCM seal cannot fail with a 12-byte nonce");
+            .seal_in_place_append_tag(self.nonce_for(seq), aead::Aad::from(aad), &mut buf)
+            .expect(SEAL_INFALLIBLE);
         buf
+    }
+
+    pub fn seal_detached(&self, seq: u64, aad: &[u8], in_out: &mut [u8]) -> [u8; 16] {
+        let tag = self
+            .inner
+            .seal_in_place_separate_tag(self.nonce_for(seq), aead::Aad::from(aad), in_out)
+            .expect(SEAL_INFALLIBLE);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(tag.as_ref());
+        out
     }
 
     pub fn open<'a>(
@@ -64,9 +79,8 @@ impl AeadKey {
         aad: &[u8],
         in_out: &'a mut [u8],
     ) -> Result<&'a [u8], AeadError> {
-        let nonce = aead::Nonce::assume_unique_for_key(self.nonce(seq));
         self.inner
-            .open_in_place(nonce, aead::Aad::from(aad), in_out)
+            .open_in_place(self.nonce_for(seq), aead::Aad::from(aad), in_out)
             .map(|p| &*p)
             .map_err(|_| AeadError::OpenFailed)
     }

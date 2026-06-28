@@ -190,28 +190,24 @@ impl Sealer {
             return Err(RecordError::SeqExhausted);
         }
 
-        let mut inner = Vec::with_capacity(body.len() + 1);
-        inner.extend_from_slice(body);
-        inner.push(inner_type as u8);
-
-        let outer_body_len = inner.len() + AEAD_TAG_LEN;
+        let outer_body_len = body.len() + 1 + AEAD_TAG_LEN;
         if outer_body_len > MAX_CIPHERTEXT_BODY {
             return Err(RecordError::BodyTooLarge);
         }
 
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        header.push(ContentType::ApplicationData as u8);
-        header.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        header.extend_from_slice(&(outer_body_len as u16).to_be_bytes());
-
         let seq = self.seq;
         self.seq += 1;
 
-        let ct_with_tag = self.aead.seal(seq, &header, &inner);
+        let mut out = Vec::with_capacity(HEADER_LEN + outer_body_len);
+        out.push(ContentType::ApplicationData as u8);
+        out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        out.extend_from_slice(&(outer_body_len as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out.push(inner_type as u8);
 
-        let mut out = Vec::with_capacity(HEADER_LEN + ct_with_tag.len());
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&ct_with_tag);
+        let (header, ciphertext) = out.split_at_mut(HEADER_LEN);
+        let tag = self.aead.seal_detached(seq, header, ciphertext);
+        out.extend_from_slice(&tag);
         Ok(out)
     }
 }
