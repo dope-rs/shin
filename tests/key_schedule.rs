@@ -179,6 +179,20 @@ fn aead_seal_open_round_trip() {
 }
 
 #[test]
+fn aead_seal_detached_matches_seal_and_round_trips() {
+    let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV);
+    let plaintext = b"some plaintext payload";
+    let aad = b"associated data";
+
+    let mut buf = plaintext.to_vec();
+    let tag = key.seal_detached(0, aad, &mut buf);
+    buf.extend_from_slice(&tag);
+
+    assert_eq!(buf, key.seal(0, aad, plaintext));
+    assert_eq!(key.open(0, aad, &mut buf).unwrap(), plaintext);
+}
+
+#[test]
 fn aead_open_rejects_tampered_tag() {
     let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV);
     let mut sealed = key.seal(0, b"aad", b"payload");
