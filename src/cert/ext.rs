@@ -218,14 +218,15 @@ impl<'a> GeneralName<'a> {
         let mut out = Vec::new();
         while !ir.is_empty() {
             let tlv = ir.next()?;
-            let kind = tlv.tag.0 & 0x1f;
-            out.push(match kind {
-                2 => Self::DnsName(tlv.contents),
-                7 => Self::IpAddress(tlv.contents),
-                _ => Self::Other {
+            out.push(if tlv.tag == Tag::context(2, false) {
+                Self::DnsName(tlv.contents)
+            } else if tlv.tag == Tag::context(7, false) {
+                Self::IpAddress(tlv.contents)
+            } else {
+                Self::Other {
                     tag: tlv.tag.0,
                     value: tlv.contents,
-                },
+                }
             });
         }
         Ok(out)
@@ -236,6 +237,7 @@ impl<'a> GeneralName<'a> {
 pub struct Subtrees<'a> {
     pub dns: Vec<&'a [u8]>,
     pub ip: Vec<&'a [u8]>,
+    pub has_unsupported: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -271,6 +273,8 @@ impl<'a> NameConstraints<'a> {
                 out.dns.push(base.contents);
             } else if base.tag == Tag::context(7, false) {
                 out.ip.push(base.contents);
+            } else {
+                out.has_unsupported = true;
             }
         }
         Ok(out)

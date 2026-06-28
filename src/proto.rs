@@ -81,17 +81,27 @@ impl SupportedGroups {
 pub(crate) struct SignatureAlgorithms;
 
 impl SignatureAlgorithms {
+    pub(crate) const X509: [u16; 6] = [
+        SIG_ECDSA_SECP256R1_SHA256,
+        SIG_RSA_PSS_RSAE_SHA256,
+        SIG_ECDSA_SECP384R1_SHA384,
+        SIG_RSA_PSS_RSAE_SHA384,
+        SIG_RSA_PSS_RSAE_SHA512,
+        SIG_ED25519,
+    ];
+
     pub(crate) fn x509_encode() -> Vec<u8> {
-        let mut v = Vec::with_capacity(14);
+        let mut v = Vec::with_capacity(2 + Self::X509.len() * 2);
         v.put_vec_u16(|o| {
-            o.put_u16(SIG_ECDSA_SECP256R1_SHA256);
-            o.put_u16(SIG_RSA_PSS_RSAE_SHA256);
-            o.put_u16(SIG_ECDSA_SECP384R1_SHA384);
-            o.put_u16(SIG_RSA_PSS_RSAE_SHA384);
-            o.put_u16(SIG_RSA_PSS_RSAE_SHA512);
-            o.put_u16(SIG_ED25519);
+            for s in Self::X509 {
+                o.put_u16(s);
+            }
         });
         v
+    }
+
+    pub(crate) fn x509_supported(scheme: u16) -> bool {
+        Self::X509.contains(&scheme)
     }
 
     pub(crate) fn rpk_encode() -> Vec<u8> {
@@ -284,7 +294,9 @@ impl Finished {
         let fkey = &mut fkey_buf[..alg.output_len()];
         Hkdf::expand_label(alg, traffic_secret, "finished", &[], fkey);
         let key = hmac::Key::new(crate::kdf::hmac_alg(alg), fkey);
-        Digest::from_slice(hmac::sign(&key, transcript_hash).as_ref())
+        let mac = Digest::from_slice(hmac::sign(&key, transcript_hash).as_ref());
+        crate::schedule::zeroize(fkey);
+        mac
     }
 }
 

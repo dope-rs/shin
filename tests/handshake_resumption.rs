@@ -1,23 +1,12 @@
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
-use shin::{Clock, Epoch, Event};
+use shin::{Epoch, Event};
+
+mod common;
+use common::{FixedClock, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
-
-struct FixedClock(u64);
-impl Clock for FixedClock {
-    fn now_ms(&self) -> u64 {
-        self.0
-    }
-}
-
-fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
-    events.iter().find_map(|e| match e {
-        Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-        _ => None,
-    })
-}
 
 fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x55u8; 32]).unwrap()
@@ -61,24 +50,24 @@ fn drive(
     let mut all_server = Vec::new();
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     all_client.extend(c1);
 
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).unwrap();
-    let s_hs = extract_send(&s1, Epoch::Handshake).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
     all_server.extend(s1);
 
     let c2 = client.read(Epoch::Plaintext, &sh).unwrap();
     all_client.extend(c2);
     let c3 = client.read(Epoch::Handshake, &s_hs).unwrap();
-    let cf = extract_send(&c3, Epoch::Handshake).unwrap();
+    let cf = find_send(&c3, Epoch::Handshake).unwrap();
     all_client.extend(c3);
 
     let s2 = server.read(Epoch::Handshake, &cf).unwrap();
     all_server.extend(s2);
 
-    let nst = extract_send(&all_server, Epoch::Application);
+    let nst = find_send(&all_server, Epoch::Application);
     if let Some(bytes) = nst {
         let extra = client.read(Epoch::Application, &bytes).unwrap();
         all_client.extend(extra);
@@ -123,9 +112,9 @@ fn resumed_handshake_skips_certificate_and_certificate_verify() {
     let mut client2 = fresh_client(Some(resumption));
 
     let c1 = client2.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server2.read(Epoch::Plaintext, &ch).unwrap();
-    let s_hs_blob = extract_send(&s1, Epoch::Handshake).unwrap();
+    let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
 
     use shin::codec::Reader;
     use shin::handshake::{Handshake, HandshakeType};

@@ -1,10 +1,13 @@
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDSA_P384_SHA384};
 
+use shin::Epoch;
 use shin::cert::Cert;
 use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+
+mod common;
+use common::{find_send, has_done};
 
 const HOSTNAME: &str = "p384.local";
 
@@ -29,17 +32,6 @@ fn now_inside(cert_der: &[u8]) -> u64 {
     let nb = shin::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
     let na = shin::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
     (nb.0 + na.0) / 2
-}
-
-fn extract_send(events: &[Event], epoch: Epoch) -> Option<Vec<u8>> {
-    events.iter().find_map(|e| match e {
-        Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-        _ => None,
-    })
-}
-
-fn has_done(events: &[Event]) -> bool {
-    events.iter().any(|e| matches!(e, Event::Done))
 }
 
 #[test]
@@ -83,14 +75,14 @@ fn handshake_with_ecdsa_p384_x509_chain() {
     let (mut client, mut server) = (client, server);
 
     let c1 = client.start().unwrap();
-    let ch = extract_send(&c1, Epoch::Plaintext).expect("CH");
+    let ch = find_send(&c1, Epoch::Plaintext).expect("CH");
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
-    let sh = extract_send(&s1, Epoch::Plaintext).expect("SH");
-    let s_hs = extract_send(&s1, Epoch::Handshake).expect("server EE+Cert+CV+SF");
+    let sh = find_send(&s1, Epoch::Plaintext).expect("SH");
+    let s_hs = find_send(&s1, Epoch::Handshake).expect("server EE+Cert+CV+SF");
     let _c2 = client.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = client.read(Epoch::Handshake, &s_hs).unwrap();
     assert!(has_done(&c3), "client confirmed via ECDSA-P384 chain");
-    let cf = extract_send(&c3, Epoch::Handshake).expect("CF");
+    let cf = find_send(&c3, Epoch::Handshake).expect("CF");
     let s2 = server.read(Epoch::Handshake, &cf).unwrap();
     assert!(has_done(&s2));
 }

@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use ring::hmac;
 
-use crate::hash::{Digest, HashAlg, MAX_HASH_LEN};
+use crate::hash::{Digest, HashAlg, MAX_HASH_LEN, Secret};
 
 pub(crate) fn hmac_alg(alg: HashAlg) -> hmac::Algorithm {
     match alg {
@@ -14,9 +14,9 @@ pub(crate) fn hmac_alg(alg: HashAlg) -> hmac::Algorithm {
 pub struct Hkdf;
 
 impl Hkdf {
-    pub fn extract(alg: HashAlg, salt: &[u8], ikm: &[u8]) -> Digest {
+    pub fn extract(alg: HashAlg, salt: &[u8], ikm: &[u8]) -> Secret {
         let key = hmac::Key::new(hmac_alg(alg), salt);
-        Digest::from_slice(hmac::sign(&key, ikm).as_ref())
+        Secret::from_slice(hmac::sign(&key, ikm).as_ref())
     }
 
     pub fn expand(alg: HashAlg, prk: &[u8], info: &[u8], out: &mut [u8]) {
@@ -41,6 +41,7 @@ impl Hkdf {
             t_prev_len = block.len();
             written += take;
         }
+        crate::schedule::zeroize(&mut t_prev);
     }
 
     pub fn expand_label(alg: HashAlg, prk: &[u8], label: &str, context: &[u8], out: &mut [u8]) {
@@ -48,14 +49,16 @@ impl Hkdf {
         Self::expand(alg, prk, &info, out);
     }
 
-    pub fn derive_secret(alg: HashAlg, prk: &[u8], label: &str, transcript_hash: &[u8]) -> Digest {
+    pub fn derive_secret(alg: HashAlg, prk: &[u8], label: &str, transcript_hash: &[u8]) -> Secret {
         let mut buf = [0u8; MAX_HASH_LEN];
         let out = &mut buf[..alg.output_len()];
         Self::expand_label(alg, prk, label, transcript_hash, out);
-        Digest::from_slice(out)
+        let secret = Secret::from_slice(out);
+        crate::schedule::zeroize(out);
+        secret
     }
 
-    pub fn traffic_update(alg: HashAlg, prev: &Digest) -> Digest {
+    pub fn traffic_update(alg: HashAlg, prev: &Digest) -> Secret {
         Self::derive_secret(alg, prev.as_slice(), "traffic upd", &[])
     }
 

@@ -24,6 +24,13 @@ pub const MAX_HANDSHAKE_SIZE: usize = 256 * 1024;
 /// churn from KeyUpdates coalesced into a single record.
 pub const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
 
+/// Cap on post-handshake KeyUpdates accepted without intervening application-data
+/// progress, bounding rekey churn across records. A legitimate peer interleaves
+/// KeyUpdates with application data (which resets the count via
+/// `note_application_data`); a flooder sending one KeyUpdate per record with no
+/// app data in between trips this cap and is aborted.
+pub const MAX_KEY_UPDATES_WITHOUT_APP_DATA: u32 = 8;
+
 /// Inbound handshake message source: reassembles messages fragmented across or
 /// coalesced within records (RFC 8446 §5.1), then hands them back decoded one at
 /// a time alongside their raw bytes (which feed the transcript). A single message
@@ -277,6 +284,32 @@ impl Certificate {
     }
 }
 
+/// RFC 8446 §4.3.2. In TLS 1.3 the request carries an (here always empty)
+/// context that the client echoes in its Certificate, plus extensions — of
+/// which `signature_algorithms` is mandatory and lists the schemes the server
+/// will accept in the client's CertificateVerify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateRequest {
+    pub certificate_request_context: Vec<u8>,
+    pub extensions: Vec<Extension>,
+}
+
+impl CertificateRequest {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.put_vec_u8(|o| o.put_slice(&self.certificate_request_context));
+        Extension::encode_list(&self.extensions, out);
+    }
+
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let certificate_request_context = r.vec_u8()?.to_vec();
+        let extensions = Extension::decode_list(r)?;
+        Ok(Self {
+            certificate_request_context,
+            extensions,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateVerify {
     pub algorithm: u16,
@@ -374,6 +407,7 @@ pub enum Handshake {
     ClientHello(ClientHello),
     ServerHello(ServerHello),
     EncryptedExtensions(EncryptedExtensions),
+    CertificateRequest(CertificateRequest),
     Certificate(Certificate),
     CertificateVerify(CertificateVerify),
     Finished(Finished),
@@ -388,6 +422,7 @@ impl Handshake {
             Self::ClientHello(_) => HandshakeType::ClientHello,
             Self::ServerHello(_) => HandshakeType::ServerHello,
             Self::EncryptedExtensions(_) => HandshakeType::EncryptedExtensions,
+            Self::CertificateRequest(_) => HandshakeType::CertificateRequest,
             Self::Certificate(_) => HandshakeType::Certificate,
             Self::CertificateVerify(_) => HandshakeType::CertificateVerify,
             Self::Finished(_) => HandshakeType::Finished,
@@ -403,6 +438,7 @@ impl Handshake {
             Self::ClientHello(m) => m.encode(o),
             Self::ServerHello(m) => m.encode(o),
             Self::EncryptedExtensions(m) => m.encode(o),
+            Self::CertificateRequest(m) => m.encode(o),
             Self::Certificate(m) => m.encode(o),
             Self::CertificateVerify(m) => m.encode(o),
             Self::Finished(m) => m.encode(o),
@@ -421,6 +457,9 @@ impl Handshake {
             HandshakeType::EncryptedExtensions => {
                 Self::EncryptedExtensions(EncryptedExtensions::decode(&mut body)?)
             }
+            HandshakeType::CertificateRequest => {
+                Self::CertificateRequest(CertificateRequest::decode(&mut body)?)
+            }
             HandshakeType::Certificate => Self::Certificate(Certificate::decode(&mut body)?),
             HandshakeType::CertificateVerify => {
                 Self::CertificateVerify(CertificateVerify::decode(&mut body)?)
@@ -431,7 +470,7 @@ impl Handshake {
             HandshakeType::NewSessionTicket => {
                 Self::NewSessionTicket(NewSessionTicket::decode(&mut body)?)
             }
-            HandshakeType::CertificateRequest | HandshakeType::MessageHash => {
+            HandshakeType::MessageHash => {
                 return Err(DecodeError::InvalidEnum);
             }
         };

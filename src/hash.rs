@@ -89,6 +89,57 @@ impl core::fmt::Debug for Digest {
     }
 }
 
+/// Key-schedule secret of up to [`MAX_HASH_LEN`] bytes. Intentionally not `Copy`
+/// (so secret bytes are never silently duplicated) and wiped on drop; [`Digest`]
+/// stays `Copy` for public transcript hashes that need neither.
+pub struct Secret {
+    bytes: [u8; MAX_HASH_LEN],
+    len: usize,
+}
+
+impl Secret {
+    pub fn from_slice(s: &[u8]) -> Self {
+        let mut bytes = [0u8; MAX_HASH_LEN];
+        bytes[..s.len()].copy_from_slice(s);
+        Self {
+            bytes,
+            len: s.len(),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.len]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn to_digest(&self) -> Digest {
+        Digest::from_slice(self.as_slice())
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        crate::schedule::zeroize(&mut self.bytes);
+    }
+}
+
+impl core::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Secret([redacted; {}])", self.len)
+    }
+}
+
 /// Running handshake transcript. The hash algorithm is fixed only once the
 /// cipher suite is negotiated, so both SHA-256 and SHA-384 are advanced in
 /// lockstep and the chosen one is read with [`hash`](Self::hash).

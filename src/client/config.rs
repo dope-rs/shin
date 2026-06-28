@@ -3,11 +3,8 @@ use alloc::vec::Vec;
 use crate::Error;
 use crate::cert::{Cert, SubjectPublicKeyInfo};
 use crate::chain::TrustAnchor;
-use crate::proto::{
-    SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_ED25519, SIG_RSA_PSS_RSAE_SHA256,
-    SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512,
-};
-use crate::sig::{self, VerifyingKey};
+use crate::proto::{CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509};
+use crate::sig::{self, SigningKey};
 
 #[derive(Clone)]
 pub struct Config {
@@ -90,49 +87,32 @@ impl OwnedTrustAnchor {
     }
 }
 
+/// A client identity to present when the server requests client authentication
+/// (mutual TLS). Mirrors the server's [`CertSource`](crate::server::CertSource).
 #[derive(Clone)]
-pub(super) struct LeafKey {
-    pub(super) kind: LeafKeyKind,
-    pub(super) raw: Vec<u8>,
+pub enum ClientCertSource {
+    /// Bare public key (RFC 7250). The signing key must be Ed25519 (the only
+    /// RawPublicKey type shin encodes as a SubjectPublicKeyInfo).
+    RawPublicKey { signing_key: SigningKey },
+    /// X.509 chain, leaf first, with the leaf's private key.
+    X509 {
+        chain_der: Vec<Vec<u8>>,
+        signing_key: SigningKey,
+    },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum LeafKeyKind {
-    Ed25519,
-    Ecdsa,
-    Rsa,
-}
+impl ClientCertSource {
+    pub(super) fn signing_key(&self) -> &SigningKey {
+        match self {
+            Self::RawPublicKey { signing_key } => signing_key,
+            Self::X509 { signing_key, .. } => signing_key,
+        }
+    }
 
-impl LeafKey {
-    pub(super) fn verify(&self, scheme: u16, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        let bad = || Error::BadCertificateVerify;
-        match (self.kind, scheme) {
-            (LeafKeyKind::Ed25519, SIG_ED25519) => {
-                if self.raw.len() != sig::PUBKEY_LEN {
-                    return Err(bad());
-                }
-                let mut pk = [0u8; sig::PUBKEY_LEN];
-                pk.copy_from_slice(&self.raw);
-                VerifyingKey::Ed25519(&pk)
-                    .verify(msg, sig)
-                    .map_err(|_| bad())
-            }
-            (LeafKeyKind::Ecdsa, SIG_ECDSA_SECP256R1_SHA256) => VerifyingKey::EcdsaP256(&self.raw)
-                .verify(msg, sig)
-                .map_err(|_| bad()),
-            (LeafKeyKind::Ecdsa, SIG_ECDSA_SECP384R1_SHA384) => VerifyingKey::EcdsaP384(&self.raw)
-                .verify(msg, sig)
-                .map_err(|_| bad()),
-            (LeafKeyKind::Rsa, SIG_RSA_PSS_RSAE_SHA256) => VerifyingKey::RsaPssSha256(&self.raw)
-                .verify(msg, sig)
-                .map_err(|_| bad()),
-            (LeafKeyKind::Rsa, SIG_RSA_PSS_RSAE_SHA384) => VerifyingKey::RsaPssSha384(&self.raw)
-                .verify(msg, sig)
-                .map_err(|_| bad()),
-            (LeafKeyKind::Rsa, SIG_RSA_PSS_RSAE_SHA512) => VerifyingKey::RsaPssSha512(&self.raw)
-                .verify(msg, sig)
-                .map_err(|_| bad()),
-            _ => Err(Error::UnsupportedSigScheme),
+    pub(super) fn cert_type(&self) -> u8 {
+        match self {
+            Self::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
+            Self::X509 { .. } => CERT_TYPE_X509,
         }
     }
 }

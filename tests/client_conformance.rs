@@ -8,7 +8,10 @@ use shin::extension::{Extension, ExtensionType};
 use shin::handshake::{Handshake, KeyUpdate, RANDOM_LEN, ServerHello, TLS_1_2};
 use shin::server::{CertSource, Config as ServerConfig, Server};
 use shin::sig::SigningKey;
-use shin::{Epoch, Error, Event};
+use shin::{Epoch, Error};
+
+mod common;
+use common::send;
 
 const HRR_RANDOM: [u8; RANDOM_LEN] = [
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
@@ -51,16 +54,6 @@ fn rpk_server() -> Server<fn() -> u64> {
         },
         || 0,
     )
-}
-
-fn send(events: &[Event], epoch: Epoch) -> Vec<u8> {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::Send { epoch: ep, data } if *ep == epoch => Some(data.clone()),
-            _ => None,
-        })
-        .expect("expected a Send event")
 }
 
 /// Drives a full RPK handshake so the returned client is in the post-handshake
@@ -337,4 +330,38 @@ fn client_bounds_key_update_flood() {
         c.read(Epoch::Application, &key_updates(9)).unwrap_err(),
         Error::UnexpectedMessage
     );
+}
+
+#[test]
+fn client_bounds_key_update_flood_across_records() {
+    let one_key_update = || {
+        let mut blob = Vec::new();
+        Handshake::KeyUpdate(KeyUpdate { request_update: 0 }).encode(&mut blob);
+        blob
+    };
+    let mut c = completed_rpk_client();
+    // One KeyUpdate per record, no intervening application data: bounded.
+    for _ in 0..8 {
+        c.read(Epoch::Application, &one_key_update()).unwrap();
+    }
+    assert_eq!(
+        c.read(Epoch::Application, &one_key_update()).unwrap_err(),
+        Error::UnexpectedMessage
+    );
+}
+
+#[test]
+fn client_accepts_key_updates_interleaved_with_app_data() {
+    let one_key_update = || {
+        let mut blob = Vec::new();
+        Handshake::KeyUpdate(KeyUpdate { request_update: 0 }).encode(&mut blob);
+        blob
+    };
+    let mut c = completed_rpk_client();
+    // Application-data progress between KeyUpdates resets the flood counter, so a
+    // legitimate peer can key-update for the life of the connection.
+    for _ in 0..1000 {
+        c.read(Epoch::Application, &one_key_update()).unwrap();
+        c.note_application_data();
+    }
 }
