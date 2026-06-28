@@ -69,8 +69,8 @@ pub enum Event {
     },
     KeysReady {
         epoch: Epoch,
-        read_secret: [u8; 32],
-        write_secret: [u8; 32],
+        read_secret: crate::hash::Digest,
+        write_secret: crate::hash::Digest,
     },
     PeerExtension {
         ty: u16,
@@ -78,7 +78,7 @@ pub enum Event {
     },
     KeyUpdate {
         direction: KeyDirection,
-        secret: [u8; 32],
+        secret: crate::hash::Digest,
     },
     NewSessionTicket {
         ticket_lifetime: u32,
@@ -91,7 +91,7 @@ pub enum Event {
         psk: [u8; 32],
     },
     ZeroRttKeysReady {
-        secret: [u8; 32],
+        secret: crate::hash::Digest,
     },
     EarlyDataAccepted,
     EarlyDataRejected,

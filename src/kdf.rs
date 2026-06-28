@@ -2,22 +2,26 @@ use alloc::vec::Vec;
 
 use ring::hmac;
 
-use crate::hash::HASH_LEN;
+use crate::hash::{Digest, HashAlg, MAX_HASH_LEN};
+
+pub(crate) fn hmac_alg(alg: HashAlg) -> hmac::Algorithm {
+    match alg {
+        HashAlg::Sha256 => hmac::HMAC_SHA256,
+        HashAlg::Sha384 => hmac::HMAC_SHA384,
+    }
+}
 
 pub struct Hkdf;
 
 impl Hkdf {
-    pub fn extract(salt: &[u8], ikm: &[u8]) -> [u8; HASH_LEN] {
-        let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
-        let tag = hmac::sign(&key, ikm);
-        let mut out = [0u8; HASH_LEN];
-        out.copy_from_slice(tag.as_ref());
-        out
+    pub fn extract(alg: HashAlg, salt: &[u8], ikm: &[u8]) -> Digest {
+        let key = hmac::Key::new(hmac_alg(alg), salt);
+        Digest::from_slice(hmac::sign(&key, ikm).as_ref())
     }
 
-    pub fn expand(prk: &[u8], info: &[u8], out: &mut [u8]) {
-        let key = hmac::Key::new(hmac::HMAC_SHA256, prk);
-        let mut t_prev: [u8; HASH_LEN] = [0; HASH_LEN];
+    pub fn expand(alg: HashAlg, prk: &[u8], info: &[u8], out: &mut [u8]) {
+        let key = hmac::Key::new(hmac_alg(alg), prk);
+        let mut t_prev = [0u8; MAX_HASH_LEN];
         let mut t_prev_len = 0;
         let mut written = 0;
         let mut counter: u8 = 0;
@@ -31,7 +35,6 @@ impl Hkdf {
             ctx.update(&[counter]);
             let tag = ctx.sign();
             let block = tag.as_ref();
-            debug_assert_eq!(block.len(), HASH_LEN);
             let take = (out.len() - written).min(block.len());
             out[written..written + take].copy_from_slice(&block[..take]);
             t_prev[..block.len()].copy_from_slice(block);
@@ -40,31 +43,32 @@ impl Hkdf {
         }
     }
 
-    pub fn expand_label(prk: &[u8], label: &str, context: &[u8], out: &mut [u8]) {
-        let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
-        let total_len = u16::try_from(out.len()).expect("hkdf_expand_label: output > 65535");
-        info.extend_from_slice(&total_len.to_be_bytes());
+    pub fn expand_label(alg: HashAlg, prk: &[u8], label: &str, context: &[u8], out: &mut [u8]) {
+        let info = Self::hkdf_label(label, context, out.len());
+        Self::expand(alg, prk, &info, out);
+    }
 
+    pub fn derive_secret(alg: HashAlg, prk: &[u8], label: &str, transcript_hash: &[u8]) -> Digest {
+        let mut buf = [0u8; MAX_HASH_LEN];
+        let out = &mut buf[..alg.output_len()];
+        Self::expand_label(alg, prk, label, transcript_hash, out);
+        Digest::from_slice(out)
+    }
+
+    pub fn traffic_update(alg: HashAlg, prev: &Digest) -> Digest {
+        Self::derive_secret(alg, prev.as_slice(), "traffic upd", &[])
+    }
+
+    fn hkdf_label(label: &str, context: &[u8], out_len: usize) -> Vec<u8> {
+        let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
+        let total_len = u16::try_from(out_len).expect("hkdf_expand_label: output > 65535");
+        info.extend_from_slice(&total_len.to_be_bytes());
         let label_with_prefix_len = 6 + label.len();
         info.push(u8::try_from(label_with_prefix_len).expect("hkdf_expand_label: label too long"));
         info.extend_from_slice(b"tls13 ");
         info.extend_from_slice(label.as_bytes());
-
         info.push(u8::try_from(context.len()).expect("hkdf_expand_label: context too long"));
         info.extend_from_slice(context);
-
-        Self::expand(prk, &info, out);
-    }
-
-    pub fn derive_secret(prk: &[u8], label: &str, transcript_hash: &[u8]) -> [u8; HASH_LEN] {
-        let mut out = [0u8; HASH_LEN];
-        Self::expand_label(prk, label, transcript_hash, &mut out);
-        out
-    }
-
-    pub fn finished_key(base_secret: &[u8]) -> [u8; HASH_LEN] {
-        let mut out = [0u8; HASH_LEN];
-        Self::expand_label(base_secret, "finished", &[], &mut out);
-        out
+        info
     }
 }

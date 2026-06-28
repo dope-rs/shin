@@ -22,6 +22,15 @@ impl AeadKey {
         }
     }
 
+    pub fn aes_256_gcm(key: &[u8; 32], iv: [u8; 12]) -> Self {
+        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, key)
+            .expect("AES-256-GCM accepts a 32-byte key by construction");
+        Self {
+            inner: aead::LessSafeKey::new(unbound),
+            iv,
+        }
+    }
+
     pub fn chacha20_poly1305(key: &[u8; 32], iv: [u8; 12]) -> Self {
         let unbound = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, key)
             .expect("ChaCha20-Poly1305 accepts a 32-byte key by construction");

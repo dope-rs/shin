@@ -95,7 +95,7 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
 /// SHA-256 binder. A naive len - 32 is off by 3 and breaks interop.
 #[test]
 fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
-    use shin::hash::Transcript;
+    use shin::hash::{HashAlg, Transcript};
     use shin::psk::ResumptionBinder;
 
     let psk = [0x99u8; 32];
@@ -148,7 +148,7 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
 
     let mut t_ok = Transcript::new();
     t_ok.update(&ch_bytes[..n - 35]);
-    let expected = ResumptionBinder::compute(&psk, &t_ok.hash());
+    let expected = ResumptionBinder::compute(&psk, t_ok.hash(HashAlg::Sha256).as_slice());
     assert_eq!(
         on_wire_binder,
         expected.to_vec(),
@@ -158,7 +158,7 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
     // len-32 (off by 3) must NOT match.
     let mut t_bad = Transcript::new();
     t_bad.update(&ch_bytes[..n - 32]);
-    let wrong = ResumptionBinder::compute(&psk, &t_bad.hash());
+    let wrong = ResumptionBinder::compute(&psk, t_bad.hash(HashAlg::Sha256).as_slice());
     assert_ne!(on_wire_binder, wrong.to_vec());
 }
 

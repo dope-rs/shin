@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use ring::hmac;
 
 use crate::codec::{DecodeError, Encode, EncodeError, Reader};
-use crate::hash::HASH_LEN;
+use crate::hash::{Digest, HashAlg, MAX_HASH_LEN};
 use crate::kdf::Hkdf;
 use crate::kx::KexGroup;
 
@@ -276,15 +276,15 @@ pub(crate) struct Finished;
 
 impl Finished {
     pub(crate) fn verify_data(
-        traffic_secret: &[u8; HASH_LEN],
+        alg: HashAlg,
+        traffic_secret: &[u8],
         transcript_hash: &[u8],
-    ) -> [u8; HASH_LEN] {
-        let fkey = Hkdf::finished_key(traffic_secret);
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &fkey);
-        let tag = hmac::sign(&key, transcript_hash);
-        let mut out = [0u8; HASH_LEN];
-        out.copy_from_slice(tag.as_ref());
-        out
+    ) -> Digest {
+        let mut fkey_buf = [0u8; MAX_HASH_LEN];
+        let fkey = &mut fkey_buf[..alg.output_len()];
+        Hkdf::expand_label(alg, traffic_secret, "finished", &[], fkey);
+        let key = hmac::Key::new(crate::kdf::hmac_alg(alg), fkey);
+        Digest::from_slice(hmac::sign(&key, transcript_hash).as_ref())
     }
 }
 
