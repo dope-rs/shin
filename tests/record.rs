@@ -28,7 +28,7 @@ fn craft_wire(seq: u64, inner_plaintext: &[u8]) -> Vec<u8> {
 fn plaintext_round_trip() {
     let body = b"client-hello-bytes";
     let mut buf = Vec::new();
-    PlaintextRecord::encode(ContentType::Handshake, body, &mut buf).unwrap();
+    PlaintextRecord::encode_into(ContentType::Handshake, body, &mut buf).unwrap();
     assert_eq!(buf[0], ContentType::Handshake as u8);
     assert_eq!(&buf[1..3], &PROTOCOL_VERSION.to_be_bytes());
     assert_eq!(&buf[3..5], &(body.len() as u16).to_be_bytes());
@@ -44,7 +44,7 @@ fn plaintext_round_trip() {
 fn parse_plaintext_partial_returns_none() {
     let body = b"abc";
     let mut buf = Vec::new();
-    PlaintextRecord::encode(ContentType::Handshake, body, &mut buf).unwrap();
+    PlaintextRecord::encode_into(ContentType::Handshake, body, &mut buf).unwrap();
     assert!(PlaintextRecord::parse(&buf[..3]).unwrap().is_none());
     assert!(
         PlaintextRecord::parse(&buf[..buf.len() - 1])
@@ -153,6 +153,25 @@ fn seal_into_slice_rejects_undersized_buffer() {
 }
 
 #[test]
+fn encode_into_slice_matches_allocating_encode_byte_for_byte() {
+    let body = b"client-hello-bytes";
+    let one = PlaintextRecord::encode(ContentType::Handshake, body).unwrap();
+
+    let mut wire = [0u8; HEADER_LEN + 64];
+    let n = PlaintextRecord::encode_into_slice(ContentType::Handshake, body, &mut wire).unwrap();
+    assert_eq!(&wire[..n], one.as_slice());
+}
+
+#[test]
+fn encode_into_slice_rejects_undersized_buffer() {
+    let mut tiny = [0u8; HEADER_LEN];
+    assert_eq!(
+        PlaintextRecord::encode_into_slice(ContentType::Handshake, b"x", &mut tiny),
+        Err(RecordError::BufferTooSmall)
+    );
+}
+
+#[test]
 fn sequence_number_increments_per_record() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET);
     let mut opener = Opener::from_secret(&TEST_SECRET);
@@ -250,7 +269,7 @@ fn encode_rejects_oversize_body() {
     let big = vec![0u8; MAX_PLAINTEXT_BODY + 1];
     let mut out = Vec::new();
     assert_eq!(
-        PlaintextRecord::encode(ContentType::Handshake, &big, &mut out),
+        PlaintextRecord::encode_into(ContentType::Handshake, &big, &mut out),
         Err(RecordError::BodyTooLarge)
     );
     assert!(out.is_empty());
