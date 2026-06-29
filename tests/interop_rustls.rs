@@ -4,9 +4,7 @@ use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
-};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme, SupportedCipherSuite};
 
 use shin::asn1::{Reader, Tag};
@@ -353,7 +351,9 @@ fn drive_shin_client_vs_rustls_server(suite: CipherSuite) {
             }
             x if x == ContentType::ChangeCipherSpec as u8 => {}
             x if x == ContentType::ApplicationData as u8 => {
-                let opener = hs_opener.as_mut().expect("handshake keys before ciphertext");
+                let opener = hs_opener
+                    .as_mut()
+                    .expect("handshake keys before ciphertext");
                 let mut wire = rec.clone();
                 let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
                 assert_eq!(inner_type, ContentType::Handshake);
@@ -377,7 +377,10 @@ fn drive_shin_client_vs_rustls_server(suite: CipherSuite) {
     feed_rustls(&mut server, &cf_record);
 
     assert!(client.is_done());
-    assert!(!server.is_handshaking(), "rustls server completed handshake");
+    assert!(
+        !server.is_handshaking(),
+        "rustls server completed handshake"
+    );
     assert_eq!(client.negotiated_cipher_suite(), Some(suite));
 
     let mut app_sealer = Sealer::with_suite(app_write.as_slice(), suite);
@@ -460,7 +463,10 @@ fn drive_shin_server_vs_rustls_client(suite: CipherSuite) {
     let s2 = server.read(Epoch::Handshake, &client_finished).unwrap();
     assert!(has_done(&s2), "shin server completed handshake");
     assert!(server.is_done());
-    assert!(!client.is_handshaking(), "rustls client completed handshake");
+    assert!(
+        !client.is_handshaking(),
+        "rustls client completed handshake"
+    );
     assert_eq!(server.negotiated_cipher_suite(), Some(suite));
 
     let mut app_sealer = Sealer::with_suite(ap_w.as_slice(), suite);
