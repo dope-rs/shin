@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use crate::aead::AeadKey;
 use crate::hash::HashAlg;
 use crate::schedule::TrafficKeys;
+use crate::uninit::VecUninitExt;
 
 pub const PROTOCOL_VERSION: u16 = 0x0303;
 
@@ -112,6 +113,8 @@ pub enum RecordError {
     /// A prior open failed authentication; the opener rejects all further use
     /// (RFC 8446 §5.2 — a failed open is fatal).
     Poisoned,
+    /// The destination buffer was smaller than the sealed record.
+    BufferTooSmall,
 }
 
 #[derive(Debug, Clone)]
@@ -206,36 +209,71 @@ impl Sealer {
         body: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), RecordError> {
-        if body.len() > MAX_PLAINTEXT_BODY {
-            return Err(RecordError::BodyTooLarge);
+        let total = sealed_record_len(body)?;
+        self.check_seq()?;
+        // SAFETY: `seal_record` writes all `total` bytes of its destination.
+        unsafe {
+            out.extend_uninit(total, |dst| self.seal_record(inner_type, body, dst));
         }
+        Ok(())
+    }
+
+    /// Seals one record into `out`, returning its length. No allocation.
+    ///
+    /// ```
+    /// use shin::record::{AEAD_TAG_LEN, ContentType, HEADER_LEN, Sealer};
+    /// let mut sealer = Sealer::from_secret(&[0u8; 32]);
+    /// let mut wire = [0u8; 64];
+    /// let n = sealer
+    ///     .seal_into_slice(ContentType::ApplicationData, b"hi", &mut wire)
+    ///     .unwrap();
+    /// assert_eq!(n, HEADER_LEN + b"hi".len() + 1 + AEAD_TAG_LEN);
+    /// ```
+    pub fn seal_into_slice(
+        &mut self,
+        inner_type: ContentType,
+        body: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, RecordError> {
+        let total = sealed_record_len(body)?;
+        let dst = out.get_mut(..total).ok_or(RecordError::BufferTooSmall)?;
+        self.check_seq()?;
+        self.seal_record(inner_type, body, dst);
+        Ok(total)
+    }
+
+    fn check_seq(&self) -> Result<(), RecordError> {
         if self.seq == u64::MAX {
             return Err(RecordError::SeqExhausted);
         }
-
-        let outer_body_len = body.len() + 1 + AEAD_TAG_LEN;
-        if outer_body_len > MAX_CIPHERTEXT_BODY {
-            return Err(RecordError::BodyTooLarge);
-        }
-
-        let seq = self.seq;
-        self.seq += 1;
-
-        let start = out.len();
-        out.reserve(HEADER_LEN + outer_body_len);
-        out.push(ContentType::ApplicationData as u8);
-        out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        out.extend_from_slice(&(outer_body_len as u16).to_be_bytes());
-        out.extend_from_slice(body);
-        out.push(inner_type as u8);
-
-        let tag = {
-            let (header, ciphertext) = out[start..].split_at_mut(HEADER_LEN);
-            self.aead.seal_detached(seq, header, ciphertext)
-        };
-        out.extend_from_slice(&tag);
         Ok(())
     }
+
+    fn seal_record(&mut self, inner_type: ContentType, body: &[u8], dst: &mut [u8]) {
+        debug_assert_eq!(dst.len(), HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN);
+        debug_assert!(self.seq != u64::MAX);
+        let seq = self.seq;
+        self.seq += 1;
+        let outer_body_len = dst.len() - HEADER_LEN;
+
+        dst[0] = ContentType::ApplicationData as u8;
+        dst[1..3].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        dst[3..HEADER_LEN].copy_from_slice(&(outer_body_len as u16).to_be_bytes());
+        dst[HEADER_LEN..HEADER_LEN + body.len()].copy_from_slice(body);
+        dst[HEADER_LEN + body.len()] = inner_type as u8;
+
+        let (header, rest) = dst.split_at_mut(HEADER_LEN);
+        let (plaintext, tag_dst) = rest.split_at_mut(body.len() + 1);
+        let tag = self.aead.seal_detached(seq, header, plaintext);
+        tag_dst.copy_from_slice(&tag);
+    }
+}
+
+fn sealed_record_len(body: &[u8]) -> Result<usize, RecordError> {
+    if body.len() > MAX_PLAINTEXT_BODY {
+        return Err(RecordError::BodyTooLarge);
+    }
+    Ok(HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN)
 }
 
 pub struct Opener {

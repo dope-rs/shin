@@ -26,6 +26,7 @@ pub mod time;
 
 mod peer;
 mod proto;
+mod uninit;
 
 pub mod client;
 pub mod server;
