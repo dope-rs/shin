@@ -111,6 +111,48 @@ fn seal_into_staged_equals_seal_and_round_trips() {
 }
 
 #[test]
+fn seal_into_slice_matches_allocating_seal_byte_for_byte() {
+    let body = b"hello tls record body";
+
+    let mut allocating = Sealer::from_secret(&TEST_SECRET);
+    let one = allocating.seal(ContentType::ApplicationData, body).unwrap();
+
+    let mut wire = [0u8; HEADER_LEN + 64];
+    let mut into = Sealer::from_secret(&TEST_SECRET);
+    let n = into
+        .seal_into_slice(ContentType::ApplicationData, body, &mut wire)
+        .unwrap();
+    assert_eq!(&wire[..n], one.as_slice());
+}
+
+#[test]
+fn seal_into_slice_accepts_exact_fit_buffer() {
+    let body = b"x";
+    let total = HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN;
+    let mut exact = vec![0u8; total];
+    let mut sealer = Sealer::from_secret(&TEST_SECRET);
+    let n = sealer
+        .seal_into_slice(ContentType::ApplicationData, body, &mut exact)
+        .unwrap();
+    assert_eq!(n, total);
+}
+
+#[test]
+fn seal_into_slice_rejects_undersized_buffer() {
+    let mut sealer = Sealer::from_secret(&TEST_SECRET);
+    let mut tiny = [0u8; HEADER_LEN];
+    assert_eq!(
+        sealer.seal_into_slice(ContentType::ApplicationData, b"x", &mut tiny),
+        Err(RecordError::BufferTooSmall)
+    );
+    assert_eq!(
+        sealer.seq(),
+        0,
+        "a rejected seal must not spend the sequence"
+    );
+}
+
+#[test]
 fn sequence_number_increments_per_record() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET);
     let mut opener = Opener::from_secret(&TEST_SECRET);
