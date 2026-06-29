@@ -124,19 +124,57 @@ pub struct PlaintextRecord<'a> {
 }
 
 impl<'a> PlaintextRecord<'a> {
-    pub fn encode(
+    /// Encodes a plaintext record into a fresh buffer.
+    ///
+    /// ```
+    /// use shin::record::{ContentType, HEADER_LEN, PlaintextRecord};
+    /// let wire = PlaintextRecord::encode(ContentType::Alert, &[1, 2]).unwrap();
+    /// assert_eq!(wire.len(), HEADER_LEN + 2);
+    /// ```
+    pub fn encode(content_type: ContentType, body: &[u8]) -> Result<Vec<u8>, RecordError> {
+        let mut out = Vec::new();
+        Self::encode_into(content_type, body, &mut out)?;
+        Ok(out)
+    }
+
+    /// Appends a plaintext record to `out` without a fresh allocation.
+    ///
+    /// ```
+    /// use shin::record::{ContentType, HEADER_LEN, PlaintextRecord};
+    /// let mut wire = Vec::new();
+    /// PlaintextRecord::encode_into(ContentType::Alert, &[1, 2], &mut wire).unwrap();
+    /// assert_eq!(wire.len(), HEADER_LEN + 2);
+    /// ```
+    pub fn encode_into(
         content_type: ContentType,
         body: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), RecordError> {
-        if body.len() > MAX_PLAINTEXT_BODY {
-            return Err(RecordError::BodyTooLarge);
+        let total = plaintext_record_len(body)?;
+        // SAFETY: `write_plaintext` fills all `total` bytes of its destination.
+        unsafe {
+            out.extend_uninit(total, |dst| write_plaintext(content_type, body, dst));
         }
-        out.push(content_type as u8);
-        out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-        out.extend_from_slice(body);
         Ok(())
+    }
+
+    /// Encodes a plaintext record into `out`, returning its length. No allocation.
+    ///
+    /// ```
+    /// use shin::record::{ContentType, HEADER_LEN, PlaintextRecord};
+    /// let mut wire = [0u8; 32];
+    /// let n = PlaintextRecord::encode_into_slice(ContentType::Alert, &[1, 2], &mut wire).unwrap();
+    /// assert_eq!(n, HEADER_LEN + 2);
+    /// ```
+    pub fn encode_into_slice(
+        content_type: ContentType,
+        body: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, RecordError> {
+        let total = plaintext_record_len(body)?;
+        let dst = out.get_mut(..total).ok_or(RecordError::BufferTooSmall)?;
+        write_plaintext(content_type, body, dst);
+        Ok(total)
     }
 
     pub fn parse(input: &'a [u8]) -> Result<Option<(Self, usize)>, RecordError> {
@@ -256,9 +294,7 @@ impl Sealer {
         self.seq += 1;
         let outer_body_len = dst.len() - HEADER_LEN;
 
-        dst[0] = ContentType::ApplicationData as u8;
-        dst[1..3].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        dst[3..HEADER_LEN].copy_from_slice(&(outer_body_len as u16).to_be_bytes());
+        write_header(ContentType::ApplicationData, outer_body_len as u16, dst);
         dst[HEADER_LEN..HEADER_LEN + body.len()].copy_from_slice(body);
         dst[HEADER_LEN + body.len()] = inner_type as u8;
 
@@ -269,11 +305,33 @@ impl Sealer {
     }
 }
 
-fn sealed_record_len(body: &[u8]) -> Result<usize, RecordError> {
+fn check_body_len(body: &[u8]) -> Result<(), RecordError> {
     if body.len() > MAX_PLAINTEXT_BODY {
         return Err(RecordError::BodyTooLarge);
     }
+    Ok(())
+}
+
+fn sealed_record_len(body: &[u8]) -> Result<usize, RecordError> {
+    check_body_len(body)?;
     Ok(HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN)
+}
+
+fn plaintext_record_len(body: &[u8]) -> Result<usize, RecordError> {
+    check_body_len(body)?;
+    Ok(HEADER_LEN + body.len())
+}
+
+fn write_header(content_type: ContentType, body_len: u16, dst: &mut [u8]) {
+    dst[0] = content_type as u8;
+    dst[1..3].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    dst[3..HEADER_LEN].copy_from_slice(&body_len.to_be_bytes());
+}
+
+fn write_plaintext(content_type: ContentType, body: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(dst.len(), HEADER_LEN + body.len());
+    write_header(content_type, body.len() as u16, dst);
+    dst[HEADER_LEN..].copy_from_slice(body);
 }
 
 pub struct Opener {

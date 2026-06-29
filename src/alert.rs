@@ -135,9 +135,8 @@ impl Alert {
     /// alerts sent before the handshake traffic keys are established; later
     /// alerts must be sealed under the current epoch instead.
     pub fn to_plaintext_record(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(crate::record::HEADER_LEN + 2);
-        let _ = PlaintextRecord::encode(ContentType::Alert, &self.body(), &mut out);
-        out
+        PlaintextRecord::encode(ContentType::Alert, &self.body())
+            .expect("2-byte alert body fits a plaintext record")
     }
 }
 

@@ -180,9 +180,7 @@ fn has_done(events: &[Event]) -> bool {
 }
 
 fn plaintext_record(content_type: ContentType, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    PlaintextRecord::encode(content_type, body, &mut out).unwrap();
-    out
+    PlaintextRecord::encode(content_type, body).unwrap()
 }
 
 fn split_records(buf: &[u8]) -> Vec<Vec<u8>> {
