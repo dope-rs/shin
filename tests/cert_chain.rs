@@ -47,9 +47,13 @@ fn validates_self_signed_leaf_with_ipv6_san() {
     let now = now_for(&cert);
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::validate(&chain, &anchors, now, b"2001:db8::1").expect("ipv6 SAN matches");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"2001:db8::1")
+        .expect("ipv6 SAN matches");
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"2001:db8::2").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"2001:db8::2")
+            .unwrap_err(),
         ChainError::HostnameMismatch,
     );
 }
@@ -66,7 +70,8 @@ fn ipv6_san_matches_compressed_reference_forms() {
         &b"2001:0db8:0000:0000:0000:0000:0000:0001"[..],
         &b"2001:db8:0:0:0:0:0:1"[..],
     ] {
-        Chain::validate(&chain, &anchors, now, form)
+        Chain::new(&chain)
+            .validate(&anchors, now, form)
             .unwrap_or_else(|_| panic!("form {:?} should match", core::str::from_utf8(form)));
     }
 }
@@ -79,7 +84,9 @@ fn ipv6_san_rejects_dns_reference_and_vice_versa() {
     let ip_chain = [ip_cert.clone()];
     let ip_anchors = [TrustAnchor::from_cert(&ip_cert)];
     assert_eq!(
-        Chain::validate(&ip_chain, &ip_anchors, ip_now, b"example.com").unwrap_err(),
+        Chain::new(&ip_chain)
+            .validate(&ip_anchors, ip_now, b"example.com")
+            .unwrap_err(),
         ChainError::HostnameMismatch
     );
 
@@ -89,7 +96,9 @@ fn ipv6_san_rejects_dns_reference_and_vice_versa() {
     let dns_chain = [dns_cert.clone()];
     let dns_anchors = [TrustAnchor::from_cert(&dns_cert)];
     assert_eq!(
-        Chain::validate(&dns_chain, &dns_anchors, dns_now, b"2001:db8::1").unwrap_err(),
+        Chain::new(&dns_chain)
+            .validate(&dns_anchors, dns_now, b"2001:db8::1")
+            .unwrap_err(),
         ChainError::HostnameMismatch
     );
 }
@@ -103,12 +112,16 @@ fn ipv4_mapped_and_distinct_ipv6_do_not_collide() {
     let anchors = [TrustAnchor::from_cert(&cert)];
     // A different address whose textual prefix overlaps must not match.
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"2001:db8::1:0").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"2001:db8::1:0")
+            .unwrap_err(),
         ChainError::HostnameMismatch
     );
     // Garbage that is neither a valid IP nor a DNS label must not match.
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"2001:db8::zz").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"2001:db8::zz")
+            .unwrap_err(),
         ChainError::HostnameMismatch
     );
 }
@@ -120,7 +133,9 @@ fn validates_self_signed_leaf_with_dns_san() {
     let now = now_for(&cert);
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::validate(&chain, &anchors, now, b"host.local").expect("valid");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"host.local")
+        .expect("valid");
 }
 
 #[test]
@@ -133,7 +148,9 @@ fn rejects_unknown_anchor() {
     let chain = [leaf];
     let anchors = [TrustAnchor::from_cert(&other)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::NoTrustAnchor
     );
 }
@@ -146,7 +163,9 @@ fn rejects_hostname_mismatch() {
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"other.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"other.local")
+            .unwrap_err(),
         ChainError::HostnameMismatch
     );
 }
@@ -160,7 +179,9 @@ fn rejects_expired_cert() {
     let anchors = [TrustAnchor::from_cert(&cert)];
     let beyond = UnixTime(na.0 + 60);
     assert_eq!(
-        Chain::validate(&chain, &anchors, beyond, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, beyond, b"host.local")
+            .unwrap_err(),
         ChainError::Expired
     );
 }
@@ -174,14 +195,22 @@ fn validity_boundaries_are_inclusive() {
     let na = UnixTime::from_time_value(&cert.validity.not_after).unwrap();
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::validate(&chain, &anchors, nb, b"host.local").expect("notBefore is inclusive");
-    Chain::validate(&chain, &anchors, na, b"host.local").expect("notAfter is inclusive");
+    Chain::new(&chain)
+        .validate(&anchors, nb, b"host.local")
+        .expect("notBefore is inclusive");
+    Chain::new(&chain)
+        .validate(&anchors, na, b"host.local")
+        .expect("notAfter is inclusive");
     assert_eq!(
-        Chain::validate(&chain, &anchors, UnixTime(nb.0 - 1), b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, UnixTime(nb.0 - 1), b"host.local")
+            .unwrap_err(),
         ChainError::NotYetValid
     );
     assert_eq!(
-        Chain::validate(&chain, &anchors, UnixTime(na.0 + 1), b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, UnixTime(na.0 + 1), b"host.local")
+            .unwrap_err(),
         ChainError::Expired
     );
 }
@@ -195,7 +224,9 @@ fn rejects_not_yet_valid() {
     let anchors = [TrustAnchor::from_cert(&cert)];
     let earlier = UnixTime(nb.0.saturating_sub(60));
     assert_eq!(
-        Chain::validate(&chain, &anchors, earlier, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, earlier, b"host.local")
+            .unwrap_err(),
         ChainError::NotYetValid
     );
 }
@@ -211,7 +242,9 @@ fn rejects_ca_marked_cert_as_leaf() {
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"ca.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"ca.local")
+            .unwrap_err(),
         ChainError::NotEndEntity
     );
 }
@@ -228,7 +261,9 @@ fn rejects_missing_server_auth_eku() {
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::NoServerAuth
     );
 }
@@ -253,7 +288,9 @@ fn rejects_unknown_critical_extension() {
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::UnhandledCriticalExtension
     );
 }
@@ -265,7 +302,9 @@ fn accepts_unknown_noncritical_extension() {
     let now = now_for(&cert);
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::validate(&chain, &anchors, now, b"host.local").expect("non-critical unknown ext is ok");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"host.local")
+        .expect("non-critical unknown ext is ok");
 }
 
 fn ca(cn: &str) -> (CertificateParams, KeyPair, Vec<u8>) {
@@ -313,7 +352,9 @@ fn rejects_issuer_subject_dn_mismatch() {
     let chain = [leaf_cert.clone(), wrong_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::IssuerSubjectMismatch
     );
 }
@@ -325,5 +366,7 @@ fn wildcard_san_matches_subdomain() {
     let now = now_for(&cert);
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::validate(&chain, &anchors, now, b"foo.example.local").expect("valid");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"foo.example.local")
+        .expect("valid");
 }

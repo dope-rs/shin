@@ -10,6 +10,8 @@ use rand_core::{TryCryptoRng, TryRng};
 use ring::agreement::{self, Algorithm, ECDH_P256, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::rand::SecureRandom;
 
+use zeroize::Zeroize;
+
 /// Largest (EC)DHE / hybrid shared secret: ML-KEM-768 (32) ‖ X25519 (32).
 pub const MAX_SHARED_LEN: usize = 64;
 
@@ -46,7 +48,7 @@ impl SharedSecret {
 
 impl Drop for SharedSecret {
     fn drop(&mut self) {
-        crate::schedule::zeroize(&mut self.bytes);
+        self.bytes.zeroize();
     }
 }
 
@@ -235,52 +237,51 @@ impl EphemeralKey {
     }
 }
 
-/// Responder (server) side: given the client's share, produce the
-/// `server_share` to echo and the matching shared secret in one step. KEM is
-/// asymmetric — the responder encapsulates rather than generating its own
-/// keypair — so this is a free function, not a mirror of [`EphemeralKey`].
-pub fn responder<R: SecureRandom>(
-    group: KexGroup,
-    client_share: &[u8],
-    rng: &R,
-) -> Result<(Vec<u8>, SharedSecret), KxError> {
-    match group {
-        KexGroup::X25519 | KexGroup::Secp256r1 => {
-            let eph = EphemeralPrivateKey::generate(group.ecdh_algorithm(), rng)
-                .map_err(|_| KxError::Generate)?;
-            let server_share = eph
-                .compute_public_key()
-                .map_err(|_| KxError::Generate)?
-                .as_ref()
-                .to_vec();
-            let peer = UnparsedPublicKey::new(group.ecdh_algorithm(), client_share);
-            let shared = agreement::agree_ephemeral(eph, &peer, SharedSecret::from_slice)
-                .map_err(|_| KxError::InvalidPubkey)?;
-            Ok((server_share, shared))
-        }
-        KexGroup::X25519Mlkem768 => {
-            if client_share.len() != MLKEM768_EK_LEN + X25519_LEN {
-                return Err(KxError::InvalidPubkey);
+impl KexGroup {
+    pub fn respond<R: SecureRandom>(
+        self,
+        client_share: &[u8],
+        rng: &R,
+    ) -> Result<(Vec<u8>, SharedSecret), KxError> {
+        match self {
+            KexGroup::X25519 | KexGroup::Secp256r1 => {
+                let eph = EphemeralPrivateKey::generate(self.ecdh_algorithm(), rng)
+                    .map_err(|_| KxError::Generate)?;
+                let server_share = eph
+                    .compute_public_key()
+                    .map_err(|_| KxError::Generate)?
+                    .as_ref()
+                    .to_vec();
+                let peer = UnparsedPublicKey::new(self.ecdh_algorithm(), client_share);
+                let shared = agreement::agree_ephemeral(eph, &peer, SharedSecret::from_slice)
+                    .map_err(|_| KxError::InvalidPubkey)?;
+                Ok((server_share, shared))
             }
-            let (ek_bytes, x25519_client_pk) = client_share.split_at(MLKEM768_EK_LEN);
-            let ek = EncapsulationKey::<MlKem768>::new_from_slice(ek_bytes)
+            KexGroup::X25519Mlkem768 => {
+                if client_share.len() != MLKEM768_EK_LEN + X25519_LEN {
+                    return Err(KxError::InvalidPubkey);
+                }
+                let (ek_bytes, x25519_client_pk) = client_share.split_at(MLKEM768_EK_LEN);
+                let ek = EncapsulationKey::<MlKem768>::new_from_slice(ek_bytes)
+                    .map_err(|_| KxError::InvalidPubkey)?;
+                let mut kem_rng = BufRng::draw(rng, 32)?;
+                let (ct, mlkem_ss) = ek.encapsulate_with_rng(&mut kem_rng);
+
+                let x25519 =
+                    EphemeralPrivateKey::generate(&X25519, rng).map_err(|_| KxError::Generate)?;
+                let x25519_server_pk =
+                    x25519.compute_public_key().map_err(|_| KxError::Generate)?;
+                let peer = UnparsedPublicKey::new(&X25519, x25519_client_pk);
+                let shared = agreement::agree_ephemeral(x25519, &peer, |x25519_ss| {
+                    SharedSecret::from_parts(mlkem_ss.as_slice(), x25519_ss)
+                })
                 .map_err(|_| KxError::InvalidPubkey)?;
-            let mut kem_rng = BufRng::draw(rng, 32)?;
-            let (ct, mlkem_ss) = ek.encapsulate_with_rng(&mut kem_rng);
 
-            let x25519 =
-                EphemeralPrivateKey::generate(&X25519, rng).map_err(|_| KxError::Generate)?;
-            let x25519_server_pk = x25519.compute_public_key().map_err(|_| KxError::Generate)?;
-            let peer = UnparsedPublicKey::new(&X25519, x25519_client_pk);
-            let shared = agreement::agree_ephemeral(x25519, &peer, |x25519_ss| {
-                SharedSecret::from_parts(mlkem_ss.as_slice(), x25519_ss)
-            })
-            .map_err(|_| KxError::InvalidPubkey)?;
-
-            let mut server_share = Vec::with_capacity(MLKEM768_CT_LEN + X25519_LEN);
-            server_share.extend_from_slice(ct.as_slice());
-            server_share.extend_from_slice(x25519_server_pk.as_ref());
-            Ok((server_share, shared))
+                let mut server_share = Vec::with_capacity(MLKEM768_CT_LEN + X25519_LEN);
+                server_share.extend_from_slice(ct.as_slice());
+                server_share.extend_from_slice(x25519_server_pk.as_ref());
+                Ok((server_share, shared))
+            }
         }
     }
 }

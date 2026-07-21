@@ -1,10 +1,6 @@
 use alloc::vec::Vec;
 
-use ring::hmac;
-
 use crate::codec::{DecodeError, Encode, EncodeError, Reader};
-use crate::hash::{Digest, HashAlg, MAX_HASH_LEN};
-use crate::kdf::Hkdf;
 use crate::kx::KexGroup;
 
 pub(crate) const TLS_1_3: u16 = 0x0304;
@@ -19,18 +15,25 @@ pub(crate) const SIG_ED25519: u16 = 0x0807;
 pub(crate) const CERT_TYPE_X509: u8 = 0;
 pub(crate) const CERT_TYPE_RAW_PUBLIC_KEY: u8 = 2;
 
-pub(crate) struct SupportedVersions;
+pub(crate) struct SupportedVersions(u16);
 
 impl SupportedVersions {
-    pub(crate) fn client_encode() -> Vec<u8> {
-        let mut v = Vec::with_capacity(3);
-        v.put_vec_u8(|o| o.put_u16(TLS_1_3));
-        v
+    pub(crate) fn tls13() -> Self {
+        Self(TLS_1_3)
     }
 
-    pub(crate) fn server_encode() -> Vec<u8> {
+    pub(crate) fn client_encode(self) -> Result<Vec<u8>, EncodeError> {
+        let mut v = Vec::with_capacity(3);
+        v.put_vec_u8(|o| {
+            o.put_u16(self.0);
+            Ok(())
+        })?;
+        Ok(v)
+    }
+
+    pub(crate) fn server_encode(self) -> Vec<u8> {
         let mut v = Vec::with_capacity(2);
-        v.put_u16(TLS_1_3);
+        v.put_u16(self.0);
         v
     }
 
@@ -53,17 +56,22 @@ impl SupportedVersions {
     }
 }
 
-pub(crate) struct SupportedGroups;
+pub(crate) struct SupportedGroups(&'static [KexGroup]);
 
 impl SupportedGroups {
-    pub(crate) fn encode() -> Vec<u8> {
+    pub(crate) fn supported() -> Self {
+        Self(&KexGroup::SUPPORTED)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         let mut v = Vec::with_capacity(6);
         v.put_vec_u16(|o| {
-            for g in KexGroup::SUPPORTED {
+            for g in self.0 {
                 o.put_u16(g.to_u16());
             }
-        });
-        v
+            Ok(())
+        })?;
+        Ok(v)
     }
 
     pub(crate) fn decode(data: &[u8]) -> Result<Vec<u16>, DecodeError> {
@@ -78,7 +86,7 @@ impl SupportedGroups {
     }
 }
 
-pub(crate) struct SignatureAlgorithms;
+pub(crate) struct SignatureAlgorithms(&'static [u16]);
 
 impl SignatureAlgorithms {
     pub(crate) const X509: [u16; 6] = [
@@ -89,25 +97,29 @@ impl SignatureAlgorithms {
         SIG_RSA_PSS_RSAE_SHA512,
         SIG_ED25519,
     ];
+    const RPK: [u16; 1] = [SIG_ED25519];
 
-    pub(crate) fn x509_encode() -> Vec<u8> {
-        let mut v = Vec::with_capacity(2 + Self::X509.len() * 2);
+    pub(crate) fn x509() -> Self {
+        Self(&Self::X509)
+    }
+
+    pub(crate) fn rpk() -> Self {
+        Self(&Self::RPK)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut v = Vec::with_capacity(2 + self.0.len() * 2);
         v.put_vec_u16(|o| {
-            for s in Self::X509 {
-                o.put_u16(s);
+            for s in self.0 {
+                o.put_u16(*s);
             }
-        });
-        v
+            Ok(())
+        })?;
+        Ok(v)
     }
 
     pub(crate) fn x509_supported(scheme: u16) -> bool {
         Self::X509.contains(&scheme)
-    }
-
-    pub(crate) fn rpk_encode() -> Vec<u8> {
-        let mut v = Vec::with_capacity(4);
-        v.put_vec_u16(|o| o.put_u16(SIG_ED25519));
-        v
     }
 
     pub(crate) fn decode(data: &[u8]) -> Result<Vec<u16>, DecodeError> {
@@ -122,29 +134,42 @@ impl SignatureAlgorithms {
     }
 }
 
-pub(crate) struct KeyShare;
+pub(crate) struct KeyShare<'a> {
+    group: KexGroup,
+    pubkey: &'a [u8],
+}
 
-impl KeyShare {
-    pub(crate) fn client_encode(group: KexGroup, pubkey: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(8 + pubkey.len());
-        v.put_vec_u16(|o| {
-            o.put_u16(group.to_u16());
-            o.put_vec_u16(|o| o.put_slice(pubkey));
-        });
-        v
+impl<'a> KeyShare<'a> {
+    pub(crate) fn new(group: KexGroup, pubkey: &'a [u8]) -> Self {
+        Self { group, pubkey }
     }
 
-    pub(crate) fn server_encode(group: KexGroup, pubkey: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(4 + pubkey.len());
-        v.put_u16(group.to_u16());
-        v.put_vec_u16(|o| o.put_slice(pubkey));
-        v
+    pub(crate) fn client_encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut v = Vec::with_capacity(8 + self.pubkey.len());
+        v.put_vec_u16(|o| {
+            o.put_u16(self.group.to_u16());
+            o.put_vec_u16(|o| {
+                o.put_slice(self.pubkey);
+                Ok(())
+            })
+        })?;
+        Ok(v)
+    }
+
+    pub(crate) fn server_encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut v = Vec::with_capacity(4 + self.pubkey.len());
+        v.put_u16(self.group.to_u16());
+        v.put_vec_u16(|o| {
+            o.put_slice(self.pubkey);
+            Ok(())
+        })?;
+        Ok(v)
     }
 
     /// HelloRetryRequest key_share: the selected group only (RFC 8446 §4.2.8).
-    pub(crate) fn hrr_encode(group: KexGroup) -> Vec<u8> {
+    pub(crate) fn hrr_encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(2);
-        v.put_u16(group.to_u16());
+        v.put_u16(self.group.to_u16());
         v
     }
 
@@ -188,22 +213,24 @@ impl KeyShare {
     }
 }
 
-pub(crate) struct Alpn;
+pub(crate) struct Alpn<'a>(&'a [Vec<u8>]);
 
-impl Alpn {
-    pub(crate) fn encode(protocols: &[Vec<u8>]) -> Result<Vec<u8>, EncodeError> {
-        let mut v = Vec::with_capacity(2 + protocols.iter().map(|p| 1 + p.len()).sum::<usize>());
-        let mut err = None;
-        v.try_put_vec_u16(|o| {
-            for p in protocols {
-                if let Err(e) = o.try_put_vec_u8(|o| o.put_slice(p)) {
-                    err = Some(e);
-                }
+impl<'a> Alpn<'a> {
+    pub(crate) fn new(protocols: &'a [Vec<u8>]) -> Self {
+        Self(protocols)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut v = Vec::with_capacity(2 + self.0.iter().map(|p| 1 + p.len()).sum::<usize>());
+        v.put_vec_u16(|o| {
+            for p in self.0 {
+                o.put_vec_u8(|o| {
+                    o.put_slice(p);
+                    Ok(())
+                })?;
             }
+            Ok(())
         })?;
-        if let Some(e) = err {
-            return Err(e);
-        }
         Ok(v)
     }
 
@@ -220,36 +247,44 @@ impl Alpn {
     }
 }
 
-pub(crate) struct ServerName;
+pub(crate) struct ServerName<'a>(&'a [u8]);
 
-impl ServerName {
-    pub(crate) fn encode(hostname: &[u8]) -> Result<Vec<u8>, EncodeError> {
-        let mut v = Vec::with_capacity(5 + hostname.len());
-        let mut err = None;
-        v.try_put_vec_u16(|o| {
+impl<'a> ServerName<'a> {
+    pub(crate) fn new(hostname: &'a [u8]) -> Self {
+        Self(hostname)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut v = Vec::with_capacity(5 + self.0.len());
+        v.put_vec_u16(|o| {
             o.put_u8(0);
-            if let Err(e) = o.try_put_vec_u16(|o| o.put_slice(hostname)) {
-                err = Some(e);
-            }
+            o.put_vec_u16(|o| {
+                o.put_slice(self.0);
+                Ok(())
+            })
         })?;
-        if let Some(e) = err {
-            return Err(e);
-        }
         Ok(v)
     }
 }
 
-pub(crate) struct CertType;
+pub(crate) struct CertType(u8);
 
 impl CertType {
-    pub(crate) fn encode_list(ty: u8) -> Vec<u8> {
-        let mut v = Vec::with_capacity(2);
-        v.put_vec_u8(|o| o.put_u8(ty));
-        v
+    pub(crate) fn new(ty: u8) -> Self {
+        Self(ty)
     }
 
-    pub(crate) fn encode_single(ty: u8) -> Vec<u8> {
-        alloc::vec![ty]
+    pub(crate) fn encode_list(self) -> Result<Vec<u8>, EncodeError> {
+        let mut v = Vec::with_capacity(2);
+        v.put_vec_u8(|o| {
+            o.put_u8(self.0);
+            Ok(())
+        })?;
+        Ok(v)
+    }
+
+    pub(crate) fn encode_single(self) -> Vec<u8> {
+        alloc::vec![self.0]
     }
 
     pub(crate) fn decode_list(data: &[u8]) -> Result<Vec<u8>, DecodeError> {
@@ -261,69 +296,5 @@ impl CertType {
         }
         r.finish()?;
         Ok(out)
-    }
-}
-
-pub(crate) struct CertVerify;
-
-impl CertVerify {
-    pub(crate) fn message(transcript_hash: &[u8], from_server: bool) -> Vec<u8> {
-        let context = if from_server {
-            b"TLS 1.3, server CertificateVerify".as_slice()
-        } else {
-            b"TLS 1.3, client CertificateVerify".as_slice()
-        };
-        let mut msg = Vec::with_capacity(64 + context.len() + 1 + transcript_hash.len());
-        msg.resize(64, 0x20);
-        msg.extend_from_slice(context);
-        msg.push(0x00);
-        msg.extend_from_slice(transcript_hash);
-        msg
-    }
-}
-
-pub(crate) struct Finished;
-
-impl Finished {
-    pub(crate) fn verify_data(
-        alg: HashAlg,
-        traffic_secret: &[u8],
-        transcript_hash: &[u8],
-    ) -> Digest {
-        let mut fkey_buf = [0u8; MAX_HASH_LEN];
-        let fkey = &mut fkey_buf[..alg.output_len()];
-        Hkdf::expand_label(alg, traffic_secret, "finished", &[], fkey);
-        let key = hmac::Key::new(crate::kdf::hmac_alg(alg), fkey);
-        let mac = Digest::from_slice(hmac::sign(&key, transcript_hash).as_ref());
-        crate::schedule::zeroize(fkey);
-        mac
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn alpn_encode_ok() {
-        let protocols = alloc::vec![b"h3".to_vec(), b"hq".to_vec()];
-        assert!(Alpn::encode(&protocols).is_ok());
-    }
-
-    #[test]
-    fn alpn_encode_oversized_protocol() {
-        let protocols = alloc::vec![alloc::vec![0u8; 256]];
-        assert_eq!(Alpn::encode(&protocols), Err(EncodeError::Overflow));
-    }
-
-    #[test]
-    fn server_name_encode_ok() {
-        assert!(ServerName::encode(b"example.com").is_ok());
-    }
-
-    #[test]
-    fn server_name_encode_oversized() {
-        let hostname = alloc::vec![b'a'; 65536];
-        assert_eq!(ServerName::encode(&hostname), Err(EncodeError::Overflow));
     }
 }

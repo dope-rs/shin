@@ -104,7 +104,7 @@ fn server_hello(
         extensions,
     };
     let mut out = Vec::new();
-    Handshake::ServerHello(sh).encode(&mut out);
+    Handshake::ServerHello(sh).encode(&mut out).unwrap();
     out
 }
 
@@ -238,9 +238,11 @@ fn client_rejects_certificate_verify_with_unoffered_scheme() {
         match Handshake::decode(&mut r).unwrap() {
             Handshake::CertificateVerify(mut cv) => {
                 cv.algorithm = 0x0403;
-                Handshake::CertificateVerify(cv).encode(&mut tampered);
+                Handshake::CertificateVerify(cv)
+                    .encode(&mut tampered)
+                    .unwrap();
             }
-            other => other.encode(&mut tampered),
+            other => other.encode(&mut tampered).unwrap(),
         }
     }
 
@@ -257,9 +259,9 @@ fn tamper_ee<F: FnMut(&mut Vec<Extension>)>(flight: &[u8], mut f: F) -> Vec<u8> 
         match Handshake::decode(&mut r).unwrap() {
             Handshake::EncryptedExtensions(mut ee) => {
                 f(&mut ee.extensions);
-                Handshake::EncryptedExtensions(ee).encode(&mut out);
+                Handshake::EncryptedExtensions(ee).encode(&mut out).unwrap();
             }
-            other => other.encode(&mut out),
+            other => other.encode(&mut out).unwrap(),
         }
     }
     out
@@ -319,7 +321,9 @@ fn client_bounds_key_update_flood() {
     let key_updates = |n: usize| {
         let mut blob = Vec::new();
         for _ in 0..n {
-            Handshake::KeyUpdate(KeyUpdate { request_update: 0 }).encode(&mut blob);
+            Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+                .encode(&mut blob)
+                .unwrap();
         }
         blob
     };
@@ -336,7 +340,9 @@ fn client_bounds_key_update_flood() {
 fn client_bounds_key_update_flood_across_records() {
     let one_key_update = || {
         let mut blob = Vec::new();
-        Handshake::KeyUpdate(KeyUpdate { request_update: 0 }).encode(&mut blob);
+        Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+            .encode(&mut blob)
+            .unwrap();
         blob
     };
     let mut c = completed_rpk_client();
@@ -354,7 +360,9 @@ fn client_bounds_key_update_flood_across_records() {
 fn client_accepts_key_updates_interleaved_with_app_data() {
     let one_key_update = || {
         let mut blob = Vec::new();
-        Handshake::KeyUpdate(KeyUpdate { request_update: 0 }).encode(&mut blob);
+        Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+            .encode(&mut blob)
+            .unwrap();
         blob
     };
     let mut c = completed_rpk_client();

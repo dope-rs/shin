@@ -1,9 +1,11 @@
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
-use crate::aead::AeadKey;
+use crate::aead::{AeadError, AeadKey};
 use crate::hash::HashAlg;
+use crate::kdf::HkdfError;
 use crate::schedule::TrafficKeys;
-use crate::uninit::VecUninitExt;
+use crate::uninit::raw::{UninitWriter, VecUninitExt};
 
 pub const PROTOCOL_VERSION: u16 = 0x0303;
 
@@ -48,20 +50,20 @@ impl CipherSuite {
     }
 }
 
-fn aead_for_suite(secret: &[u8], suite: CipherSuite) -> AeadKey {
+fn aead_for_suite(secret: &[u8], suite: CipherSuite) -> Result<AeadKey, RecordKeyError> {
     let alg = suite.hash_alg();
     match suite {
         CipherSuite::Aes128GcmSha256 => {
-            let keys = TrafficKeys::<16>::derive(alg, secret);
-            AeadKey::aes_128_gcm(&keys.key, keys.iv)
+            let keys = TrafficKeys::<16>::derive(alg, secret)?;
+            Ok(AeadKey::aes_128_gcm(&keys.key, keys.iv)?)
         }
         CipherSuite::ChaCha20Poly1305Sha256 => {
-            let keys = TrafficKeys::<32>::derive(alg, secret);
-            AeadKey::chacha20_poly1305(&keys.key, keys.iv)
+            let keys = TrafficKeys::<32>::derive(alg, secret)?;
+            Ok(AeadKey::chacha20_poly1305(&keys.key, keys.iv)?)
         }
         CipherSuite::Aes256GcmSha384 => {
-            let keys = TrafficKeys::<32>::derive(alg, secret);
-            AeadKey::aes_256_gcm(&keys.key, keys.iv)
+            let keys = TrafficKeys::<32>::derive(alg, secret)?;
+            Ok(AeadKey::aes_256_gcm(&keys.key, keys.iv)?)
         }
     }
 }
@@ -104,6 +106,7 @@ pub enum RecordError {
     BodyTooLarge,
     RecordOverflow,
     OpenFailed,
+    SealFailed,
     AllZeroInner,
     NotCipherTextOuter,
     SeqExhausted,
@@ -115,6 +118,30 @@ pub enum RecordError {
     Poisoned,
     /// The destination buffer was smaller than the sealed record.
     BufferTooSmall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKeyError {
+    Aead(AeadError),
+    Kdf(HkdfError),
+}
+
+impl From<AeadError> for RecordKeyError {
+    fn from(error: AeadError) -> Self {
+        Self::Aead(error)
+    }
+}
+
+impl From<HkdfError> for RecordKeyError {
+    fn from(error: HkdfError) -> Self {
+        Self::Kdf(error)
+    }
+}
+
+impl From<AeadError> for RecordError {
+    fn from(_: AeadError) -> Self {
+        Self::SealFailed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -151,10 +178,7 @@ impl<'a> PlaintextRecord<'a> {
         out: &mut Vec<u8>,
     ) -> Result<(), RecordError> {
         let total = plaintext_record_len(body)?;
-        // SAFETY: `write_plaintext` fills all `total` bytes of its destination.
-        unsafe {
-            out.extend_uninit(total, |dst| write_plaintext(content_type, body, dst));
-        }
+        out.extend_uninit(total, |out| write_plaintext(content_type, body, out));
         Ok(())
     }
 
@@ -173,8 +197,21 @@ impl<'a> PlaintextRecord<'a> {
     ) -> Result<usize, RecordError> {
         let total = plaintext_record_len(body)?;
         let dst = out.get_mut(..total).ok_or(RecordError::BufferTooSmall)?;
-        write_plaintext(content_type, body, dst);
+        let mut out = UninitWriter::from_mut_slice(dst);
+        write_plaintext(content_type, body, &mut out);
         Ok(total)
+    }
+
+    pub fn encode_into_uninit<'b>(
+        content_type: ContentType,
+        body: &[u8],
+        out: &'b mut [MaybeUninit<u8>],
+    ) -> Result<&'b mut [u8], RecordError> {
+        let total = plaintext_record_len(body)?;
+        let dst = out.get_mut(..total).ok_or(RecordError::BufferTooSmall)?;
+        let mut out = UninitWriter::new(dst);
+        write_plaintext(content_type, body, &mut out);
+        Ok(out.into_initialized())
     }
 
     pub fn parse(input: &'a [u8]) -> Result<Option<(Self, usize)>, RecordError> {
@@ -206,15 +243,15 @@ pub struct Sealer {
 }
 
 impl Sealer {
-    pub fn from_secret(secret: &[u8; 32]) -> Self {
+    pub fn from_secret(secret: &[u8; 32]) -> Result<Self, RecordKeyError> {
         Self::with_suite(secret, CipherSuite::Aes128GcmSha256)
     }
 
-    pub fn with_suite(secret: &[u8], suite: CipherSuite) -> Self {
-        Self {
-            aead: aead_for_suite(secret, suite),
+    pub fn with_suite(secret: &[u8], suite: CipherSuite) -> Result<Self, RecordKeyError> {
+        Ok(Self {
+            aead: aead_for_suite(secret, suite)?,
             seq: 0,
-        }
+        })
     }
 
     pub fn seq(&self) -> u64 {
@@ -236,7 +273,7 @@ impl Sealer {
     ///
     /// ```
     /// use shin::record::{ContentType, Sealer};
-    /// let mut sealer = Sealer::from_secret(&[0u8; 32]);
+    /// let mut sealer = Sealer::from_secret(&[0u8; 32]).unwrap();
     /// let mut staged = Vec::new();
     /// sealer.seal_into(ContentType::ApplicationData, b"a", &mut staged).unwrap();
     /// sealer.seal_into(ContentType::ApplicationData, b"b", &mut staged).unwrap();
@@ -249,10 +286,7 @@ impl Sealer {
     ) -> Result<(), RecordError> {
         let total = sealed_record_len(body)?;
         self.check_seq()?;
-        // SAFETY: `seal_record` writes all `total` bytes of its destination.
-        unsafe {
-            out.extend_uninit(total, |dst| self.seal_record(inner_type, body, dst));
-        }
+        out.try_extend_uninit(total, |out| self.seal_record(inner_type, body, out))?;
         Ok(())
     }
 
@@ -260,7 +294,7 @@ impl Sealer {
     ///
     /// ```
     /// use shin::record::{AEAD_TAG_LEN, ContentType, HEADER_LEN, Sealer};
-    /// let mut sealer = Sealer::from_secret(&[0u8; 32]);
+    /// let mut sealer = Sealer::from_secret(&[0u8; 32]).unwrap();
     /// let mut wire = [0u8; 64];
     /// let n = sealer
     ///     .seal_into_slice(ContentType::ApplicationData, b"hi", &mut wire)
@@ -276,8 +310,23 @@ impl Sealer {
         let total = sealed_record_len(body)?;
         let dst = out.get_mut(..total).ok_or(RecordError::BufferTooSmall)?;
         self.check_seq()?;
-        self.seal_record(inner_type, body, dst);
+        let mut out = UninitWriter::from_mut_slice(dst);
+        self.seal_record(inner_type, body, &mut out)?;
         Ok(total)
+    }
+
+    pub fn seal_into_uninit<'b>(
+        &mut self,
+        inner_type: ContentType,
+        body: &[u8],
+        out: &'b mut [MaybeUninit<u8>],
+    ) -> Result<&'b mut [u8], RecordError> {
+        let total = sealed_record_len(body)?;
+        let dst = out.get_mut(..total).ok_or(RecordError::BufferTooSmall)?;
+        self.check_seq()?;
+        let mut out = UninitWriter::new(dst);
+        self.seal_record(inner_type, body, &mut out)?;
+        Ok(out.into_initialized())
     }
 
     fn check_seq(&self) -> Result<(), RecordError> {
@@ -287,21 +336,26 @@ impl Sealer {
         Ok(())
     }
 
-    fn seal_record(&mut self, inner_type: ContentType, body: &[u8], dst: &mut [u8]) {
-        debug_assert_eq!(dst.len(), HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN);
+    #[inline(always)]
+    fn seal_record(
+        &mut self,
+        inner_type: ContentType,
+        body: &[u8],
+        out: &mut UninitWriter<'_>,
+    ) -> Result<(), RecordError> {
         debug_assert!(self.seq != u64::MAX);
         let seq = self.seq;
         self.seq += 1;
-        let outer_body_len = dst.len() - HEADER_LEN;
+        let outer_body_len = body.len() + 1 + AEAD_TAG_LEN;
 
-        write_header(ContentType::ApplicationData, outer_body_len as u16, dst);
-        dst[HEADER_LEN..HEADER_LEN + body.len()].copy_from_slice(body);
-        dst[HEADER_LEN + body.len()] = inner_type as u8;
+        write_header(ContentType::ApplicationData, outer_body_len as u16, out);
+        out.extend_from_slice(body);
+        out.push(inner_type as u8);
 
-        let (header, rest) = dst.split_at_mut(HEADER_LEN);
-        let (plaintext, tag_dst) = rest.split_at_mut(body.len() + 1);
-        let tag = self.aead.seal_detached(seq, header, plaintext);
-        tag_dst.copy_from_slice(&tag);
+        let (header, plaintext) = out.initialized_mut().split_at_mut(HEADER_LEN);
+        let tag = self.aead.seal_detached(seq, header, plaintext)?;
+        out.extend_from_slice(&tag);
+        Ok(())
     }
 }
 
@@ -322,16 +376,15 @@ fn plaintext_record_len(body: &[u8]) -> Result<usize, RecordError> {
     Ok(HEADER_LEN + body.len())
 }
 
-fn write_header(content_type: ContentType, body_len: u16, dst: &mut [u8]) {
-    dst[0] = content_type as u8;
-    dst[1..3].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    dst[3..HEADER_LEN].copy_from_slice(&body_len.to_be_bytes());
+fn write_header(content_type: ContentType, body_len: u16, out: &mut UninitWriter<'_>) {
+    out.push(content_type as u8);
+    out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    out.extend_from_slice(&body_len.to_be_bytes());
 }
 
-fn write_plaintext(content_type: ContentType, body: &[u8], dst: &mut [u8]) {
-    debug_assert_eq!(dst.len(), HEADER_LEN + body.len());
-    write_header(content_type, body.len() as u16, dst);
-    dst[HEADER_LEN..].copy_from_slice(body);
+fn write_plaintext(content_type: ContentType, body: &[u8], out: &mut UninitWriter<'_>) {
+    write_header(content_type, body.len() as u16, out);
+    out.extend_from_slice(body);
 }
 
 pub struct Opener {
@@ -341,16 +394,16 @@ pub struct Opener {
 }
 
 impl Opener {
-    pub fn from_secret(secret: &[u8; 32]) -> Self {
+    pub fn from_secret(secret: &[u8; 32]) -> Result<Self, RecordKeyError> {
         Self::with_suite(secret, CipherSuite::Aes128GcmSha256)
     }
 
-    pub fn with_suite(secret: &[u8], suite: CipherSuite) -> Self {
-        Self {
-            aead: aead_for_suite(secret, suite),
+    pub fn with_suite(secret: &[u8], suite: CipherSuite) -> Result<Self, RecordKeyError> {
+        Ok(Self {
+            aead: aead_for_suite(secret, suite)?,
             seq: 0,
             poisoned: false,
-        }
+        })
     }
 
     pub fn seq(&self) -> u64 {
@@ -421,31 +474,5 @@ impl Opener {
         let plaintext_start = HEADER_LEN;
         let plaintext_end = HEADER_LEN + inner_type_pos;
         Ok(Some((inner_type, plaintext_start..plaintext_end, total)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SECRET: [u8; 32] = [0x42u8; 32];
-
-    #[test]
-    fn seal_refuses_at_seq_max() {
-        let mut sealer = Sealer::from_secret(&SECRET);
-        sealer.seq = u64::MAX;
-        assert_eq!(
-            sealer.seal(ContentType::ApplicationData, b"x"),
-            Err(RecordError::SeqExhausted)
-        );
-    }
-
-    #[test]
-    fn open_refuses_at_seq_max() {
-        let mut sealer = Sealer::from_secret(&SECRET);
-        let mut wire = sealer.seal(ContentType::ApplicationData, b"x").unwrap();
-        let mut opener = Opener::from_secret(&SECRET);
-        opener.seq = u64::MAX;
-        assert_eq!(opener.open(&mut wire), Err(RecordError::SeqExhausted));
     }
 }

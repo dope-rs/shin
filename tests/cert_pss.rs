@@ -10,7 +10,7 @@ const SHA1_OID: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
 const RSASSA_PSS_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
 
 fn rsa_cert() -> Vec<u8> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rsa::rand_core::OsRng;
     let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
     let pkcs8 = priv_key.to_pkcs8_der().unwrap();
     let pki = PrivatePkcs8KeyDer::from(pkcs8.as_bytes().to_vec());

@@ -66,7 +66,7 @@ fn strip_key_share(ch_bytes: &[u8]) -> Vec<u8> {
     };
     ch.extensions.retain(|e| e.ty != ExtensionType::KEY_SHARE);
     let mut out = Vec::new();
-    Handshake::ClientHello(ch).encode(&mut out);
+    Handshake::ClientHello(ch).encode(&mut out).unwrap();
     out
 }
 
@@ -110,7 +110,7 @@ fn craft_hrr() -> Vec<u8> {
         ],
     };
     let mut out = Vec::new();
-    Handshake::ServerHello(sh).encode(&mut out);
+    Handshake::ServerHello(sh).encode(&mut out).unwrap();
     out
 }
 
@@ -121,7 +121,10 @@ fn post_hrr_binder(psk: &[u8; 32], ch1: &[u8], hrr: &[u8], ch2: &[u8]) -> Vec<u8
     t.update(hrr);
     t.update(&ch2[..ch2.len() - BINDERS_FIELD_LEN]);
     let partial = t.hash(HashAlg::Sha256);
-    ResumptionBinder::compute(psk, partial.as_slice()).to_vec()
+    ResumptionBinder::compute(psk, partial.as_slice())
+        .unwrap()
+        .as_slice()
+        .to_vec()
 }
 
 fn obtain_resumption() -> Resumption {
@@ -235,8 +238,9 @@ fn server_rejects_psk_binder_ignoring_hrr_prefix() {
     let n = ch2.len();
     let mut fresh = Transcript::new();
     fresh.update(&ch2[..n - BINDERS_FIELD_LEN]);
-    let wrong = ResumptionBinder::compute(&resumption.psk, fresh.hash(HashAlg::Sha256).as_slice());
-    ch2[n - 32..].copy_from_slice(&wrong);
+    let wrong =
+        ResumptionBinder::compute(&resumption.psk, fresh.hash(HashAlg::Sha256).as_slice()).unwrap();
+    ch2[n - 32..].copy_from_slice(wrong.as_slice());
 
     let types = handshake_types(&send(
         &server.read(Epoch::Plaintext, &ch2).unwrap(),

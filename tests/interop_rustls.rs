@@ -20,13 +20,13 @@ const HOSTNAME: &str = "host.local";
 
 fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     let mut r = Reader::new(pkcs8);
-    let inner = r.expect(Tag::SEQUENCE).ok()?;
+    let inner = r.read_tagged(Tag::SEQUENCE).ok()?;
     let mut ir = Reader::new(inner);
-    let _version = ir.expect(Tag::INTEGER).ok()?;
-    let _alg = ir.expect(Tag::SEQUENCE).ok()?;
-    let outer_oct = ir.expect(Tag::OCTET_STRING).ok()?;
+    let _version = ir.read_tagged(Tag::INTEGER).ok()?;
+    let _alg = ir.read_tagged(Tag::SEQUENCE).ok()?;
+    let outer_oct = ir.read_tagged(Tag::OCTET_STRING).ok()?;
     let mut or = Reader::new(outer_oct);
-    let inner_oct = or.expect(Tag::OCTET_STRING).ok()?;
+    let inner_oct = or.read_tagged(Tag::OCTET_STRING).ok()?;
     if inner_oct.len() != 32 {
         return None;
     }
@@ -179,10 +179,6 @@ fn has_done(events: &[Event]) -> bool {
     events.iter().any(|e| matches!(e, Event::Done))
 }
 
-fn plaintext_record(content_type: ContentType, body: &[u8]) -> Vec<u8> {
-    PlaintextRecord::encode(content_type, body).unwrap()
-}
-
 fn split_records(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -329,7 +325,10 @@ fn drive_shin_client_vs_rustls_server(suite: CipherSuite) {
     // ClientHello -> rustls server.
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext);
-    feed_rustls(&mut server, &plaintext_record(ContentType::Handshake, &ch));
+    feed_rustls(
+        &mut server,
+        &PlaintextRecord::encode(ContentType::Handshake, &ch).unwrap(),
+    );
 
     // Server's first flight: ServerHello (plaintext) [+ CCS] + encrypted EE/Cert/CV/Finished.
     let server_flight = drain_rustls(&mut server);
@@ -344,8 +343,8 @@ fn drive_shin_client_vs_rustls_server(suite: CipherSuite) {
                 let body = &rec[5..];
                 let c2 = client.read(Epoch::Plaintext, body).unwrap();
                 let (hs_r, hs_w) = extract_keys(&c2, Epoch::Handshake);
-                hs_opener = Some(Opener::with_suite(hs_r.as_slice(), suite));
-                hs_sealer = Some(Sealer::with_suite(hs_w.as_slice(), suite));
+                hs_opener = Some(Opener::with_suite(hs_r.as_slice(), suite).unwrap());
+                hs_sealer = Some(Sealer::with_suite(hs_w.as_slice(), suite).unwrap());
             }
             x if x == ContentType::ChangeCipherSpec as u8 => {}
             x if x == ContentType::ApplicationData as u8 => {
@@ -381,8 +380,8 @@ fn drive_shin_client_vs_rustls_server(suite: CipherSuite) {
     );
     assert_eq!(client.negotiated_cipher_suite(), Some(suite));
 
-    let mut app_sealer = Sealer::with_suite(app_write.as_slice(), suite);
-    let mut app_opener = Opener::with_suite(app_read.as_slice(), suite);
+    let mut app_sealer = Sealer::with_suite(app_write.as_slice(), suite).unwrap();
+    let mut app_opener = Opener::with_suite(app_read.as_slice(), suite).unwrap();
 
     // shin client -> rustls server application data.
     let payload_c2s = b"hello from shin client";
@@ -434,11 +433,11 @@ fn drive_shin_server_vs_rustls_client(suite: CipherSuite) {
     let (hs_r, hs_w) = extract_keys(&s1, Epoch::Handshake);
     let (ap_r, ap_w) = extract_keys(&s1, Epoch::Application);
 
-    let mut hs_sealer = Sealer::with_suite(hs_w.as_slice(), suite);
-    let mut hs_opener = Opener::with_suite(hs_r.as_slice(), suite);
+    let mut hs_sealer = Sealer::with_suite(hs_w.as_slice(), suite).unwrap();
+    let mut hs_opener = Opener::with_suite(hs_r.as_slice(), suite).unwrap();
 
     // ServerHello (plaintext) + encrypted EE/Cert/CV/Finished -> rustls client.
-    let mut to_client = plaintext_record(ContentType::Handshake, &sh);
+    let mut to_client = PlaintextRecord::encode(ContentType::Handshake, &sh).unwrap();
     to_client.extend_from_slice(&hs_sealer.seal(ContentType::Handshake, &s_hs).unwrap());
     feed_rustls(&mut client, &to_client);
 
@@ -467,8 +466,8 @@ fn drive_shin_server_vs_rustls_client(suite: CipherSuite) {
     );
     assert_eq!(server.negotiated_cipher_suite(), Some(suite));
 
-    let mut app_sealer = Sealer::with_suite(ap_w.as_slice(), suite);
-    let mut app_opener = Opener::with_suite(ap_r.as_slice(), suite);
+    let mut app_sealer = Sealer::with_suite(ap_w.as_slice(), suite).unwrap();
+    let mut app_opener = Opener::with_suite(ap_r.as_slice(), suite).unwrap();
 
     // shin server -> rustls client application data.
     let payload_s2c = b"hello from shin server";

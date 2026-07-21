@@ -31,14 +31,6 @@ mod uninit;
 pub mod client;
 pub mod server;
 
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
-}
-
 /// Per-connection wall clock, milliseconds since the UNIX epoch. Any
 /// `Fn() -> u64` is a `Clock`: `Client::new(config, || now_ms())`.
 pub trait Clock {
@@ -258,6 +250,12 @@ impl From<crate::codec::DecodeError> for Error {
 
 impl From<crate::codec::EncodeError> for Error {
     fn from(_: crate::codec::EncodeError) -> Self {
+        Self::Encode
+    }
+}
+
+impl From<crate::kdf::HkdfError> for Error {
+    fn from(_: crate::kdf::HkdfError) -> Self {
         Self::Encode
     }
 }

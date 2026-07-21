@@ -29,7 +29,9 @@ fn parse_rejects_bad_length_and_unknown() {
 
 #[test]
 fn plaintext_record_is_well_formed() {
-    let rec = Alert::fatal(AlertDescription::HandshakeFailure).to_plaintext_record();
+    let rec = Alert::fatal(AlertDescription::HandshakeFailure)
+        .to_plaintext_record()
+        .unwrap();
     assert_eq!(rec[0], ContentType::Alert as u8);
     assert_eq!(&rec[3..5], &[0, 2]);
     assert_eq!(&rec[5..7], &[2, 40]);

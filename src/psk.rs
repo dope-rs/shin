@@ -2,9 +2,10 @@ use alloc::vec::Vec;
 
 use ring::hmac;
 
-use crate::codec::{DecodeError, Encode, Reader};
+use crate::codec::{DecodeError, Encode, EncodeError, Reader};
 use crate::hash::{HASH_LEN, HashAlg, Transcript};
-use crate::kdf::Hkdf;
+use crate::kdf::{Hkdf, HkdfError};
+use zeroize::Zeroize;
 
 pub const KX_MODE_PSK_DHE: u8 = 1;
 
@@ -18,43 +19,74 @@ pub struct PskIdentity {
     pub obfuscated_ticket_age: u32,
 }
 
-pub struct KxModes;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KxModes(Vec<u8>);
 
 impl KxModes {
-    pub fn encode(modes: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + modes.len());
-        out.put_vec_u8(|o| o.put_slice(modes));
-        out
+    pub fn new(modes: Vec<u8>) -> Self {
+        Self(modes)
     }
 
-    pub fn decode(data: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut out = Vec::with_capacity(1 + self.0.len());
+        out.put_vec_u8(|o| {
+            o.put_slice(&self.0);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(data);
         let modes = r.vec_u8()?.to_vec();
         r.finish()?;
-        Ok(modes)
+        Ok(Self(modes))
     }
 }
 
-pub struct Offer;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub identities: Vec<PskIdentity>,
+    pub binders: Vec<Vec<u8>>,
+}
 
 impl Offer {
-    pub fn encode(identities: &[PskIdentity], binders: &[Vec<u8>]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.put_vec_u16(|o| {
-            for id in identities {
-                o.put_vec_u16(|oo| oo.put_slice(&id.identity));
-                o.put_u32(id.obfuscated_ticket_age);
-            }
-        });
-        out.put_vec_u16(|o| {
-            for b in binders {
-                o.put_vec_u8(|oo| oo.put_slice(b));
-            }
-        });
-        out
+    pub fn new(identities: Vec<PskIdentity>, binders: Vec<Vec<u8>>) -> Self {
+        Self {
+            identities,
+            binders,
+        }
     }
 
-    pub fn decode(data: &[u8]) -> Result<(Vec<PskIdentity>, Vec<Vec<u8>>), DecodeError> {
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut out = Vec::new();
+        out.put_vec_u16(|o| {
+            for id in &self.identities {
+                o.put_vec_u16(|oo| {
+                    oo.put_slice(&id.identity);
+                    Ok(())
+                })?;
+                o.put_u32(id.obfuscated_ticket_age);
+            }
+            Ok(())
+        })?;
+        out.put_vec_u16(|o| {
+            for b in &self.binders {
+                o.put_vec_u8(|oo| {
+                    oo.put_slice(b);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(data);
         let mut id_sub = r.sub_u16()?;
         let mut identities = Vec::new();
@@ -75,51 +107,63 @@ impl Offer {
         if identities.len() != binders.len() {
             return Err(DecodeError::Trailing);
         }
-        Ok((identities, binders))
+        Ok(Self {
+            identities,
+            binders,
+        })
     }
 }
 
-pub struct SelectedIdentity;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedIdentity(u16);
 
 impl SelectedIdentity {
-    pub fn encode(selected_identity: u16) -> Vec<u8> {
+    pub fn new(selected_identity: u16) -> Self {
+        Self(selected_identity)
+    }
+
+    pub fn get(self) -> u16 {
+        self.0
+    }
+
+    pub fn encode(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(2);
-        out.put_u16(selected_identity);
+        out.put_u16(self.0);
         out
     }
 
-    pub fn decode(data: &[u8]) -> Result<u16, DecodeError> {
+    pub fn decode(data: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(data);
         let v = r.u16()?;
         r.finish()?;
-        Ok(v)
+        Ok(Self(v))
     }
 }
 
-pub struct ResumptionBinder;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumptionBinder([u8; HASH_LEN]);
 
 impl ResumptionBinder {
-    pub fn compute(psk: &[u8; HASH_LEN], partial_ch_hash: &[u8]) -> [u8; HASH_LEN] {
+    pub fn compute(psk: &[u8; HASH_LEN], partial_ch_hash: &[u8]) -> Result<Self, HkdfError> {
         let zero = [0u8; HASH_LEN];
-        let early_secret = Hkdf::extract(RESUMPTION_HASH, &zero, psk);
-        let binder_key = Hkdf::derive_secret(
-            RESUMPTION_HASH,
+        let hkdf = Hkdf::new(RESUMPTION_HASH);
+        let early_secret = hkdf.extract(&zero, psk);
+        let binder_key = hkdf.derive_secret(
             early_secret.as_slice(),
             "res binder",
             Transcript::hash_empty(RESUMPTION_HASH).as_slice(),
-        );
+        )?;
         let mut finished_key = [0u8; HASH_LEN];
-        Hkdf::expand_label(
-            RESUMPTION_HASH,
-            binder_key.as_slice(),
-            "finished",
-            &[],
-            &mut finished_key,
-        );
-        let key = hmac::Key::new(crate::kdf::hmac_alg(RESUMPTION_HASH), &finished_key);
+        hkdf.expand_label(binder_key.as_slice(), "finished", &[], &mut finished_key)?;
+        let key = hmac::Key::new(RESUMPTION_HASH.hmac(), &finished_key);
         let tag = hmac::sign(&key, partial_ch_hash);
         let mut out = [0u8; HASH_LEN];
         out.copy_from_slice(tag.as_ref());
-        out
+        finished_key.zeroize();
+        Ok(Self(out))
+    }
+
+    pub fn as_slice(&self) -> &[u8; HASH_LEN] {
+        &self.0
     }
 }

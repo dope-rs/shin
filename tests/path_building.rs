@@ -77,7 +77,9 @@ fn accepts_reordered_intermediates() {
 
     // Intermediates presented out of order (im1 before im2).
     let shuffled = [leaf.clone(), c_im1.clone(), c_im2.clone()];
-    Chain::validate(&shuffled, &anchors, now, b"host.local").expect("reordered chain validates");
+    Chain::new(&shuffled)
+        .validate(&anchors, now, b"host.local")
+        .expect("reordered chain validates");
 }
 
 #[test]
@@ -95,7 +97,9 @@ fn tolerates_extra_unrelated_cert() {
     let anchors = [TrustAnchor::from_cert(&c_root)];
 
     let chain = [leaf.clone(), c_extra, c_im];
-    Chain::validate(&chain, &anchors, now, b"host.local").expect("extra cert tolerated");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"host.local")
+        .expect("extra cert tolerated");
 }
 
 #[test]
@@ -119,7 +123,9 @@ fn tries_alternate_cross_signed_anchors() {
         TrustAnchor::from_cert(&c_root_b),
         TrustAnchor::from_cert(&c_root_a),
     ];
-    Chain::validate(&chain, &anchors, now, b"host.local").expect("alternate anchor tried");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"host.local")
+        .expect("alternate anchor tried");
 }
 
 #[test]
@@ -136,7 +142,9 @@ fn rejects_intermediate_without_server_auth_eku() {
 
     let chain = [leaf.clone(), c_im];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::NoServerAuth,
     );
 }
@@ -154,7 +162,9 @@ fn accepts_intermediate_with_server_auth_eku() {
     let anchors = [TrustAnchor::from_cert(&c_root)];
 
     let chain = [leaf.clone(), c_im];
-    Chain::validate(&chain, &anchors, now, b"host.local").expect("serverAuth EKU CA is fine");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"host.local")
+        .expect("serverAuth EKU CA is fine");
 }
 
 #[test]
@@ -181,7 +191,9 @@ fn rejects_duplicate_extension() {
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::DuplicateExtension,
     );
 }

@@ -66,8 +66,8 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
         .find(|e| e.ty == ExtensionType::PSK_KEY_EXCHANGE_MODES)
         .expect("psk_kx_modes ext expected");
     assert_eq!(
-        KxModes::decode(&kx_ext.data).unwrap(),
-        vec![KX_MODE_PSK_DHE]
+        KxModes::decode(&kx_ext.data).unwrap().as_slice(),
+        &[KX_MODE_PSK_DHE]
     );
 
     let psk_ext = ch
@@ -75,17 +75,17 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
         .iter()
         .find(|e| e.ty == ExtensionType::PRE_SHARED_KEY)
         .expect("pre_shared_key ext expected");
-    let (ids, binders) = Offer::decode(&psk_ext.data).unwrap();
-    assert_eq!(ids.len(), 1);
-    assert_eq!(ids[0].identity, vec![0xAA; 64]);
+    let offer = Offer::decode(&psk_ext.data).unwrap();
+    assert_eq!(offer.identities.len(), 1);
+    assert_eq!(offer.identities[0].identity, vec![0xAA; 64]);
     assert_eq!(
-        ids[0].obfuscated_ticket_age,
+        offer.identities[0].obfuscated_ticket_age,
         12_345u32.wrapping_add(0xCAFEBABE),
     );
-    assert_eq!(binders.len(), 1);
-    assert_eq!(binders[0].len(), 32);
+    assert_eq!(offer.binders.len(), 1);
+    assert_eq!(offer.binders[0].len(), 32);
     assert!(
-        !binders[0].iter().all(|&b| b == 0),
+        !offer.binders[0].iter().all(|&b| b == 0),
         "binder must be computed, not placeholder zeros",
     );
 }
@@ -141,25 +141,25 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
             .iter()
             .find(|e| e.ty == ExtensionType::PRE_SHARED_KEY)
             .unwrap();
-        Offer::decode(&psk_ext.data).unwrap().1[0].clone()
+        Offer::decode(&psk_ext.data).unwrap().binders[0].clone()
     };
 
     let n = ch_bytes.len();
 
     let mut t_ok = Transcript::new();
     t_ok.update(&ch_bytes[..n - 35]);
-    let expected = ResumptionBinder::compute(&psk, t_ok.hash(HashAlg::Sha256).as_slice());
+    let expected = ResumptionBinder::compute(&psk, t_ok.hash(HashAlg::Sha256).as_slice()).unwrap();
     assert_eq!(
         on_wire_binder,
-        expected.to_vec(),
+        expected.as_slice().to_vec(),
         "binder must cover len-35"
     );
 
     // len-32 (off by 3) must NOT match.
     let mut t_bad = Transcript::new();
     t_bad.update(&ch_bytes[..n - 32]);
-    let wrong = ResumptionBinder::compute(&psk, t_bad.hash(HashAlg::Sha256).as_slice());
-    assert_ne!(on_wire_binder, wrong.to_vec());
+    let wrong = ResumptionBinder::compute(&psk, t_bad.hash(HashAlg::Sha256).as_slice()).unwrap();
+    assert_ne!(on_wire_binder, wrong.as_slice().to_vec());
 }
 
 #[test]

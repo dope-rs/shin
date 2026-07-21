@@ -50,7 +50,7 @@ fn strip_key_share(ch_bytes: &[u8]) -> Vec<u8> {
     };
     ch.extensions.retain(|e| e.ty != ExtensionType::KEY_SHARE);
     let mut out = Vec::new();
-    Handshake::ClientHello(ch).encode(&mut out);
+    Handshake::ClientHello(ch).encode(&mut out).unwrap();
     out
 }
 

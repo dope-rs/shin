@@ -92,8 +92,8 @@ fn handshake_completes_over_aes256_sha384() {
     assert_eq!(c_write, s_read);
 
     // Records protect/parse end to end under AES-256-GCM with these secrets.
-    let mut sealer = Sealer::with_suite(c_write.as_slice(), CipherSuite::Aes256GcmSha384);
-    let mut opener = Opener::with_suite(s_read.as_slice(), CipherSuite::Aes256GcmSha384);
+    let mut sealer = Sealer::with_suite(c_write.as_slice(), CipherSuite::Aes256GcmSha384).unwrap();
+    let mut opener = Opener::with_suite(s_read.as_slice(), CipherSuite::Aes256GcmSha384).unwrap();
     let mut wire = sealer
         .seal(ContentType::ApplicationData, b"hello over aes-256")
         .unwrap();

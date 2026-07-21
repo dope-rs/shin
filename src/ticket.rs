@@ -33,7 +33,9 @@ impl TicketSecret {
 
     fn aead_key(&self) -> Result<LessSafeKey, TicketError> {
         let mut key_bytes = [0u8; 16];
-        Hkdf::expand_label(HashAlg::Sha256, &self.0, "ticket", &[], &mut key_bytes);
+        Hkdf::new(HashAlg::Sha256)
+            .expand_label(&self.0, "ticket", &[], &mut key_bytes)
+            .map_err(|_| TicketError::BadKey)?;
         let unbound =
             UnboundKey::new(&aead::AES_128_GCM, &key_bytes).map_err(|_| TicketError::BadKey)?;
         Ok(LessSafeKey::new(unbound))

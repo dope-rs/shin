@@ -32,16 +32,12 @@ fn root(cn: &str) -> Ca {
     Ca { params, key, der }
 }
 
-fn issuer_of(ca: &Ca) -> Issuer<'_, &KeyPair> {
-    Issuer::from_params(&ca.params, &ca.key)
-}
-
 fn intermediate(cn: &str, nc: NameConstraints, parent: &Ca) -> Ca {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let params = ca_params(cn, Some(nc));
     let der = params
         .clone()
-        .signed_by(&key, &issuer_of(parent))
+        .signed_by(&key, &Issuer::from_params(&parent.params, &parent.key))
         .unwrap()
         .der()
         .to_vec();
@@ -58,7 +54,7 @@ fn leaf(san: &str, parent: &Ca) -> Vec<u8> {
     params.is_ca = IsCa::NoCa;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params
-        .signed_by(&key, &issuer_of(parent))
+        .signed_by(&key, &Issuer::from_params(&parent.params, &parent.key))
         .unwrap()
         .der()
         .to_vec()
@@ -82,7 +78,7 @@ fn run(im_nc: NameConstraints, san: &str, host: &[u8]) -> Result<(), ChainError>
 
     let chain = [leaf_cert.clone(), im_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
-    Chain::validate(&chain, &anchors, now, host)
+    Chain::new(&chain).validate(&anchors, now, host)
 }
 
 fn permit(subtrees: Vec<GeneralSubtree>) -> NameConstraints {

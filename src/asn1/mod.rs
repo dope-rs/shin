@@ -81,7 +81,7 @@ impl<'a> Reader<'a> {
         Ok(tlv)
     }
 
-    pub fn expect(&mut self, tag: Tag) -> Result<&'a [u8], DerError> {
+    pub fn read_tagged(&mut self, tag: Tag) -> Result<&'a [u8], DerError> {
         let tlv = self.next()?;
         if tlv.tag != tag {
             return Err(DerError::Mismatch);
@@ -95,7 +95,7 @@ impl<'a> Reader<'a> {
 
     pub fn read_optional(&mut self, tag: Tag) -> Result<Option<&'a [u8]>, DerError> {
         if self.peek_tag() == Some(tag) {
-            Ok(Some(self.expect(tag)?))
+            Ok(Some(self.read_tagged(tag)?))
         } else {
             Ok(None)
         }

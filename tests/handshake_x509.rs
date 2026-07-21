@@ -31,13 +31,13 @@ fn ed25519_self_signed() -> (Vec<u8>, SigningKey) {
 
 fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     let mut r = Reader::new(pkcs8);
-    let inner = r.expect(Tag::SEQUENCE).ok()?;
+    let inner = r.read_tagged(Tag::SEQUENCE).ok()?;
     let mut ir = Reader::new(inner);
-    let _version = ir.expect(Tag::INTEGER).ok()?;
-    let _alg = ir.expect(Tag::SEQUENCE).ok()?;
-    let outer_oct = ir.expect(Tag::OCTET_STRING).ok()?;
+    let _version = ir.read_tagged(Tag::INTEGER).ok()?;
+    let _alg = ir.read_tagged(Tag::SEQUENCE).ok()?;
+    let outer_oct = ir.read_tagged(Tag::OCTET_STRING).ok()?;
     let mut or = Reader::new(outer_oct);
-    let inner_oct = or.expect(Tag::OCTET_STRING).ok()?;
+    let inner_oct = or.read_tagged(Tag::OCTET_STRING).ok()?;
     if inner_oct.len() != 32 {
         return None;
     }

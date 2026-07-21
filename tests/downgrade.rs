@@ -49,7 +49,7 @@ fn server_hello_bytes(random_tail: [u8; 8], echo: Vec<u8>) -> Vec<u8> {
         ],
     };
     let mut bytes = Vec::new();
-    Handshake::ServerHello(sh).encode(&mut bytes);
+    Handshake::ServerHello(sh).encode(&mut bytes).unwrap();
     bytes
 }
 

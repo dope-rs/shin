@@ -1,9 +1,14 @@
-pub struct Hostname;
+#[derive(Clone, Copy)]
+pub struct Hostname<'a>(&'a [u8]);
 
-impl Hostname {
-    pub fn dns_matches(presented: &[u8], reference: &[u8]) -> bool {
+impl<'a> Hostname<'a> {
+    pub fn new(reference: &'a [u8]) -> Self {
+        Self(reference)
+    }
+
+    pub fn matches_dns(self, presented: &[u8]) -> bool {
         let presented = Self::trim_trailing_dot(presented);
-        let reference = Self::trim_trailing_dot(reference);
+        let reference = Self::trim_trailing_dot(self.0);
 
         if !Self::valid_name(presented) || !Self::valid_name(reference) {
             return false;
@@ -41,11 +46,12 @@ impl Hostname {
         !name.windows(2).any(|w| w == b"..")
     }
 
-    pub fn ip_matches(presented: &[u8], reference: &[u8]) -> bool {
-        presented == reference
+    pub fn matches_ip(self, presented: &[u8]) -> bool {
+        presented == self.0
     }
 
-    pub fn is_ip_literal(h: &[u8]) -> bool {
+    pub fn is_ip_literal(self) -> bool {
+        let h = self.0;
         if h.is_empty() {
             return false;
         }

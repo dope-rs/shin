@@ -63,48 +63,42 @@ impl LeafKey {
             _ => Err(Error::UnsupportedSigScheme),
         }
     }
-}
 
-/// Extract the leaf key from a RawPublicKey (RFC 7250) certificate entry, whose
-/// `cert_data` is a bare SubjectPublicKeyInfo.
-pub(crate) fn raw_public_key_leaf(spki_der: &[u8]) -> Result<LeafKey, Error> {
-    match SubjectPublicKey::decode(spki_der).map_err(|_| Error::Spki)? {
-        SubjectPublicKey::Ed25519(pk) => Ok(LeafKey {
-            kind: LeafKeyKind::Ed25519,
-            raw: pk.to_vec(),
-        }),
-        SubjectPublicKey::EcdsaP256(uncompressed) => Ok(LeafKey {
-            kind: LeafKeyKind::Ecdsa,
-            raw: uncompressed,
-        }),
-        SubjectPublicKey::EcdsaP384(uncompressed) => Ok(LeafKey {
-            kind: LeafKeyKind::Ecdsa,
-            raw: uncompressed,
-        }),
+    pub(crate) fn from_spki(spki_der: &[u8]) -> Result<Self, Error> {
+        match SubjectPublicKey::decode(spki_der).map_err(|_| Error::Spki)? {
+            SubjectPublicKey::Ed25519(pk) => Ok(Self {
+                kind: LeafKeyKind::Ed25519,
+                raw: pk.to_vec(),
+            }),
+            SubjectPublicKey::EcdsaP256(uncompressed) => Ok(Self {
+                kind: LeafKeyKind::Ecdsa,
+                raw: uncompressed,
+            }),
+            SubjectPublicKey::EcdsaP384(uncompressed) => Ok(Self {
+                kind: LeafKeyKind::Ecdsa,
+                raw: uncompressed,
+            }),
+        }
     }
-}
 
-/// Parse an X.509 leaf certificate and extract its public key plus the raw
-/// SubjectPublicKeyInfo DER (a uniform pinning target across key types). This
-/// does NOT validate a chain or trust anchors — the caller pins the returned
-/// key/SPKI (the `authorized_keys` model).
-pub(crate) fn x509_leaf_key(leaf_der: &[u8]) -> Result<(LeafKey, Vec<u8>), Error> {
-    let cert = Cert::parse(leaf_der).map_err(Error::BadCertificateParse)?;
-    let spki = cert.spki;
-    let kind = if spki.algorithm.oid == crate::cert::OID_ED25519 {
-        LeafKeyKind::Ed25519
-    } else if spki.algorithm.oid == crate::cert::OID_EC_PUBLIC_KEY {
-        LeafKeyKind::Ecdsa
-    } else if spki.algorithm.oid == crate::cert::OID_RSA_ENCRYPTION {
-        LeafKeyKind::Rsa
-    } else {
-        return Err(Error::UnsupportedSigScheme);
-    };
-    Ok((
-        LeafKey {
-            kind,
-            raw: spki.subject_public_key.to_vec(),
-        },
-        spki.raw_der.to_vec(),
-    ))
+    pub(crate) fn parse_x509(leaf_der: &[u8]) -> Result<(Self, Vec<u8>), Error> {
+        let cert = Cert::parse(leaf_der).map_err(Error::BadCertificateParse)?;
+        let spki = cert.spki;
+        let kind = if spki.algorithm.oid == crate::cert::OID_ED25519 {
+            LeafKeyKind::Ed25519
+        } else if spki.algorithm.oid == crate::cert::OID_EC_PUBLIC_KEY {
+            LeafKeyKind::Ecdsa
+        } else if spki.algorithm.oid == crate::cert::OID_RSA_ENCRYPTION {
+            LeafKeyKind::Rsa
+        } else {
+            return Err(Error::UnsupportedSigScheme);
+        };
+        Ok((
+            Self {
+                kind,
+                raw: spki.subject_public_key.to_vec(),
+            },
+            spki.raw_der.to_vec(),
+        ))
+    }
 }

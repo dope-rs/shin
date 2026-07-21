@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
 
 use crate::cert::{
-    BasicConstraints, Cert, ExtensionIter, GeneralName, KeyUsage, NameConstraints, OID_EKU_ANY,
-    OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE,
-    OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, SubjectPublicKeyInfo, VerifyError, is_handled_ext,
+    BasicConstraints, Cert, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage, NameConstraints,
+    OID_EKU_ANY, OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE,
+    OID_EXT_KEY_USAGE, OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, SubjectPublicKeyInfo, VerifyError,
 };
 use crate::hostname::Hostname;
 use crate::time::UnixTime;
@@ -86,7 +86,7 @@ impl<'a> ParsedExt<'a> {
                 return Err(ChainError::DuplicateExtension);
             }
             seen.push(ext.oid);
-            if ext.critical && !is_handled_ext(ext.oid) {
+            if ext.critical && !ExtensionEntry::is_handled(ext.oid) {
                 return Err(ChainError::UnhandledCriticalExtension);
             }
             if ext.oid == OID_EXT_BASIC_CONSTRAINTS {
@@ -123,15 +123,22 @@ struct LeafSan<'a> {
     ip: Vec<&'a [u8]>,
 }
 
-pub struct Chain;
+pub struct Chain<'a, 'der> {
+    certs: &'a [Cert<'der>],
+}
 
-impl Chain {
+impl<'a, 'der> Chain<'a, 'der> {
+    pub fn new(certs: &'a [Cert<'der>]) -> Self {
+        Self { certs }
+    }
+
     pub fn validate(
-        chain: &[Cert<'_>],
+        &self,
         trust_anchors: &[TrustAnchor<'_>],
         now: UnixTime,
         hostname_dns_id: &[u8],
     ) -> Result<(), ChainError> {
+        let chain = self.certs;
         if chain.is_empty() {
             return Err(ChainError::Empty);
         }
@@ -190,9 +197,10 @@ impl Chain {
     fn order_chain(chain: &[Cert<'_>]) -> Vec<usize> {
         let mut used = alloc::vec![false; chain.len()];
         let mut path = alloc::vec![0usize];
+        let mut current_index = 0;
         used[0] = true;
         loop {
-            let current = &chain[*path.last().unwrap()];
+            let current = &chain[current_index];
             let matches: Vec<usize> = chain
                 .iter()
                 .enumerate()
@@ -210,6 +218,7 @@ impl Chain {
             };
             used[chosen] = true;
             path.push(chosen);
+            current_index = chosen;
         }
         path
     }
@@ -355,7 +364,11 @@ impl Chain {
     fn check_hostname(leaf_san: &LeafSan<'_>, host: &[u8]) -> Result<(), ChainError> {
         match Self::parse_ip(host) {
             Some(target) => {
-                if leaf_san.ip.iter().any(|p| Hostname::ip_matches(p, &target)) {
+                if leaf_san
+                    .ip
+                    .iter()
+                    .any(|p| Hostname::new(&target).matches_ip(p))
+                {
                     return Ok(());
                 }
             }
@@ -364,7 +377,7 @@ impl Chain {
                 if leaf_san
                     .dns
                     .iter()
-                    .any(|d| Hostname::dns_matches(d, &lowered))
+                    .any(|d| Hostname::new(&lowered).matches_dns(d))
                 {
                     return Ok(());
                 }

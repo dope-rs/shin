@@ -1,17 +1,12 @@
 use ring::digest::{Context, SHA256, SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN};
 
+use zeroize::Zeroize;
+
 pub const HASH_LEN: usize = SHA256_OUTPUT_LEN;
 
 /// Largest hash output handled (SHA-384). Fixed-size secret buffers use this so
 /// one inline type spans both SHA-256 (32) and SHA-384 (48) suites.
 pub const MAX_HASH_LEN: usize = SHA384_OUTPUT_LEN;
-
-pub fn sha256(data: &[u8]) -> [u8; HASH_LEN] {
-    let d = ring::digest::digest(&SHA256, data);
-    let mut out = [0u8; HASH_LEN];
-    out.copy_from_slice(d.as_ref());
-    out
-}
 
 /// The transcript / key-schedule hash a cipher suite ties to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +27,13 @@ impl HashAlg {
         match self {
             Self::Sha256 => &SHA256,
             Self::Sha384 => &SHA384,
+        }
+    }
+
+    pub(crate) fn hmac(self) -> ring::hmac::Algorithm {
+        match self {
+            Self::Sha256 => ring::hmac::HMAC_SHA256,
+            Self::Sha384 => ring::hmac::HMAC_SHA384,
         }
     }
 
@@ -72,6 +74,11 @@ impl Digest {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn ct_eq(&self, other: &[u8]) -> bool {
+        use subtle::ConstantTimeEq;
+        self.len == other.len() && bool::from(self.as_slice().ct_eq(other))
     }
 }
 
@@ -130,7 +137,7 @@ impl Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        crate::schedule::zeroize(&mut self.bytes);
+        self.bytes.zeroize();
     }
 }
 

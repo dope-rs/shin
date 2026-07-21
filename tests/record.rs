@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use shin::aead::AeadKey;
 use shin::hash::HashAlg;
 use shin::record::{
@@ -12,14 +14,14 @@ const TEST_SECRET: [u8; 32] = [
 ];
 
 fn craft_wire(seq: u64, inner_plaintext: &[u8]) -> Vec<u8> {
-    let keys = TrafficKeys::<16>::derive(HashAlg::Sha256, &TEST_SECRET);
-    let aead = AeadKey::aes_128_gcm(&keys.key, keys.iv);
+    let keys = TrafficKeys::<16>::derive(HashAlg::Sha256, &TEST_SECRET).unwrap();
+    let aead = AeadKey::aes_128_gcm(&keys.key, keys.iv).unwrap();
     let outer_body_len = inner_plaintext.len() + AEAD_TAG_LEN;
     let mut wire = Vec::with_capacity(HEADER_LEN);
     wire.push(ContentType::ApplicationData as u8);
     wire.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
     wire.extend_from_slice(&(outer_body_len as u16).to_be_bytes());
-    let ct = aead.seal(seq, &wire, inner_plaintext);
+    let ct = aead.seal(seq, &wire, inner_plaintext).unwrap();
     wire.extend_from_slice(&ct);
     wire
 }
@@ -64,8 +66,8 @@ fn parse_plaintext_rejects_unknown_content_type() {
 
 #[test]
 fn ciphertext_round_trip_handshake_inner() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
 
     let body = b"encrypted-extensions-payload";
     let mut wire = sealer.seal(ContentType::Handshake, body).unwrap();
@@ -80,8 +82,8 @@ fn ciphertext_round_trip_handshake_inner() {
 
 #[test]
 fn ciphertext_round_trip_app_data_inner() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
 
     let body = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
     let mut wire = sealer.seal(ContentType::ApplicationData, body).unwrap();
@@ -94,52 +96,47 @@ fn ciphertext_round_trip_app_data_inner() {
 fn seal_into_staged_equals_seal_and_round_trips() {
     let body = b"hello tls record body";
 
-    let mut allocating = Sealer::from_secret(&TEST_SECRET);
+    let mut allocating = Sealer::from_secret(&TEST_SECRET).unwrap();
     let one = allocating.seal(ContentType::ApplicationData, body).unwrap();
 
     let mut staged = vec![0xAA, 0xBB];
-    let mut into = Sealer::from_secret(&TEST_SECRET);
+    let mut into = Sealer::from_secret(&TEST_SECRET).unwrap();
     into.seal_into(ContentType::ApplicationData, body, &mut staged)
         .unwrap();
     assert_eq!(&staged[2..], one.as_slice());
 
     let mut wire = staged[2..].to_vec();
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
     assert_eq!(inner_type, ContentType::ApplicationData);
     assert_eq!(&wire[range], body);
 }
 
 #[test]
-fn seal_into_slice_matches_allocating_seal_byte_for_byte() {
+fn seal_output_methods_match_byte_for_byte() {
     let body = b"hello tls record body";
 
-    let mut allocating = Sealer::from_secret(&TEST_SECRET);
+    let mut allocating = Sealer::from_secret(&TEST_SECRET).unwrap();
     let one = allocating.seal(ContentType::ApplicationData, body).unwrap();
 
-    let mut wire = [0u8; HEADER_LEN + 64];
-    let mut into = Sealer::from_secret(&TEST_SECRET);
+    let mut wire = vec![0u8; one.len()];
+    let mut into = Sealer::from_secret(&TEST_SECRET).unwrap();
     let n = into
         .seal_into_slice(ContentType::ApplicationData, body, &mut wire)
         .unwrap();
     assert_eq!(&wire[..n], one.as_slice());
-}
 
-#[test]
-fn seal_into_slice_accepts_exact_fit_buffer() {
-    let body = b"x";
-    let total = HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN;
-    let mut exact = vec![0u8; total];
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let n = sealer
-        .seal_into_slice(ContentType::ApplicationData, body, &mut exact)
+    let mut uninit = vec![MaybeUninit::uninit(); one.len()];
+    let mut into = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let wire = into
+        .seal_into_uninit(ContentType::ApplicationData, body, &mut uninit)
         .unwrap();
-    assert_eq!(n, total);
+    assert_eq!(wire, one.as_slice());
 }
 
 #[test]
-fn seal_into_slice_rejects_undersized_buffer() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
+fn seal_output_methods_reject_undersized_buffer() {
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
     let mut tiny = [0u8; HEADER_LEN];
     assert_eq!(
         sealer.seal_into_slice(ContentType::ApplicationData, b"x", &mut tiny),
@@ -150,31 +147,49 @@ fn seal_into_slice_rejects_undersized_buffer() {
         0,
         "a rejected seal must not spend the sequence"
     );
+
+    let mut tiny = [MaybeUninit::uninit(); HEADER_LEN];
+    assert_eq!(
+        sealer.seal_into_uninit(ContentType::ApplicationData, b"x", &mut tiny),
+        Err(RecordError::BufferTooSmall)
+    );
+    assert_eq!(sealer.seq(), 0);
 }
 
 #[test]
-fn encode_into_slice_matches_allocating_encode_byte_for_byte() {
+fn encode_output_methods_match_byte_for_byte() {
     let body = b"client-hello-bytes";
     let one = PlaintextRecord::encode(ContentType::Handshake, body).unwrap();
 
-    let mut wire = [0u8; HEADER_LEN + 64];
+    let mut wire = vec![0u8; one.len()];
     let n = PlaintextRecord::encode_into_slice(ContentType::Handshake, body, &mut wire).unwrap();
     assert_eq!(&wire[..n], one.as_slice());
+
+    let mut uninit = vec![MaybeUninit::uninit(); one.len()];
+    let wire =
+        PlaintextRecord::encode_into_uninit(ContentType::Handshake, body, &mut uninit).unwrap();
+    assert_eq!(wire, one.as_slice());
 }
 
 #[test]
-fn encode_into_slice_rejects_undersized_buffer() {
+fn encode_output_methods_reject_undersized_buffer() {
     let mut tiny = [0u8; HEADER_LEN];
     assert_eq!(
         PlaintextRecord::encode_into_slice(ContentType::Handshake, b"x", &mut tiny),
+        Err(RecordError::BufferTooSmall)
+    );
+
+    let mut tiny = [MaybeUninit::uninit(); HEADER_LEN];
+    assert_eq!(
+        PlaintextRecord::encode_into_uninit(ContentType::Handshake, b"x", &mut tiny),
         Err(RecordError::BufferTooSmall)
     );
 }
 
 #[test]
 fn sequence_number_increments_per_record() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
 
     for i in 0..5u8 {
         let body = vec![i; 32];
@@ -188,8 +203,8 @@ fn sequence_number_increments_per_record() {
 
 #[test]
 fn ciphertext_open_rejects_tampered_tag() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let mut wire = sealer.seal(ContentType::ApplicationData, b"body").unwrap();
     let last = wire.len() - 1;
     wire[last] ^= 0x01;
@@ -198,8 +213,8 @@ fn ciphertext_open_rejects_tampered_tag() {
 
 #[test]
 fn ciphertext_open_rejects_wrong_seq_order() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let _wire1 = sealer.seal(ContentType::ApplicationData, b"first").unwrap();
     let mut wire2 = sealer
         .seal(ContentType::ApplicationData, b"second")
@@ -212,8 +227,8 @@ fn ciphertext_open_rejects_wrong_seq_order() {
 
 #[test]
 fn open_returns_none_when_input_short() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let wire = sealer.seal(ContentType::ApplicationData, b"hi").unwrap();
 
     let mut head = wire[..HEADER_LEN - 1].to_vec();
@@ -225,8 +240,8 @@ fn open_returns_none_when_input_short() {
 
 #[test]
 fn open_rejects_plaintext_outer_type() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let mut wire = sealer.seal(ContentType::Handshake, b"x").unwrap();
     wire[0] = ContentType::Handshake as u8;
     assert_eq!(
@@ -237,26 +252,26 @@ fn open_rejects_plaintext_outer_type() {
 
 #[test]
 fn auth_failure_poisons_opener_so_later_valid_records_are_refused() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
     let mut tampered = sealer.seal(ContentType::ApplicationData, b"body").unwrap();
     let last = tampered.len() - 1;
     tampered[last] ^= 0x01;
 
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     assert_eq!(
         opener.open(&mut tampered).unwrap_err(),
         RecordError::OpenFailed
     );
     assert_eq!(opener.seq(), 0, "a forgery must not advance the sequence");
 
-    let mut fresh = Sealer::from_secret(&TEST_SECRET);
+    let mut fresh = Sealer::from_secret(&TEST_SECRET).unwrap();
     let mut good = fresh.seal(ContentType::ApplicationData, b"body").unwrap();
     assert_eq!(opener.open(&mut good).unwrap_err(), RecordError::Poisoned);
 }
 
 #[test]
 fn seal_refuses_oversize_body() {
-    let mut sealer = Sealer::from_secret(&TEST_SECRET);
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
     let big = vec![0u8; MAX_PLAINTEXT_BODY + 1];
     assert_eq!(
         sealer.seal(ContentType::ApplicationData, &big),
@@ -280,7 +295,7 @@ fn open_rejects_record_overflow() {
     let mut inner = vec![0u8; MAX_PLAINTEXT_BODY + 1];
     inner.push(ContentType::ApplicationData as u8);
     let mut wire = craft_wire(0, &inner);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     assert_eq!(opener.open(&mut wire), Err(RecordError::RecordOverflow));
 }
 
@@ -289,7 +304,7 @@ fn open_accepts_max_plaintext() {
     let mut inner = vec![0u8; MAX_PLAINTEXT_BODY];
     inner.push(ContentType::ApplicationData as u8);
     let mut wire = craft_wire(0, &inner);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
     assert_eq!(inner_type, ContentType::ApplicationData);
     assert_eq!(range.len(), MAX_PLAINTEXT_BODY);
@@ -300,7 +315,7 @@ fn open_accepts_short_content_with_large_padding() {
     let mut inner = vec![b'h', b'i', ContentType::ApplicationData as u8];
     inner.resize(MAX_PLAINTEXT_BODY + 200, 0);
     let mut wire = craft_wire(0, &inner);
-    let mut opener = Opener::from_secret(&TEST_SECRET);
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let (inner_type, range, _) = opener.open(&mut wire).unwrap().unwrap();
     assert_eq!(inner_type, ContentType::ApplicationData);
     assert_eq!(&wire[range], b"hi");

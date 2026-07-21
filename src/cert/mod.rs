@@ -6,7 +6,6 @@ pub use ext::{
     BasicConstraints, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage, NameConstraints,
     OID_EKU_ANY, OID_EKU_CLIENT_AUTH, OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS,
     OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE, OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, Subtrees,
-    is_handled_ext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,14 +65,14 @@ pub struct SubjectPublicKeyInfo<'a> {
 impl<'a> SubjectPublicKeyInfo<'a> {
     pub fn parse_standalone(spki_der: &'a [u8]) -> Result<Self, CertError> {
         let mut r = Reader::new(spki_der);
-        let inner = r.expect(Tag::SEQUENCE)?;
+        let inner = r.read_tagged(Tag::SEQUENCE)?;
         r.finish()?;
         let mut sr = Reader::new(inner);
-        let alg_inner = sr.expect(Tag::SEQUENCE)?;
+        let alg_inner = sr.read_tagged(Tag::SEQUENCE)?;
         let mut ar = Reader::new(alg_inner);
-        let oid = ar.expect(Tag::OID)?;
+        let oid = ar.read_tagged(Tag::OID)?;
         let parameters = ar.bytes_remaining();
-        let bit = sr.expect(Tag::BIT_STRING)?;
+        let bit = sr.read_tagged(Tag::BIT_STRING)?;
         let subject_public_key = Tlv::bit_string(bit)?;
         sr.finish()?;
         Ok(Self {
@@ -85,10 +84,10 @@ impl<'a> SubjectPublicKeyInfo<'a> {
 
     fn parse_inline(r: &mut Reader<'a>) -> Result<Self, CertError> {
         let raw_der = Self::peek_full_tlv(r)?;
-        let inner = r.expect(Tag::SEQUENCE)?;
+        let inner = r.read_tagged(Tag::SEQUENCE)?;
         let mut sr = Reader::new(inner);
         let algorithm = AlgorithmIdentifier::parse(&mut sr)?;
-        let bit = sr.expect(Tag::BIT_STRING)?;
+        let bit = sr.read_tagged(Tag::BIT_STRING)?;
         let subject_public_key = Tlv::bit_string(bit)?;
         sr.finish()?;
         Ok(Self {
@@ -190,7 +189,7 @@ impl<'a> Cert<'a> {
 
         let version = if let Some(ver_inner) = r.read_optional(Tag::context(0, true))? {
             let mut vr = Reader::new(ver_inner);
-            let v = Tlv::integer_u64(vr.expect(Tag::INTEGER)?)?;
+            let v = Tlv::integer_u64(vr.read_tagged(Tag::INTEGER)?)?;
             vr.finish()?;
             if v > 2 {
                 return Err(CertError::BadVersion);
@@ -203,11 +202,11 @@ impl<'a> Cert<'a> {
             1
         };
 
-        let serial = r.expect(Tag::INTEGER)?;
+        let serial = r.read_tagged(Tag::INTEGER)?;
         let signature_alg = AlgorithmIdentifier::parse(&mut r)?;
-        let issuer_der = r.expect(Tag::SEQUENCE)?;
-        let validity = Validity::parse(r.expect(Tag::SEQUENCE)?)?;
-        let subject_der = r.expect(Tag::SEQUENCE)?;
+        let issuer_der = r.read_tagged(Tag::SEQUENCE)?;
+        let validity = Validity::parse(r.read_tagged(Tag::SEQUENCE)?)?;
+        let subject_der = r.read_tagged(Tag::SEQUENCE)?;
         let spki = SubjectPublicKeyInfo::parse_inline(&mut r)?;
 
         let issuer_uid = r.read_optional(Tag::context(1, false))?.is_some();
@@ -215,7 +214,7 @@ impl<'a> Cert<'a> {
 
         let extensions_der = if let Some(ext_outer) = r.read_optional(Tag::context(3, true))? {
             let mut er = Reader::new(ext_outer);
-            let ext_seq = er.expect(Tag::SEQUENCE)?;
+            let ext_seq = er.read_tagged(Tag::SEQUENCE)?;
             er.finish()?;
             Some(ext_seq)
         } else {
@@ -245,9 +244,9 @@ impl<'a> Cert<'a> {
 
 impl<'a> AlgorithmIdentifier<'a> {
     fn parse(r: &mut Reader<'a>) -> Result<Self, CertError> {
-        let alg_inner = r.expect(Tag::SEQUENCE)?;
+        let alg_inner = r.read_tagged(Tag::SEQUENCE)?;
         let mut ar = Reader::new(alg_inner);
-        let oid = ar.expect(Tag::OID)?;
+        let oid = ar.read_tagged(Tag::OID)?;
         let parameters = ar.bytes_remaining();
         Ok(Self { oid, parameters })
     }
@@ -400,16 +399,20 @@ impl Cert<'_> {
     /// MGF1-same-hash, salt = digest-length profile; SHA-1 default is rejected.
     fn pss_hash(params: &[u8]) -> Result<PssHash, VerifyError> {
         let mut r = Reader::new(params);
-        let inner = r.expect(Tag::SEQUENCE).map_err(|_| VerifyError::Failed)?;
+        let inner = r
+            .read_tagged(Tag::SEQUENCE)
+            .map_err(|_| VerifyError::Failed)?;
         let mut sr = Reader::new(inner);
         let hash_field = sr
             .read_optional(Tag::context(0, true))
             .map_err(|_| VerifyError::Failed)?
             .ok_or(VerifyError::UnsupportedAlgorithm)?;
         let mut hr = Reader::new(hash_field);
-        let alg = hr.expect(Tag::SEQUENCE).map_err(|_| VerifyError::Failed)?;
+        let alg = hr
+            .read_tagged(Tag::SEQUENCE)
+            .map_err(|_| VerifyError::Failed)?;
         let mut ar = Reader::new(alg);
-        let oid = ar.expect(Tag::OID).map_err(|_| VerifyError::Failed)?;
+        let oid = ar.read_tagged(Tag::OID).map_err(|_| VerifyError::Failed)?;
         match oid {
             x if x == OID_SHA256 => Ok(PssHash::Sha256),
             x if x == OID_SHA384 => Ok(PssHash::Sha384),
@@ -423,7 +426,9 @@ impl Cert<'_> {
         expected_curve: &[u8],
     ) -> Result<(), VerifyError> {
         let mut r = Reader::new(spki.algorithm.parameters);
-        let oid = r.expect(Tag::OID).map_err(|_| VerifyError::BadCurveParam)?;
+        let oid = r
+            .read_tagged(Tag::OID)
+            .map_err(|_| VerifyError::BadCurveParam)?;
         if oid != expected_curve {
             return Err(VerifyError::UnsupportedCurve);
         }

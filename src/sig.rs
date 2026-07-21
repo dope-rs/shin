@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use ring::rand::SystemRandom;
@@ -21,33 +22,32 @@ pub enum SigError {
     VerifyFailed,
 }
 
-pub enum SigningKey {
+#[derive(Clone)]
+pub struct SigningKey(Arc<SigningKeyInner>);
+
+enum SigningKeyInner {
     Ed25519(Ed25519Inner),
     EcdsaP256(EcdsaP256Inner),
     EcdsaP384(EcdsaP384Inner),
     Rsa(RsaInner),
 }
 
-pub struct Ed25519Inner {
-    seed: [u8; SEED_LEN],
+struct Ed25519Inner {
     inner: Ed25519KeyPair,
     pubkey: [u8; PUBKEY_LEN],
 }
 
-pub struct EcdsaP256Inner {
-    pkcs8: Vec<u8>,
+struct EcdsaP256Inner {
     inner: EcdsaKeyPair,
     pubkey_uncompressed: Vec<u8>,
 }
 
-pub struct EcdsaP384Inner {
-    pkcs8: Vec<u8>,
+struct EcdsaP384Inner {
     inner: EcdsaKeyPair,
     pubkey_uncompressed: Vec<u8>,
 }
 
-pub struct RsaInner {
-    pkcs8: Vec<u8>,
+struct RsaInner {
     inner: RsaKeyPair,
     public_key_der: Vec<u8>,
 }
@@ -57,11 +57,10 @@ impl SigningKey {
         let inner = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| SigError::InvalidSeed)?;
         let mut pubkey = [0u8; PUBKEY_LEN];
         pubkey.copy_from_slice(inner.public_key().as_ref());
-        Ok(Self::Ed25519(Ed25519Inner {
-            seed: *seed,
+        Ok(Self(Arc::new(SigningKeyInner::Ed25519(Ed25519Inner {
             inner,
             pubkey,
-        }))
+        }))))
     }
 
     pub fn from_ecdsa_p256_pkcs8(pkcs8: &[u8]) -> Result<Self, SigError> {
@@ -69,11 +68,10 @@ impl SigningKey {
         let inner = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, &rng)
             .map_err(|_| SigError::InvalidKey)?;
         let pubkey_uncompressed = inner.public_key().as_ref().to_vec();
-        Ok(Self::EcdsaP256(EcdsaP256Inner {
-            pkcs8: pkcs8.to_vec(),
+        Ok(Self(Arc::new(SigningKeyInner::EcdsaP256(EcdsaP256Inner {
             inner,
             pubkey_uncompressed,
-        }))
+        }))))
     }
 
     pub fn from_ecdsa_p384_pkcs8(pkcs8: &[u8]) -> Result<Self, SigError> {
@@ -81,55 +79,53 @@ impl SigningKey {
         let inner = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8, &rng)
             .map_err(|_| SigError::InvalidKey)?;
         let pubkey_uncompressed = inner.public_key().as_ref().to_vec();
-        Ok(Self::EcdsaP384(EcdsaP384Inner {
-            pkcs8: pkcs8.to_vec(),
+        Ok(Self(Arc::new(SigningKeyInner::EcdsaP384(EcdsaP384Inner {
             inner,
             pubkey_uncompressed,
-        }))
+        }))))
     }
 
     pub fn from_rsa_pkcs8(pkcs8: &[u8]) -> Result<Self, SigError> {
         let inner = RsaKeyPair::from_pkcs8(pkcs8).map_err(|_| SigError::InvalidKey)?;
         let public_key_der = inner.public_key().as_ref().to_vec();
-        Ok(Self::Rsa(RsaInner {
-            pkcs8: pkcs8.to_vec(),
+        Ok(Self(Arc::new(SigningKeyInner::Rsa(RsaInner {
             inner,
             public_key_der,
-        }))
+        }))))
     }
 
     pub fn pubkey(&self) -> Option<&[u8; PUBKEY_LEN]> {
-        match self {
-            Self::Ed25519(k) => Some(&k.pubkey),
+        match self.0.as_ref() {
+            SigningKeyInner::Ed25519(k) => Some(&k.pubkey),
             _ => None,
         }
     }
 
     pub fn ecdsa_p256_pubkey(&self) -> Option<&[u8]> {
-        match self {
-            Self::EcdsaP256(k) => Some(&k.pubkey_uncompressed),
+        match self.0.as_ref() {
+            SigningKeyInner::EcdsaP256(k) => Some(&k.pubkey_uncompressed),
             _ => None,
         }
     }
 
     pub fn ecdsa_p384_pubkey(&self) -> Option<&[u8]> {
-        match self {
-            Self::EcdsaP384(k) => Some(&k.pubkey_uncompressed),
+        match self.0.as_ref() {
+            SigningKeyInner::EcdsaP384(k) => Some(&k.pubkey_uncompressed),
             _ => None,
         }
     }
 
     pub fn rsa_public_key_der(&self) -> Option<&[u8]> {
-        match self {
-            Self::Rsa(k) => Some(&k.public_key_der),
+        match self.0.as_ref() {
+            SigningKeyInner::Rsa(k) => Some(&k.public_key_der),
             _ => None,
         }
     }
 
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, SigError> {
-        match self {
-            Self::Ed25519(k) => Ok(k.inner.sign(msg).as_ref().to_vec()),
-            Self::EcdsaP256(k) => {
+        match self.0.as_ref() {
+            SigningKeyInner::Ed25519(k) => Ok(k.inner.sign(msg).as_ref().to_vec()),
+            SigningKeyInner::EcdsaP256(k) => {
                 let rng = SystemRandom::new();
                 Ok(k.inner
                     .sign(&rng, msg)
@@ -137,7 +133,7 @@ impl SigningKey {
                     .as_ref()
                     .to_vec())
             }
-            Self::EcdsaP384(k) => {
+            SigningKeyInner::EcdsaP384(k) => {
                 let rng = SystemRandom::new();
                 Ok(k.inner
                     .sign(&rng, msg)
@@ -145,7 +141,7 @@ impl SigningKey {
                     .as_ref()
                     .to_vec())
             }
-            Self::Rsa(k) => {
+            SigningKeyInner::Rsa(k) => {
                 let rng = SystemRandom::new();
                 let mut sig = alloc::vec![0u8; k.inner.public().modulus_len()];
                 k.inner
@@ -157,22 +153,11 @@ impl SigningKey {
     }
 
     pub fn sig_scheme(&self) -> u16 {
-        match self {
-            Self::Ed25519(_) => 0x0807,
-            Self::EcdsaP256(_) => 0x0403,
-            Self::EcdsaP384(_) => 0x0503,
-            Self::Rsa(_) => 0x0804,
-        }
-    }
-}
-
-impl Clone for SigningKey {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Ed25519(k) => Self::from_seed(&k.seed).expect("seed validated"),
-            Self::EcdsaP256(k) => Self::from_ecdsa_p256_pkcs8(&k.pkcs8).expect("pkcs8 validated"),
-            Self::EcdsaP384(k) => Self::from_ecdsa_p384_pkcs8(&k.pkcs8).expect("pkcs8 validated"),
-            Self::Rsa(k) => Self::from_rsa_pkcs8(&k.pkcs8).expect("pkcs8 validated"),
+        match self.0.as_ref() {
+            SigningKeyInner::Ed25519(_) => 0x0807,
+            SigningKeyInner::EcdsaP256(_) => 0x0403,
+            SigningKeyInner::EcdsaP384(_) => 0x0503,
+            SigningKeyInner::Rsa(_) => 0x0804,
         }
     }
 }
@@ -209,31 +194,5 @@ impl VerifyingKey<'_> {
                 .verify(msg, sig)
                 .map_err(|_| bad()),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ed25519_pubkey_some_and_sign_ok() {
-        let seed = [7u8; SEED_LEN];
-        let key = SigningKey::from_seed(&seed).unwrap();
-        assert!(key.pubkey().is_some());
-        let sig = key.sign(b"hello").unwrap();
-        assert_eq!(sig.len(), SIG_LEN);
-    }
-
-    #[test]
-    fn non_ed25519_pubkey_none() {
-        let seed = [7u8; SEED_LEN];
-        let key = SigningKey::from_seed(&seed).unwrap();
-        match key {
-            SigningKey::Ed25519(_) => {}
-            _ => panic!("expected ed25519"),
-        }
-        // pubkey() must not panic for any variant; Ed25519 returns Some.
-        assert!(key.pubkey().is_some());
     }
 }

@@ -1,8 +1,8 @@
 use ring::rand::SystemRandom;
 
 use shin::hash::{Digest, HashAlg, Transcript};
-use shin::kdf::Hkdf;
-use shin::kx::{EphemeralKey, KexGroup, KxError, responder};
+use shin::kdf::{Hkdf, HkdfError};
+use shin::kx::{EphemeralKey, KexGroup, KxError};
 use shin::record::{CipherSuite, ContentType, Opener, Sealer};
 
 const MLKEM768_EK_LEN: usize = 1184;
@@ -38,10 +38,29 @@ fn digest_equality_ignores_padding() {
 #[test]
 fn hkdf_sha384_produces_48_byte_secrets() {
     let prk = [0x42u8; 48];
-    assert_eq!(Hkdf::extract(HashAlg::Sha384, b"salt", b"ikm").len(), 48);
-    let d = Hkdf::derive_secret(HashAlg::Sha384, &prk, "deriv", b"");
+    let hkdf = Hkdf::new(HashAlg::Sha384);
+    assert_eq!(hkdf.extract(b"salt", b"ikm").len(), 48);
+    let d = hkdf.derive_secret(&prk, "deriv", b"").unwrap();
     assert_eq!(d.len(), 48);
     assert_ne!(d.as_slice(), [0u8; 48]);
+}
+
+#[test]
+fn hkdf_rejects_oversized_inputs() {
+    let hkdf = Hkdf::new(HashAlg::Sha256);
+    let mut too_much_output = vec![0; 255 * 32 + 1];
+    assert_eq!(
+        hkdf.expand(&[0; 32], b"", &mut too_much_output),
+        Err(HkdfError::OutputTooLong)
+    );
+    assert_eq!(
+        hkdf.expand_label(&[0; 32], &"x".repeat(250), b"", &mut [0; 32]),
+        Err(HkdfError::LabelTooLong)
+    );
+    assert_eq!(
+        hkdf.expand_label(&[0; 32], "x", &[0; 256], &mut [0; 32]),
+        Err(HkdfError::ContextTooLong)
+    );
 }
 
 #[test]
@@ -53,8 +72,8 @@ fn each_cipher_suite_round_trips() {
         (CipherSuite::ChaCha20Poly1305Sha256, &s256[..]),
         (CipherSuite::Aes256GcmSha384, &s384[..]),
     ] {
-        let mut sealer = Sealer::with_suite(secret, suite);
-        let mut opener = Opener::with_suite(secret, suite);
+        let mut sealer = Sealer::with_suite(secret, suite).unwrap();
+        let mut opener = Opener::with_suite(secret, suite).unwrap();
         let mut wire = sealer
             .seal(ContentType::ApplicationData, b"payload")
             .unwrap();
@@ -86,7 +105,7 @@ fn classical_groups_round_trip() {
     for group in [KexGroup::X25519, KexGroup::Secp256r1] {
         let client = EphemeralKey::generate(group, &rng).unwrap();
         let client_share = client.client_share().to_vec();
-        let (server_share, server_ss) = responder(group, &client_share, &rng).unwrap();
+        let (server_share, server_ss) = group.respond(&client_share, &rng).unwrap();
         let client_ss = client.agree(&server_share).unwrap();
         assert_eq!(client_ss.as_slice(), server_ss.as_slice());
         assert_eq!(client_ss.as_slice().len(), 32);
@@ -101,7 +120,7 @@ fn hybrid_round_trips_with_64_byte_secret() {
     let client_share = client.client_share().to_vec();
     assert_eq!(client_share.len(), MLKEM768_EK_LEN + X25519_LEN);
 
-    let (server_share, server_ss) = responder(group, &client_share, &rng).unwrap();
+    let (server_share, server_ss) = group.respond(&client_share, &rng).unwrap();
     assert_eq!(server_share.len(), MLKEM768_CT_LEN + X25519_LEN);
 
     let client_ss = client.agree(&server_share).unwrap();
@@ -114,7 +133,7 @@ fn hybrid_rejects_malformed_shares() {
     let rng = SystemRandom::new();
     let group = KexGroup::X25519Mlkem768;
     assert_eq!(
-        responder(group, &[0u8; 10], &rng).unwrap_err(),
+        group.respond(&[0u8; 10], &rng).unwrap_err(),
         KxError::InvalidPubkey
     );
     let client = EphemeralKey::generate(group, &rng).unwrap();

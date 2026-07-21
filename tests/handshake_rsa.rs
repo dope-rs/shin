@@ -15,7 +15,7 @@ use common::{find_send, has_done};
 const HOSTNAME: &str = "rsa.local";
 
 fn rsa_self_signed() -> (Vec<u8>, SigningKey) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rsa::rand_core::OsRng;
     let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
     let pkcs8_doc = priv_key.to_pkcs8_der().unwrap();
     let pkcs8 = pkcs8_doc.as_bytes();

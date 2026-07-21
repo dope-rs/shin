@@ -1,8 +1,13 @@
 use alloc::vec::Vec;
 
-use crate::codec::{DecodeError, Encode, Reader};
+use ring::hmac;
+
+use crate::codec::{DecodeError, Encode, EncodeError, Reader};
 use crate::extension::Extension;
+use crate::hash::{Digest, HashAlg, MAX_HASH_LEN};
+use crate::kdf::{Hkdf, HkdfError};
 use crate::{Epoch, Error};
+use zeroize::Zeroize;
 
 pub const RANDOM_LEN: usize = 32;
 pub const TLS_1_3: u16 = 0x0304;
@@ -138,17 +143,24 @@ pub struct ClientHello {
 }
 
 impl ClientHello {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u16(self.legacy_version);
         out.put_slice(&self.random);
-        out.put_vec_u8(|o| o.put_slice(&self.legacy_session_id));
+        out.put_vec_u8(|o| {
+            o.put_slice(&self.legacy_session_id);
+            Ok(())
+        })?;
         out.put_vec_u16(|o| {
             for cs in &self.cipher_suites {
                 o.put_u16(*cs);
             }
-        });
-        out.put_vec_u8(|o| o.put_slice(&self.legacy_compression_methods));
-        Extension::encode_list(&self.extensions, out);
+            Ok(())
+        })?;
+        out.put_vec_u8(|o| {
+            o.put_slice(&self.legacy_compression_methods);
+            Ok(())
+        })?;
+        Extension::encode_list(&self.extensions, out)
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -185,13 +197,16 @@ pub struct ServerHello {
 }
 
 impl ServerHello {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u16(self.legacy_version);
         out.put_slice(&self.random);
-        out.put_vec_u8(|o| o.put_slice(&self.legacy_session_id_echo));
+        out.put_vec_u8(|o| {
+            o.put_slice(&self.legacy_session_id_echo);
+            Ok(())
+        })?;
         out.put_u16(self.cipher_suite);
         out.put_u8(self.legacy_compression_method);
-        Extension::encode_list(&self.extensions, out);
+        Extension::encode_list(&self.extensions, out)
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -219,8 +234,8 @@ pub struct EncryptedExtensions {
 }
 
 impl EncryptedExtensions {
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        Extension::encode_list(&self.extensions, out);
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        Extension::encode_list(&self.extensions, out)
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -236,9 +251,12 @@ pub struct CertificateEntry {
 }
 
 impl CertificateEntry {
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.put_vec_u24(|o| o.put_slice(&self.cert_data));
-        Extension::encode_list(&self.extensions, out);
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.put_vec_u24(|o| {
+            o.put_slice(&self.cert_data);
+            Ok(())
+        })?;
+        Extension::encode_list(&self.extensions, out)
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -258,13 +276,17 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.put_vec_u8(|o| o.put_slice(&self.certificate_request_context));
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.put_vec_u8(|o| {
+            o.put_slice(&self.certificate_request_context);
+            Ok(())
+        })?;
         out.put_vec_u24(|o| {
             for entry in &self.certificate_list {
-                entry.encode(o);
+                entry.encode(o)?;
             }
-        });
+            Ok(())
+        })
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -295,9 +317,12 @@ pub struct CertificateRequest {
 }
 
 impl CertificateRequest {
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.put_vec_u8(|o| o.put_slice(&self.certificate_request_context));
-        Extension::encode_list(&self.extensions, out);
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.put_vec_u8(|o| {
+            o.put_slice(&self.certificate_request_context);
+            Ok(())
+        })?;
+        Extension::encode_list(&self.extensions, out)
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -317,9 +342,26 @@ pub struct CertificateVerify {
 }
 
 impl CertificateVerify {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn message(transcript_hash: &[u8], from_server: bool) -> Vec<u8> {
+        let context = if from_server {
+            b"TLS 1.3, server CertificateVerify".as_slice()
+        } else {
+            b"TLS 1.3, client CertificateVerify".as_slice()
+        };
+        let mut msg = Vec::with_capacity(64 + context.len() + 1 + transcript_hash.len());
+        msg.resize(64, 0x20);
+        msg.extend_from_slice(context);
+        msg.push(0x00);
+        msg.extend_from_slice(transcript_hash);
+        msg
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u16(self.algorithm);
-        out.put_vec_u16(|o| o.put_slice(&self.signature));
+        out.put_vec_u16(|o| {
+            o.put_slice(&self.signature);
+            Ok(())
+        })
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -338,8 +380,23 @@ pub struct Finished {
 }
 
 impl Finished {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn verify_data(
+        alg: HashAlg,
+        traffic_secret: &[u8],
+        transcript_hash: &[u8],
+    ) -> Result<Digest, HkdfError> {
+        let mut fkey_buf = [0u8; MAX_HASH_LEN];
+        let fkey = &mut fkey_buf[..alg.output_len()];
+        Hkdf::new(alg).expand_label(traffic_secret, "finished", &[], fkey)?;
+        let key = hmac::Key::new(alg.hmac(), fkey);
+        let mac = Digest::from_slice(hmac::sign(&key, transcript_hash).as_ref());
+        fkey.zeroize();
+        Ok(mac)
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_slice(&self.verify_data);
+        Ok(())
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -355,8 +412,9 @@ pub struct KeyUpdate {
 }
 
 impl KeyUpdate {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u8(self.request_update);
+        Ok(())
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -378,12 +436,18 @@ pub struct NewSessionTicket {
 }
 
 impl NewSessionTicket {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u32(self.ticket_lifetime);
         out.put_u32(self.ticket_age_add);
-        out.put_vec_u8(|o| o.put_slice(&self.ticket_nonce));
-        out.put_vec_u16(|o| o.put_slice(&self.ticket));
-        Extension::encode_list(&self.extensions, out);
+        out.put_vec_u8(|o| {
+            o.put_slice(&self.ticket_nonce);
+            Ok(())
+        })?;
+        out.put_vec_u16(|o| {
+            o.put_slice(&self.ticket);
+            Ok(())
+        })?;
+        Extension::encode_list(&self.extensions, out)
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -432,7 +496,7 @@ impl Handshake {
         }
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u8(self.msg_type() as u8);
         out.put_vec_u24(|o| match self {
             Self::ClientHello(m) => m.encode(o),
@@ -442,10 +506,10 @@ impl Handshake {
             Self::Certificate(m) => m.encode(o),
             Self::CertificateVerify(m) => m.encode(o),
             Self::Finished(m) => m.encode(o),
-            Self::EndOfEarlyData => {}
+            Self::EndOfEarlyData => Ok(()),
             Self::KeyUpdate(m) => m.encode(o),
             Self::NewSessionTicket(m) => m.encode(o),
-        });
+        })
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {

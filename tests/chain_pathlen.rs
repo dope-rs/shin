@@ -34,16 +34,12 @@ fn root(cn: &str, path_len: Option<u8>) -> Ca {
     Ca { params, key, der }
 }
 
-fn issuer_of(ca: &Ca) -> Issuer<'_, &KeyPair> {
-    Issuer::from_params(&ca.params, &ca.key)
-}
-
 fn intermediate(cn: &str, path_len: Option<u8>, parent: &Ca) -> Ca {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let params = ca_params(cn, path_len);
     let der = params
         .clone()
-        .signed_by(&key, &issuer_of(parent))
+        .signed_by(&key, &Issuer::from_params(&parent.params, &parent.key))
         .unwrap()
         .der()
         .to_vec();
@@ -60,7 +56,7 @@ fn leaf(dns: &str, parent: &Ca) -> Vec<u8> {
     params.is_ca = IsCa::NoCa;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params
-        .signed_by(&key, &issuer_of(parent))
+        .signed_by(&key, &Issuer::from_params(&parent.params, &parent.key))
         .unwrap()
         .der()
         .to_vec()
@@ -84,7 +80,9 @@ fn chain_too_long_is_rejected() {
     let anchors = [TrustAnchor::from_cert(&anchor_cert)];
     let now = mid_time(&leaf_cert);
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::ChainTooLong
     );
 }
@@ -102,7 +100,9 @@ fn valid_two_level_chain_accepts() {
 
     let chain = [leaf_cert.clone(), im_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
-    Chain::validate(&chain, &anchors, now, b"host.local").expect("valid 2-level chain");
+    Chain::new(&chain)
+        .validate(&anchors, now, b"host.local")
+        .expect("valid 2-level chain");
 }
 
 #[test]
@@ -122,7 +122,9 @@ fn path_len_zero_intermediate_rejects_extra_intermediate() {
     let chain = [leaf_cert.clone(), im1_cert, im0_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
     assert_eq!(
-        Chain::validate(&chain, &anchors, now, b"host.local").unwrap_err(),
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
         ChainError::PathLenExceeded
     );
 }

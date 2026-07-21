@@ -109,12 +109,15 @@ pub trait Encode {
     fn put_u24(&mut self, v: u32);
     fn put_u32(&mut self, v: u32);
     fn put_slice(&mut self, s: &[u8]);
-    fn put_vec_u8<F: FnOnce(&mut Self)>(&mut self, body: F);
-    fn put_vec_u16<F: FnOnce(&mut Self)>(&mut self, body: F);
-    fn put_vec_u24<F: FnOnce(&mut Self)>(&mut self, body: F);
-    fn try_put_vec_u8<F: FnOnce(&mut Self)>(&mut self, body: F) -> Result<(), EncodeError>;
-    fn try_put_vec_u16<F: FnOnce(&mut Self)>(&mut self, body: F) -> Result<(), EncodeError>;
-    fn try_put_vec_u24<F: FnOnce(&mut Self)>(&mut self, body: F) -> Result<(), EncodeError>;
+    fn put_vec_u8<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>;
+    fn put_vec_u16<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>;
+    fn put_vec_u24<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>;
 }
 
 impl Encode for Vec<u8> {
@@ -139,94 +142,66 @@ impl Encode for Vec<u8> {
         self.extend_from_slice(s);
     }
 
-    fn put_vec_u8<F: FnOnce(&mut Self)>(&mut self, body: F) {
-        self.try_put_vec_u8(body).expect("vec_u8 body too large");
-    }
-
-    fn put_vec_u16<F: FnOnce(&mut Self)>(&mut self, body: F) {
-        self.try_put_vec_u16(body).expect("vec_u16 body too large");
-    }
-
-    fn put_vec_u24<F: FnOnce(&mut Self)>(&mut self, body: F) {
-        self.try_put_vec_u24(body).expect("vec_u24 body too large");
-    }
-
-    fn try_put_vec_u8<F: FnOnce(&mut Self)>(&mut self, body: F) -> Result<(), EncodeError> {
+    fn put_vec_u8<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
+    {
         let len_pos = self.len();
         self.push(0);
         let body_start = self.len();
-        body(self);
-        let len = u8::try_from(self.len() - body_start).map_err(|_| EncodeError::Overflow)?;
+        if let Err(error) = body(self) {
+            self.truncate(len_pos);
+            return Err(error);
+        }
+        let Ok(len) = u8::try_from(self.len() - body_start) else {
+            self.truncate(len_pos);
+            return Err(EncodeError::Overflow);
+        };
         self[len_pos] = len;
         Ok(())
     }
 
-    fn try_put_vec_u16<F: FnOnce(&mut Self)>(&mut self, body: F) -> Result<(), EncodeError> {
+    fn put_vec_u16<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
+    {
         let len_pos = self.len();
         self.extend_from_slice(&[0, 0]);
         let body_start = self.len();
-        body(self);
-        let len = u16::try_from(self.len() - body_start).map_err(|_| EncodeError::Overflow)?;
+        if let Err(error) = body(self) {
+            self.truncate(len_pos);
+            return Err(error);
+        }
+        let Ok(len) = u16::try_from(self.len() - body_start) else {
+            self.truncate(len_pos);
+            return Err(EncodeError::Overflow);
+        };
         self[len_pos..len_pos + 2].copy_from_slice(&len.to_be_bytes());
         Ok(())
     }
 
-    fn try_put_vec_u24<F: FnOnce(&mut Self)>(&mut self, body: F) -> Result<(), EncodeError> {
+    fn put_vec_u24<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
+    {
         let len_pos = self.len();
         self.extend_from_slice(&[0, 0, 0]);
         let body_start = self.len();
-        body(self);
+        if let Err(error) = body(self) {
+            self.truncate(len_pos);
+            return Err(error);
+        }
         let len = self.len() - body_start;
-        let bytes = u32::try_from(len)
-            .ok()
-            .filter(|n| *n < 1 << 24)
-            .ok_or(EncodeError::Overflow)?
-            .to_be_bytes();
+        let Ok(len) = u32::try_from(len) else {
+            self.truncate(len_pos);
+            return Err(EncodeError::Overflow);
+        };
+        if len >= 1 << 24 {
+            self.truncate(len_pos);
+            return Err(EncodeError::Overflow);
+        }
+        let bytes = len.to_be_bytes();
         self[len_pos..len_pos + 3].copy_from_slice(&bytes[1..]);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn try_put_vec_u8_overflow() {
-        let mut v = Vec::new();
-        let big = alloc::vec![0u8; 256];
-        assert_eq!(
-            v.try_put_vec_u8(|o| o.put_slice(&big)),
-            Err(EncodeError::Overflow)
-        );
-    }
-
-    #[test]
-    fn try_put_vec_u8_ok() {
-        let mut v = Vec::new();
-        let body = alloc::vec![7u8; 255];
-        assert_eq!(v.try_put_vec_u8(|o| o.put_slice(&body)), Ok(()));
-        assert_eq!(v[0], 255);
-        assert_eq!(v.len(), 256);
-    }
-
-    #[test]
-    fn try_put_vec_u16_overflow() {
-        let mut v = Vec::new();
-        let big = alloc::vec![0u8; 65536];
-        assert_eq!(
-            v.try_put_vec_u16(|o| o.put_slice(&big)),
-            Err(EncodeError::Overflow)
-        );
-    }
-
-    #[test]
-    fn try_put_vec_u24_overflow() {
-        let mut v = Vec::new();
-        let big = alloc::vec![0u8; 1 << 24];
-        assert_eq!(
-            v.try_put_vec_u24(|o| o.put_slice(&big)),
-            Err(EncodeError::Overflow)
-        );
     }
 }

@@ -29,7 +29,7 @@ fn client_hello_round_trip() {
         extensions: sample_extensions(),
     };
     let mut buf = Vec::new();
-    ch.encode(&mut buf);
+    ch.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
     let decoded = ClientHello::decode(&mut r).unwrap();
     r.finish().unwrap();
@@ -47,7 +47,7 @@ fn server_hello_round_trip() {
         extensions: sample_extensions(),
     };
     let mut buf = Vec::new();
-    sh.encode(&mut buf);
+    sh.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
     let decoded = ServerHello::decode(&mut r).unwrap();
     r.finish().unwrap();
@@ -60,7 +60,7 @@ fn encrypted_extensions_round_trip() {
         extensions: sample_extensions(),
     };
     let mut buf = Vec::new();
-    ee.encode(&mut buf);
+    ee.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
     let decoded = EncryptedExtensions::decode(&mut r).unwrap();
     r.finish().unwrap();
@@ -83,7 +83,7 @@ fn certificate_round_trip() {
         ],
     };
     let mut buf = Vec::new();
-    cert.encode(&mut buf);
+    cert.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
     let decoded = Certificate::decode(&mut r).unwrap();
     r.finish().unwrap();
@@ -97,7 +97,7 @@ fn certificate_verify_round_trip() {
         signature: b"signature-bytes".to_vec(),
     };
     let mut buf = Vec::new();
-    cv.encode(&mut buf);
+    cv.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
     let decoded = CertificateVerify::decode(&mut r).unwrap();
     r.finish().unwrap();
@@ -110,7 +110,7 @@ fn finished_round_trip() {
         verify_data: vec![0xFF; 32],
     };
     let mut buf = Vec::new();
-    fin.encode(&mut buf);
+    fin.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
     let decoded = Finished::decode(&mut r).unwrap();
     r.finish().unwrap();
@@ -128,7 +128,7 @@ fn handshake_wraps_with_type_and_length() {
         extensions: sample_extensions(),
     });
     let mut buf = Vec::new();
-    hs.encode(&mut buf);
+    hs.encode(&mut buf).unwrap();
 
     assert_eq!(buf[0], HandshakeType::ClientHello as u8);
     let body_len = u32::from_be_bytes([0, buf[1], buf[2], buf[3]]) as usize;
@@ -171,7 +171,7 @@ fn handshake_round_trip_each_variant() {
     ];
     for hs in variants {
         let mut buf = Vec::new();
-        hs.encode(&mut buf);
+        hs.encode(&mut buf).unwrap();
         let mut r = Reader::new(&buf);
         let decoded = Handshake::decode(&mut r).unwrap();
         r.finish().unwrap();
@@ -185,7 +185,8 @@ fn handshake_decode_rejects_trailing_bytes_in_body() {
     Handshake::Finished(Finished {
         verify_data: vec![0; 32],
     })
-    .encode(&mut buf);
+    .encode(&mut buf)
+    .unwrap();
     buf.extend_from_slice(b"trailing");
 
     let mut r = Reader::new(&buf);

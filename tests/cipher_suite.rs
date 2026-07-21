@@ -57,7 +57,7 @@ fn ch_with_suites(ch_bytes: &[u8], suites: Vec<u16>) -> Vec<u8> {
     };
     ch.cipher_suites = suites;
     let mut out = Vec::new();
-    Handshake::ClientHello(ch).encode(&mut out);
+    Handshake::ClientHello(ch).encode(&mut out).unwrap();
     out
 }
 

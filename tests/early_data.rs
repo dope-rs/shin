@@ -430,7 +430,7 @@ fn reencode_ch<F: FnOnce(&mut shin::handshake::ClientHello)>(
     };
     mutate(&mut ch);
     let mut out = Vec::new();
-    Handshake::ClientHello(ch).encode(&mut out);
+    Handshake::ClientHello(ch).encode(&mut out).unwrap();
     out
 }
 
@@ -496,7 +496,9 @@ fn server_caps_key_updates_per_record() {
     // Many KeyUpdate(request_update=1) in one record => bounded reply amplification.
     let mut record = Vec::new();
     for _ in 0..64 {
-        Handshake::KeyUpdate(KeyUpdate { request_update: 1 }).encode(&mut record);
+        Handshake::KeyUpdate(KeyUpdate { request_update: 1 })
+            .encode(&mut record)
+            .unwrap();
     }
     let err = s.read(Epoch::Application, &record).unwrap_err();
     assert_eq!(err, shin::Error::UnexpectedMessage);
@@ -508,7 +510,9 @@ fn server_allows_bounded_key_updates() {
     let mut s = established_server();
     let mut record = Vec::new();
     for _ in 0..8 {
-        Handshake::KeyUpdate(KeyUpdate { request_update: 0 }).encode(&mut record);
+        Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+            .encode(&mut record)
+            .unwrap();
     }
     s.read(Epoch::Application, &record).unwrap();
 }

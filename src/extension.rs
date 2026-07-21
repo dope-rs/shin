@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::codec::{DecodeError, Encode, Reader};
+use crate::codec::{DecodeError, Encode, EncodeError, Reader};
 
 pub const MAX_EXTENSIONS: usize = 64;
 
@@ -34,9 +34,12 @@ impl Extension {
         Self { ty, data }
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u16(self.ty.0);
-        out.put_vec_u16(|o| o.put_slice(&self.data));
+        out.put_vec_u16(|out| {
+            out.put_slice(&self.data);
+            Ok(())
+        })
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -45,12 +48,13 @@ impl Extension {
         Ok(Self { ty, data })
     }
 
-    pub fn encode_list(exts: &[Self], out: &mut Vec<u8>) {
+    pub fn encode_list(exts: &[Self], out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_vec_u16(|o| {
             for ext in exts {
-                ext.encode(o);
+                ext.encode(o)?;
             }
-        });
+            Ok(())
+        })
     }
 
     pub fn decode_list(r: &mut Reader<'_>) -> Result<Vec<Self>, DecodeError> {
