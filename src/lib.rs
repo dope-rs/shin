@@ -3,6 +3,14 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::fmt;
+
+use crate::alert::{Alert, AlertDescription};
+use crate::cert::CertError;
+use crate::chain::ChainError;
+use crate::codec::{DecodeError, EncodeError};
+use crate::hash::Digest;
+use crate::kdf::HkdfError;
 
 pub mod aead;
 pub mod alert;
@@ -63,8 +71,8 @@ pub enum Event {
     },
     KeysReady {
         epoch: Epoch,
-        read_secret: crate::hash::Digest,
-        write_secret: crate::hash::Digest,
+        read_secret: Digest,
+        write_secret: Digest,
     },
     PeerExtension {
         ty: u16,
@@ -72,7 +80,7 @@ pub enum Event {
     },
     KeyUpdate {
         direction: KeyDirection,
-        secret: crate::hash::Digest,
+        secret: Digest,
     },
     NewSessionTicket {
         ticket_lifetime: u32,
@@ -85,16 +93,16 @@ pub enum Event {
         psk: [u8; 32],
     },
     ZeroRttKeysReady {
-        secret: crate::hash::Digest,
+        secret: Digest,
     },
     EarlyDataAccepted,
     EarlyDataRejected,
     Done,
 }
 
-// Manual Debug so secret material is never written to logs (RFC 8446 §C.2).
-impl core::fmt::Debug for Event {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+/// Redacts secret material from logs as required by RFC 8446 §C.2.
+impl fmt::Debug for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const REDACTED: &str = "[redacted]";
         match self {
             Self::Send { epoch, data } => f
@@ -176,8 +184,8 @@ pub enum Error {
     KeyShareNotFound,
     NoApplicationProtocol,
     BadCertificate,
-    BadCertificateParse(crate::cert::CertError),
-    BadCertificateChain(crate::chain::ChainError),
+    BadCertificateParse(CertError),
+    BadCertificateChain(ChainError),
     NoTrustAnchorForIssuer(Vec<u8>),
     BadCertificateVerify,
     /// Client auth was `Required` but the client sent an empty Certificate
@@ -192,8 +200,8 @@ pub enum Error {
     Spki,
     Rng,
     Encode,
-    /// Configuration that cannot authenticate a peer (e.g. X.509 verifier with no
-    /// trust anchors). Surfaced by [`Config::validate`](crate::client::Config::validate).
+    /// Configuration that cannot authenticate a peer, surfaced by client or
+    /// server `Config::validate` before handshake work begins.
     BadConfig,
     /// An operation requiring a completed handshake was attempted too early
     /// (e.g. exporting keying material before the handshake finishes).
@@ -202,60 +210,60 @@ pub enum Error {
 
 impl Error {
     /// The fatal TLS alert to send the peer for this error (RFC 8446 §6.2).
-    pub fn alert(&self) -> crate::alert::Alert {
-        use crate::alert::{Alert, AlertDescription as D};
-        use crate::chain::ChainError;
+    pub fn alert(&self) -> Alert {
         let d = match self {
-            Self::Decode => D::DecodeError,
+            Self::Decode => AlertDescription::DecodeError,
             Self::IllegalParameter | Self::DowngradeDetected | Self::SigSchemeNotOffered => {
-                D::IllegalParameter
+                AlertDescription::IllegalParameter
             }
-            Self::UnexpectedMessage | Self::EarlyDataLimitExceeded => D::UnexpectedMessage,
+            Self::UnexpectedMessage | Self::EarlyDataLimitExceeded => {
+                AlertDescription::UnexpectedMessage
+            }
             Self::UnsupportedCipherSuite | Self::UnsupportedGroup | Self::UnsupportedSigScheme => {
-                D::HandshakeFailure
+                AlertDescription::HandshakeFailure
             }
-            Self::BadVersion => D::ProtocolVersion,
-            Self::HelloRetryRequest => D::InternalError,
-            Self::UnsolicitedExtension => D::UnsupportedExtension,
-            Self::MissingExtension => D::MissingExtension,
-            Self::KeyShareNotFound => D::HandshakeFailure,
-            Self::NoApplicationProtocol => D::NoApplicationProtocol,
-            Self::BadCertificate | Self::BadCertificateParse(_) => D::BadCertificate,
+            Self::BadVersion => AlertDescription::ProtocolVersion,
+            Self::HelloRetryRequest => AlertDescription::InternalError,
+            Self::UnsolicitedExtension => AlertDescription::UnsupportedExtension,
+            Self::MissingExtension => AlertDescription::MissingExtension,
+            Self::KeyShareNotFound => AlertDescription::HandshakeFailure,
+            Self::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
+            Self::BadCertificate | Self::BadCertificateParse(_) => AlertDescription::BadCertificate,
             Self::BadCertificateChain(ChainError::Expired | ChainError::NotYetValid) => {
-                D::CertificateExpired
+                AlertDescription::CertificateExpired
             }
             Self::NoTrustAnchorForIssuer(_)
-            | Self::BadCertificateChain(ChainError::NoTrustAnchor) => D::UnknownCa,
-            Self::BadCertificateChain(_) => D::BadCertificate,
-            Self::ClientCertRequired => D::CertificateRequired,
-            Self::AccessDenied => D::AccessDenied,
-            Self::BadCertificateVerify | Self::BadFinished => D::DecryptError,
-            Self::Kx => D::IllegalParameter,
+            | Self::BadCertificateChain(ChainError::NoTrustAnchor) => AlertDescription::UnknownCa,
+            Self::BadCertificateChain(_) => AlertDescription::BadCertificate,
+            Self::ClientCertRequired => AlertDescription::CertificateRequired,
+            Self::AccessDenied => AlertDescription::AccessDenied,
+            Self::BadCertificateVerify | Self::BadFinished => AlertDescription::DecryptError,
+            Self::Kx => AlertDescription::IllegalParameter,
             Self::Sig
             | Self::Spki
             | Self::Rng
             | Self::Encode
             | Self::BadConfig
-            | Self::NotReady => D::InternalError,
+            | Self::NotReady => AlertDescription::InternalError,
         };
         Alert::fatal(d)
     }
 }
 
-impl From<crate::codec::DecodeError> for Error {
-    fn from(_: crate::codec::DecodeError) -> Self {
+impl From<DecodeError> for Error {
+    fn from(_: DecodeError) -> Self {
         Self::Decode
     }
 }
 
-impl From<crate::codec::EncodeError> for Error {
-    fn from(_: crate::codec::EncodeError) -> Self {
+impl From<EncodeError> for Error {
+    fn from(_: EncodeError) -> Self {
         Self::Encode
     }
 }
 
-impl From<crate::kdf::HkdfError> for Error {
-    fn from(_: crate::kdf::HkdfError) -> Self {
+impl From<HkdfError> for Error {
+    fn from(_: HkdfError) -> Self {
         Self::Encode
     }
 }

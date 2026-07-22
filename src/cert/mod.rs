@@ -1,4 +1,5 @@
 use crate::asn1::{DerError, Reader, Tag, Tlv};
+use ring::signature::{self, UnparsedPublicKey};
 
 mod ext;
 
@@ -323,36 +324,41 @@ impl Cert<'_> {
         &self,
         issuer_spki: &SubjectPublicKeyInfo<'_>,
     ) -> Result<(), VerifyError> {
-        use ring::signature as s;
         let sig_oid = self.signature_alg.oid;
         let pk_oid = issuer_spki.algorithm.oid;
 
         match (sig_oid, pk_oid) {
             (a, p) if a == OID_SHA256_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                self.verify_with(issuer_spki, &s::RSA_PKCS1_2048_8192_SHA256)
+                self.verify_with(issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA256)
             }
             (a, p) if a == OID_SHA384_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                self.verify_with(issuer_spki, &s::RSA_PKCS1_2048_8192_SHA384)
+                self.verify_with(issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA384)
             }
             (a, p) if a == OID_SHA512_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                self.verify_with(issuer_spki, &s::RSA_PKCS1_2048_8192_SHA512)
+                self.verify_with(issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA512)
             }
             (a, p) if a == OID_ECDSA_SHA256 && p == OID_EC_PUBLIC_KEY => {
                 Self::check_named_curve(issuer_spki, OID_P256_CURVE)?;
-                self.verify_with(issuer_spki, &s::ECDSA_P256_SHA256_ASN1)
+                self.verify_with(issuer_spki, &signature::ECDSA_P256_SHA256_ASN1)
             }
             (a, p) if a == OID_ECDSA_SHA384 && p == OID_EC_PUBLIC_KEY => {
                 Self::check_named_curve(issuer_spki, OID_P384_CURVE)?;
-                self.verify_with(issuer_spki, &s::ECDSA_P384_SHA384_ASN1)
+                self.verify_with(issuer_spki, &signature::ECDSA_P384_SHA384_ASN1)
             }
             (a, p) if a == OID_ED25519 && p == OID_ED25519 => {
-                self.verify_with(issuer_spki, &s::ED25519)
+                self.verify_with(issuer_spki, &signature::ED25519)
             }
             (a, p) if a == OID_RSA_PSS && (p == OID_RSA_ENCRYPTION || p == OID_RSA_PSS) => {
                 match Self::pss_hash(self.signature_alg.parameters)? {
-                    PssHash::Sha256 => self.verify_with(issuer_spki, &s::RSA_PSS_2048_8192_SHA256),
-                    PssHash::Sha384 => self.verify_with(issuer_spki, &s::RSA_PSS_2048_8192_SHA384),
-                    PssHash::Sha512 => self.verify_with(issuer_spki, &s::RSA_PSS_2048_8192_SHA512),
+                    PssHash::Sha256 => {
+                        self.verify_with(issuer_spki, &signature::RSA_PSS_2048_8192_SHA256)
+                    }
+                    PssHash::Sha384 => {
+                        self.verify_with(issuer_spki, &signature::RSA_PSS_2048_8192_SHA384)
+                    }
+                    PssHash::Sha512 => {
+                        self.verify_with(issuer_spki, &signature::RSA_PSS_2048_8192_SHA512)
+                    }
                 }
             }
             (a, p) if Self::known_sig(a) && Self::known_pk(p) => {
@@ -362,12 +368,12 @@ impl Cert<'_> {
         }
     }
 
-    fn verify_with<A: ring::signature::VerificationAlgorithm>(
+    fn verify_with<A: signature::VerificationAlgorithm>(
         &self,
         issuer_spki: &SubjectPublicKeyInfo<'_>,
         alg: &'static A,
     ) -> Result<(), VerifyError> {
-        ring::signature::UnparsedPublicKey::new(alg, issuer_spki.subject_public_key)
+        UnparsedPublicKey::new(alg, issuer_spki.subject_public_key)
             .verify(self.tbs_der, self.signature)
             .map_err(|_| VerifyError::Failed)
     }

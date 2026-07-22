@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
+use core::ops::Range;
 
 use crate::aead::{AeadError, AeadKey};
 use crate::hash::HashAlg;
@@ -336,7 +337,6 @@ impl Sealer {
         Ok(())
     }
 
-    #[inline(always)]
     fn seal_record(
         &mut self,
         inner_type: ContentType,
@@ -418,7 +418,7 @@ impl Opener {
     pub fn open(
         &mut self,
         input: &mut [u8],
-    ) -> Result<Option<(ContentType, core::ops::Range<usize>, usize)>, RecordError> {
+    ) -> Result<Option<(ContentType, Range<usize>, usize)>, RecordError> {
         if self.poisoned {
             return Err(RecordError::Poisoned);
         }
@@ -458,21 +458,20 @@ impl Opener {
         self.seq += 1;
 
         let inner_slice = &input[HEADER_LEN..HEADER_LEN + plaintext_len];
-        let inner_type_pos = inner_slice
+        let content_len = inner_slice
             .iter()
             .rposition(|&b| b != 0)
             .ok_or(RecordError::AllZeroInner)?;
-        // RFC 8446 §5.4: the 2^14 limit is on de-padded content, not the padded plaintext.
-        if inner_type_pos > MAX_PLAINTEXT_BODY {
+        if content_len > MAX_PLAINTEXT_BODY {
             return Err(RecordError::RecordOverflow);
         }
-        let inner_type = ContentType::from_u8(inner_slice[inner_type_pos])?;
+        let inner_type = ContentType::from_u8(inner_slice[content_len])?;
         if inner_type == ContentType::ChangeCipherSpec {
             return Err(RecordError::UnexpectedChangeCipherSpec);
         }
 
         let plaintext_start = HEADER_LEN;
-        let plaintext_end = HEADER_LEN + inner_type_pos;
+        let plaintext_end = HEADER_LEN + content_len;
         Ok(Some((inner_type, plaintext_start..plaintext_end, total)))
     }
 }

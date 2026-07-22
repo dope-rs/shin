@@ -1,13 +1,16 @@
 use alloc::vec::Vec;
 
-use ring::hmac;
+use ring::hmac::{self, Key};
 
 use crate::codec::{DecodeError, Encode, EncodeError, Reader};
 use crate::extension::Extension;
 use crate::hash::{Digest, HashAlg, MAX_HASH_LEN};
 use crate::kdf::{Hkdf, HkdfError};
-use crate::{Epoch, Error};
 use zeroize::Zeroize;
+
+pub(crate) mod reassemblers;
+
+pub use reassemblers::HsReassembler;
 
 pub const RANDOM_LEN: usize = 32;
 pub const TLS_1_3: u16 = 0x0304;
@@ -29,73 +32,9 @@ pub const MAX_HANDSHAKE_SIZE: usize = 256 * 1024;
 /// churn from KeyUpdates coalesced into a single record.
 pub const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
 
-/// Cap on post-handshake KeyUpdates accepted without intervening application-data
-/// progress, bounding rekey churn across records. A legitimate peer interleaves
-/// KeyUpdates with application data (which resets the count via
-/// `note_application_data`); a flooder sending one KeyUpdate per record with no
-/// app data in between trips this cap and is aborted.
+/// Post-handshake KeyUpdates accepted without application-data progress before
+/// the peer is aborted.
 pub const MAX_KEY_UPDATES_WITHOUT_APP_DATA: u32 = 8;
-
-/// Inbound handshake message source: reassembles messages fragmented across or
-/// coalesced within records (RFC 8446 §5.1), then hands them back decoded one at
-/// a time alongside their raw bytes (which feed the transcript). A single message
-/// may not span a record epoch change.
-#[derive(Default)]
-pub struct HsReassembler {
-    buf: Vec<u8>,
-    /// Read cursor into `buf`; the consumed prefix is compacted away on `push`,
-    /// so draining is O(remaining) per record rather than O(n) per message.
-    pos: usize,
-    epoch: Option<Epoch>,
-    key_updates: u32,
-}
-
-impl HsReassembler {
-    /// Appends a record's handshake bytes, first compacting the prefix consumed
-    /// by previous reads so only the pending partial message is retained.
-    pub fn push(&mut self, epoch: Epoch, data: &[u8]) -> Result<(), DecodeError> {
-        if self.pos > 0 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-        if !self.buf.is_empty() && self.epoch != Some(epoch) {
-            return Err(DecodeError::HandshakeSpansEpoch);
-        }
-        self.buf.extend_from_slice(data);
-        self.epoch = Some(epoch);
-        self.key_updates = 0;
-        Ok(())
-    }
-
-    /// Returns the next message with its raw bytes, or `None` until the buffer
-    /// holds a complete message.
-    pub fn next_message(&mut self) -> Result<Option<(Handshake, Vec<u8>)>, Error> {
-        let buf = &self.buf[self.pos..];
-        if buf.len() < 4 {
-            return Ok(None);
-        }
-        let msg_len = 4 + u32::from_be_bytes([0, buf[1], buf[2], buf[3]]) as usize;
-        if msg_len > MAX_HANDSHAKE_SIZE {
-            return Err(DecodeError::HandshakeTooLarge.into());
-        }
-        if buf.len() < msg_len {
-            return Ok(None);
-        }
-        let raw = buf[..msg_len].to_vec();
-        self.pos += msg_len;
-
-        let mut r = Reader::new(&raw);
-        let msg = Handshake::decode(&mut r)?;
-        r.finish()?;
-        if matches!(msg, Handshake::KeyUpdate(_)) {
-            self.key_updates += 1;
-            if self.key_updates > MAX_KEY_UPDATES_PER_RECORD {
-                return Err(Error::UnexpectedMessage);
-            }
-        }
-        Ok(Some((msg, raw)))
-    }
-}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +215,20 @@ pub struct Certificate {
 }
 
 impl Certificate {
+    pub(crate) fn chain_fits(chain_der: &[Vec<u8>]) -> bool {
+        const FIXED_MESSAGE_BYTES: usize = 4 + 1 + 3;
+        const ENTRY_FRAMING_BYTES: usize = 3 + 2;
+        if chain_der.len() > MAX_CERTIFICATE_ENTRIES {
+            return false;
+        }
+        chain_der
+            .iter()
+            .try_fold(FIXED_MESSAGE_BYTES, |message_len, certificate| {
+                message_len.checked_add(ENTRY_FRAMING_BYTES + certificate.len())
+            })
+            .is_some_and(|message_len| message_len <= MAX_HANDSHAKE_SIZE)
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_vec_u8(|o| {
             o.put_slice(&self.certificate_request_context);
@@ -306,10 +259,8 @@ impl Certificate {
     }
 }
 
-/// RFC 8446 §4.3.2. In TLS 1.3 the request carries an (here always empty)
-/// context that the client echoes in its Certificate, plus extensions — of
-/// which `signature_algorithms` is mandatory and lists the schemes the server
-/// will accept in the client's CertificateVerify.
+/// TLS 1.3 client-auth context and extensions; `signature_algorithms` declares
+/// schemes accepted for CertificateVerify (RFC 8446 §4.3.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateRequest {
     pub certificate_request_context: Vec<u8>,
@@ -388,7 +339,7 @@ impl Finished {
         let mut fkey_buf = [0u8; MAX_HASH_LEN];
         let fkey = &mut fkey_buf[..alg.output_len()];
         Hkdf::new(alg).expand_label(traffic_secret, "finished", &[], fkey)?;
-        let key = hmac::Key::new(alg.hmac(), fkey);
+        let key = Key::new(alg.hmac(), fkey);
         let mac = Digest::from_slice(hmac::sign(&key, transcript_hash).as_ref());
         fkey.zeroize();
         Ok(mac)

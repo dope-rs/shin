@@ -134,7 +134,7 @@ impl Alert {
     /// Encode this alert as a plaintext alert record (content type 21). Used for
     /// alerts sent before the handshake traffic keys are established; later
     /// alerts must be sealed under the current epoch instead.
-    pub fn to_plaintext_record(self) -> Result<Vec<u8>, RecordError> {
+    pub fn to_plaintext_record(&self) -> Result<Vec<u8>, RecordError> {
         PlaintextRecord::encode(ContentType::Alert, &self.body())
     }
 }

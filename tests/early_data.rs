@@ -553,6 +553,36 @@ fn nst_advertises_early_data_when_accept_enabled() {
 }
 
 #[test]
+fn nst_does_not_advertise_early_data_without_replay_guard() {
+    use shin::codec::Reader;
+    use shin::handshake::Handshake;
+
+    let mut s = server_no_guard(true, NOW_MS);
+    let mut c = client(None, false);
+    let c1 = c.start().unwrap();
+    let ch = find_send(&c1, Epoch::Plaintext).unwrap();
+    let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
+    let sh = find_send(&s1, Epoch::Plaintext).unwrap();
+    let s_hs = find_send(&s1, Epoch::Handshake).unwrap();
+    c.read(Epoch::Plaintext, &sh).unwrap();
+    let c3 = c.read(Epoch::Handshake, &s_hs).unwrap();
+    let cf = find_send(&c3, Epoch::Handshake).unwrap();
+    let s2 = s.read(Epoch::Handshake, &cf).unwrap();
+    let nst_bytes = find_send(&s2, Epoch::Application).unwrap();
+
+    let mut r = Reader::new(&nst_bytes);
+    let Handshake::NewSessionTicket(nst) = Handshake::decode(&mut r).unwrap() else {
+        panic!("expected NewSessionTicket")
+    };
+    assert!(
+        nst.extensions
+            .iter()
+            .all(|extension| extension.ty != ExtensionType::EARLY_DATA),
+        "0-RTT cannot be advertised when replay protection is unavailable",
+    );
+}
+
+#[test]
 fn nst_omits_early_data_when_accept_disabled() {
     use shin::codec::Reader;
     use shin::extension::ExtensionType;

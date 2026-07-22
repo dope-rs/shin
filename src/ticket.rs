@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use ring::aead::{self, LessSafeKey, Nonce, UnboundKey};
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::SecureRandom;
 
 use crate::hash::HashAlg;
@@ -66,7 +66,7 @@ impl TicketSecret {
         buf.extend_from_slice(&suite.to_be_bytes());
         buf.push(alpn.len() as u8);
         buf.extend_from_slice(alpn);
-        key.seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut buf)
+        key.seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
             .map_err(|_| TicketError::BadAuth)?;
 
         let mut out = Vec::with_capacity(TICKET_NONCE_LEN + buf.len());
@@ -86,7 +86,7 @@ impl TicketSecret {
 
         let mut buf = ticket[TICKET_NONCE_LEN..].to_vec();
         let plain = key
-            .open_in_place(nonce, aead::Aad::empty(), &mut buf)
+            .open_in_place(nonce, Aad::empty(), &mut buf)
             .map_err(|_| TicketError::BadAuth)?;
         if plain.len() < FIXED_PLAINTEXT_LEN {
             return Err(TicketError::BadFormat);
@@ -128,20 +128,23 @@ pub struct DecryptedTicket {
 /// rotation window. Produced by [`TicketRotator`].
 #[derive(Clone)]
 pub struct TicketKeys {
-    current: [u8; 32],
-    previous: Option<[u8; 32]>,
+    current: TicketSecret,
+    previous: Option<TicketSecret>,
 }
 
 impl TicketKeys {
     pub fn single(secret: [u8; 32]) -> Self {
         Self {
-            current: secret,
+            current: TicketSecret::new(secret),
             previous: None,
         }
     }
 
     pub fn with_previous(current: [u8; 32], previous: Option<[u8; 32]>) -> Self {
-        Self { current, previous }
+        Self {
+            current: TicketSecret::new(current),
+            previous: previous.map(TicketSecret::new),
+        }
     }
 
     pub fn encrypt(
@@ -153,24 +156,23 @@ impl TicketKeys {
         alpn: &[u8],
         rng: &impl SecureRandom,
     ) -> Result<Vec<u8>, TicketError> {
-        TicketSecret::new(self.current).encrypt(psk, age_add, issued_at_ms, suite, alpn, rng)
+        self.current
+            .encrypt(psk, age_add, issued_at_ms, suite, alpn, rng)
     }
 
     pub fn decrypt(&self, ticket: &[u8]) -> Result<DecryptedTicket, TicketError> {
-        match TicketSecret::new(self.current).decrypt(ticket) {
+        match self.current.decrypt(ticket) {
             Ok(v) => Ok(v),
-            Err(e) => match self.previous {
-                Some(prev) => TicketSecret::new(prev).decrypt(ticket),
+            Err(e) => match &self.previous {
+                Some(previous) => previous.decrypt(ticket),
                 None => Err(e),
             },
         }
     }
 }
 
-/// Rolls the ticket key once it is older than `rotate_after_ms` or has sealed
-/// `rotate_after_count` tickets, keeping the displaced key as `previous` for one
-/// generation. [`issuing_keys`](Self::issuing_keys) seals,
-/// [`accepting_keys`](Self::accepting_keys) opens.
+/// Rolls a ticket key by age or seal count and retains one previous generation;
+/// [`issuing_keys`](Self::issuing_keys) seals and [`accepting_keys`](Self::accepting_keys) opens.
 pub struct TicketRotator {
     current: [u8; 32],
     previous: Option<[u8; 32]>,
@@ -230,8 +232,8 @@ impl TicketRotator {
     /// Current + previous keys for opening an inbound ticket. Never rotates.
     pub fn accepting_keys(&self) -> TicketKeys {
         TicketKeys {
-            current: self.current,
-            previous: self.previous,
+            current: TicketSecret::new(self.current),
+            previous: self.previous.map(TicketSecret::new),
         }
     }
 }

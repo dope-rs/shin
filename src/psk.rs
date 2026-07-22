@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use ring::hmac;
+use ring::hmac::{self, Key};
 
 use crate::codec::{DecodeError, Encode, EncodeError, Reader};
 use crate::hash::{HASH_LEN, HashAlg, Transcript};
@@ -112,6 +112,19 @@ impl Offer {
             binders,
         })
     }
+
+    /// ClientHello prefix covered by a single resumption binder.
+    pub(crate) fn binder_transcript_prefix(
+        encoded_client_hello: &[u8],
+        binder_len: usize,
+    ) -> Option<&[u8]> {
+        const BINDER_LIST_LENGTH_BYTES: usize = 2;
+        const BINDER_LENGTH_BYTES: usize = 1;
+        let field_len = BINDER_LIST_LENGTH_BYTES
+            .checked_add(BINDER_LENGTH_BYTES)?
+            .checked_add(binder_len)?;
+        encoded_client_hello.get(..encoded_client_hello.len().checked_sub(field_len)?)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +168,7 @@ impl ResumptionBinder {
         )?;
         let mut finished_key = [0u8; HASH_LEN];
         hkdf.expand_label(binder_key.as_slice(), "finished", &[], &mut finished_key)?;
-        let key = hmac::Key::new(RESUMPTION_HASH.hmac(), &finished_key);
+        let key = Key::new(RESUMPTION_HASH.hmac(), &finished_key);
         let tag = hmac::sign(&key, partial_ch_hash);
         let mut out = [0u8; HASH_LEN];
         out.copy_from_slice(tag.as_ref());

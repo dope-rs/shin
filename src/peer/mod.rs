@@ -1,13 +1,10 @@
-//! Peer-certificate public-key extraction and CertificateVerify signature
-//! checking, shared by the client (verifying the server) and the server
-//! (verifying a client under mutual TLS). Keeping the verify match in one place
-//! means the security-critical (key-kind, signature-scheme) pairing is reviewed
-//! and tested once.
+//! Shared peer-key extraction and CertificateVerify checking. Centralizing the
+//! key-kind/signature-scheme pairing keeps both handshake directions identical.
 
 use alloc::vec::Vec;
 
 use crate::Error;
-use crate::cert::Cert;
+use crate::cert::{Cert, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION};
 use crate::proto::{
     SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_ED25519, SIG_RSA_PSS_RSAE_SHA256,
     SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512,
@@ -84,11 +81,11 @@ impl LeafKey {
     pub(crate) fn parse_x509(leaf_der: &[u8]) -> Result<(Self, Vec<u8>), Error> {
         let cert = Cert::parse(leaf_der).map_err(Error::BadCertificateParse)?;
         let spki = cert.spki;
-        let kind = if spki.algorithm.oid == crate::cert::OID_ED25519 {
+        let kind = if spki.algorithm.oid == OID_ED25519 {
             LeafKeyKind::Ed25519
-        } else if spki.algorithm.oid == crate::cert::OID_EC_PUBLIC_KEY {
+        } else if spki.algorithm.oid == OID_EC_PUBLIC_KEY {
             LeafKeyKind::Ecdsa
-        } else if spki.algorithm.oid == crate::cert::OID_RSA_ENCRYPTION {
+        } else if spki.algorithm.oid == OID_RSA_ENCRYPTION {
             LeafKeyKind::Rsa
         } else {
             return Err(Error::UnsupportedSigScheme);

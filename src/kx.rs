@@ -1,10 +1,11 @@
 use alloc::vec::Vec;
 use core::convert::Infallible;
+use core::fmt;
 
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{
-    Ciphertext as MlKemCiphertext, EncapsulationKey, KeyExport, MlKem768, TryKeyInit,
-    kem::Kem as _, ml_kem_768::DecapsulationKey,
+    Ciphertext, EncapsulationKey, KeyExport, MlKem768, TryKeyInit, kem::Kem as _,
+    ml_kem_768::DecapsulationKey,
 };
 use rand_core::{TryCryptoRng, TryRng};
 use ring::agreement::{self, Algorithm, ECDH_P256, EphemeralPrivateKey, UnparsedPublicKey, X25519};
@@ -52,8 +53,8 @@ impl Drop for SharedSecret {
     }
 }
 
-impl core::fmt::Debug for SharedSecret {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for SharedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedSecret([redacted; {}])", self.len)
     }
 }
@@ -72,10 +73,8 @@ pub enum KexGroup {
 }
 
 impl KexGroup {
-    /// Advertised in preference order. X25519MLKEM768 is offered but kept last so
-    /// that peers offering classical groups keep the smaller, established
-    /// exchange; the post-quantum group is selected only when a client commits a
-    /// key share for it.
+    /// Preference order keeps X25519MLKEM768 last, selecting it only when the
+    /// client commits a hybrid key share.
     pub const SUPPORTED: [KexGroup; 3] = [
         KexGroup::X25519,
         KexGroup::Secp256r1,
@@ -223,7 +222,7 @@ impl EphemeralKey {
                     return Err(KxError::InvalidPubkey);
                 }
                 let (ct_bytes, x25519_server_pk) = server_share.split_at(MLKEM768_CT_LEN);
-                let ct = MlKemCiphertext::<MlKem768>::try_from(ct_bytes)
+                let ct = Ciphertext::<MlKem768>::try_from(ct_bytes)
                     .map_err(|_| KxError::InvalidPubkey)?;
                 let mlkem_ss = mlkem_dk.decapsulate(&ct);
                 let peer = UnparsedPublicKey::new(&X25519, x25519_server_pk);

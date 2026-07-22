@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use crate::hash::{Digest, HashAlg, MAX_HASH_LEN, Secret};
 use zeroize::Zeroize;
 
-use ring::hmac;
+use ring::hmac::{self, Context, Key};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HkdfError {
@@ -23,7 +23,7 @@ impl Hkdf {
     }
 
     pub fn extract(self, salt: &[u8], ikm: &[u8]) -> Secret {
-        let key = hmac::Key::new(self.alg.hmac(), salt);
+        let key = Key::new(self.alg.hmac(), salt);
         Secret::from_slice(hmac::sign(&key, ikm).as_ref())
     }
 
@@ -34,12 +34,12 @@ impl Hkdf {
             return Err(HkdfError::OutputTooLong);
         }
 
-        let key = hmac::Key::new(self.alg.hmac(), prk);
+        let key = Key::new(self.alg.hmac(), prk);
         let mut t_prev = [0u8; MAX_HASH_LEN];
         let mut t_prev_len = 0;
         let mut written = 0;
         for counter in 1..=block_count {
-            let mut ctx = hmac::Context::with_key(&key);
+            let mut ctx = Context::with_key(&key);
             ctx.update(&t_prev[..t_prev_len]);
             ctx.update(info);
             ctx.update(&[counter as u8]);

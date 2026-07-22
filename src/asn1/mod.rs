@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::mem::size_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DerError {
@@ -129,7 +130,7 @@ impl<'a> Tlv<'a> {
         if n == 0 {
             return Err(DerError::BadLength);
         }
-        if n > core::mem::size_of::<usize>() {
+        if n > size_of::<usize>() {
             return Err(DerError::BadLength);
         }
         if after.len() < n {

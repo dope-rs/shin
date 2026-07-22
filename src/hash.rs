@@ -1,4 +1,9 @@
-use ring::digest::{Context, SHA256, SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN};
+use core::fmt;
+
+use ring::{
+    digest::{self, Context, SHA256, SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN},
+    hmac,
+};
 
 use zeroize::Zeroize;
 
@@ -23,22 +28,22 @@ impl HashAlg {
         }
     }
 
-    pub(crate) fn ring(self) -> &'static ring::digest::Algorithm {
+    pub(crate) fn ring(self) -> &'static digest::Algorithm {
         match self {
             Self::Sha256 => &SHA256,
             Self::Sha384 => &SHA384,
         }
     }
 
-    pub(crate) fn hmac(self) -> ring::hmac::Algorithm {
+    pub(crate) fn hmac(self) -> hmac::Algorithm {
         match self {
-            Self::Sha256 => ring::hmac::HMAC_SHA256,
-            Self::Sha384 => ring::hmac::HMAC_SHA384,
+            Self::Sha256 => hmac::HMAC_SHA256,
+            Self::Sha384 => hmac::HMAC_SHA384,
         }
     }
 
     pub fn hash(self, data: &[u8]) -> Digest {
-        Digest::from_slice(ring::digest::digest(self.ring(), data).as_ref())
+        Digest::from_slice(digest::digest(self.ring(), data).as_ref())
     }
 }
 
@@ -90,8 +95,8 @@ impl PartialEq for Digest {
 
 impl Eq for Digest {}
 
-impl core::fmt::Debug for Digest {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Digest([redacted; {}])", self.len)
     }
 }
@@ -131,7 +136,10 @@ impl Secret {
     }
 
     pub fn to_digest(&self) -> Digest {
-        Digest::from_slice(self.as_slice())
+        Digest {
+            bytes: self.bytes,
+            len: self.len,
+        }
     }
 }
 
@@ -141,8 +149,8 @@ impl Drop for Secret {
     }
 }
 
-impl core::fmt::Debug for Secret {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Secret([redacted; {}])", self.len)
     }
 }

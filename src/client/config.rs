@@ -1,8 +1,9 @@
 use alloc::vec::Vec;
 
 use crate::Error;
-use crate::cert::{Cert, SubjectPublicKeyInfo};
+use crate::cert::{Cert, CertError, SubjectPublicKeyInfo};
 use crate::chain::TrustAnchor;
+use crate::handshake::Certificate;
 use crate::proto::{CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509};
 use crate::sig::{self, SigningKey};
 
@@ -35,13 +36,14 @@ pub enum Verifier {
 }
 
 impl Config {
-    /// Reject obviously-broken configuration before a handshake starts: an X.509
-    /// verifier needs at least one trust anchor and a non-empty server name, and
-    /// lengths that would overflow their wire encodings (and thus panic during
-    /// ClientHello construction) are refused up front.
+    /// Reject unusable trust, identity, or wire-length settings before the
+    /// handshake starts.
     pub fn validate(&self) -> Result<(), Error> {
         if let Verifier::X509 { anchors, hostname } = &self.verifier
-            && (anchors.is_empty() || hostname.is_empty())
+            && (anchors.is_empty()
+                || hostname.is_empty()
+                || hostname.len() > u16::MAX as usize - 3
+                || anchors.iter().any(|anchor| anchor.view().is_err()))
         {
             return Err(Error::BadConfig);
         }
@@ -58,6 +60,11 @@ impl Config {
         if alpn_total > u16::MAX as usize {
             return Err(Error::BadConfig);
         }
+        if self.resumption.as_ref().is_some_and(|resumption| {
+            resumption.ticket.is_empty() || resumption.ticket.len() > u16::MAX as usize
+        }) {
+            return Err(Error::BadConfig);
+        }
         Ok(())
     }
 }
@@ -69,7 +76,7 @@ pub struct OwnedTrustAnchor {
 }
 
 impl OwnedTrustAnchor {
-    pub fn from_cert_der(cert_der: &[u8]) -> Result<Self, crate::cert::CertError> {
+    pub fn from_cert_der(cert_der: &[u8]) -> Result<Self, CertError> {
         let cert = Cert::parse(cert_der)?;
         Ok(Self {
             subject_der: cert.subject_der.to_vec(),
@@ -102,6 +109,17 @@ pub enum ClientCertSource {
 }
 
 impl ClientCertSource {
+    pub(super) fn validate(&self) -> Result<(), Error> {
+        let valid = match self {
+            Self::RawPublicKey { signing_key } => signing_key.is_ed25519(),
+            Self::X509 {
+                chain_der,
+                signing_key,
+            } => Certificate::chain_fits(chain_der) && signing_key.matches_x509_chain(chain_der),
+        };
+        if valid { Ok(()) } else { Err(Error::BadConfig) }
+    }
+
     pub(super) fn signing_key(&self) -> &SigningKey {
         match self {
             Self::RawPublicKey { signing_key } => signing_key,

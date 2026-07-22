@@ -104,7 +104,7 @@ fn drive<V: ClientCertVerifier>(
         client.set_client_cert(cc);
     }
 
-    let c1 = client.start().unwrap();
+    let c1 = client.start()?;
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch)?;
     let sh = find_send(&s1, Epoch::Plaintext).unwrap();
@@ -244,9 +244,7 @@ fn unauthorized_client_key_rejected() {
 }
 
 #[test]
-fn tampered_client_cert_verify_rejected() {
-    // Client presents cert C (public key K1) but signs CertificateVerify with a
-    // DIFFERENT key K2 — possession of K1 is therefore NOT proven.
+fn mismatched_client_certificate_key_is_bad_config() {
     let (server_der, server_key) = ecdsa_p256_self_signed(SERVER_NAME);
     let (client_der, _k1) = ecdsa_p256_self_signed(CLIENT_NAME);
     let (_decoy, k2) = ecdsa_p256_self_signed(CLIENT_NAME);
@@ -269,5 +267,5 @@ fn tampered_client_cert_verify_rejected() {
         now * 1000,
     )
     .unwrap_err();
-    assert_eq!(err, Error::BadCertificateVerify);
+    assert_eq!(err, Error::BadConfig);
 }

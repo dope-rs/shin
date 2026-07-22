@@ -1,12 +1,14 @@
 use alloc::vec::Vec;
 
 use crate::cert::{
-    BasicConstraints, Cert, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage, NameConstraints,
-    OID_EKU_ANY, OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE,
-    OID_EXT_KEY_USAGE, OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN, SubjectPublicKeyInfo, VerifyError,
+    BasicConstraints, Cert, CertError, ExtensionEntry, ExtensionIter, GeneralName, KeyUsage,
+    NameConstraints, OID_EKU_ANY, OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS,
+    OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE, OID_EXT_NAME_CONSTRAINTS, OID_EXT_SAN,
+    SubjectPublicKeyInfo, VerifyError,
 };
 use crate::hostname::Hostname;
 use crate::time::UnixTime;
+use core::str;
 
 pub const MAX_CHAIN_LEN: usize = 10;
 
@@ -39,8 +41,8 @@ impl From<VerifyError> for ChainError {
     }
 }
 
-impl From<crate::cert::CertError> for ChainError {
-    fn from(_: crate::cert::CertError) -> Self {
+impl From<CertError> for ChainError {
+    fn from(_: CertError) -> Self {
         Self::Parse
     }
 }
@@ -414,7 +416,7 @@ impl<'a, 'der> Chain<'a, 'der> {
     }
 
     fn parse_ip(host: &[u8]) -> Option<Vec<u8>> {
-        let s = core::str::from_utf8(host).ok()?;
+        let s = str::from_utf8(host).ok()?;
         if s.contains(':') {
             Self::parse_ipv6(s)
         } else {
@@ -438,7 +440,7 @@ impl<'a, 'der> Chain<'a, 'der> {
         Some(out)
     }
 
-    // RFC 4291 IPv6: "::" compression and a trailing embedded IPv4. Returns 16 bytes.
+    /// Parses RFC 4291 IPv6, including `::` compression and trailing embedded IPv4.
     fn parse_ipv6(s: &str) -> Option<Vec<u8>> {
         let (head, tail, compressed) = match s.find("::") {
             Some(i) => {
@@ -470,7 +472,7 @@ impl<'a, 'der> Chain<'a, 'der> {
         }
     }
 
-    // One "::"-delimited side -> (bytes, group count); an embedded IPv4 is 2 groups.
+    /// Parses one `::`-delimited side; embedded IPv4 contributes two groups.
     fn parse_v6_part(part: &str) -> Option<(Vec<u8>, usize)> {
         if part.is_empty() {
             return Some((Vec::new(), 0));

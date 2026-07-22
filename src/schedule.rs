@@ -1,5 +1,6 @@
 use crate::hash::{Digest, HASH_LEN, HashAlg, MAX_HASH_LEN, Secret, Transcript};
 use crate::kdf::{Hkdf, HkdfError};
+use crate::psk::RESUMPTION_HASH;
 use zeroize::Zeroize;
 
 pub struct KeySchedule {
@@ -128,7 +129,7 @@ impl KeySchedule {
         transcript_hash: &[u8],
     ) -> Result<Secret, HkdfError> {
         let zero = [0u8; HASH_LEN];
-        let hkdf = Hkdf::new(crate::psk::RESUMPTION_HASH);
+        let hkdf = Hkdf::new(RESUMPTION_HASH);
         let early = hkdf.extract(&zero, psk);
         hkdf.derive_secret(early.as_slice(), "c e traffic", transcript_hash)
     }
@@ -151,12 +152,7 @@ impl ResumptionMaster {
 
     pub fn psk(&self, nonce: &[u8]) -> Result<[u8; HASH_LEN], HkdfError> {
         let mut out = [0u8; HASH_LEN];
-        Hkdf::new(crate::psk::RESUMPTION_HASH).expand_label(
-            &self.0,
-            "resumption",
-            nonce,
-            &mut out,
-        )?;
+        Hkdf::new(RESUMPTION_HASH).expand_label(&self.0, "resumption", nonce, &mut out)?;
         Ok(out)
     }
 }

@@ -9,6 +9,8 @@ use ring::signature::{
     RsaKeyPair, UnparsedPublicKey,
 };
 
+use crate::cert::{Cert, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION, SubjectPublicKeyInfo};
+
 pub const PUBKEY_LEN: usize = 32;
 pub const SIG_LEN: usize = 64;
 pub const SEED_LEN: usize = 32;
@@ -159,6 +161,45 @@ impl SigningKey {
             SigningKeyInner::EcdsaP384(_) => 0x0503,
             SigningKeyInner::Rsa(_) => 0x0804,
         }
+    }
+
+    pub(crate) fn is_ed25519(&self) -> bool {
+        matches!(self.0.as_ref(), SigningKeyInner::Ed25519(_))
+    }
+
+    pub(crate) fn matches_spki(&self, spki: &SubjectPublicKeyInfo<'_>) -> bool {
+        match self.0.as_ref() {
+            SigningKeyInner::Ed25519(key) => {
+                spki.algorithm.oid == OID_ED25519
+                    && spki.subject_public_key == key.pubkey.as_slice()
+            }
+            SigningKeyInner::EcdsaP256(key) => {
+                spki.algorithm.oid == OID_EC_PUBLIC_KEY
+                    && spki.subject_public_key == key.pubkey_uncompressed
+            }
+            SigningKeyInner::EcdsaP384(key) => {
+                spki.algorithm.oid == OID_EC_PUBLIC_KEY
+                    && spki.subject_public_key == key.pubkey_uncompressed
+            }
+            SigningKeyInner::Rsa(key) => {
+                spki.algorithm.oid == OID_RSA_ENCRYPTION
+                    && spki.subject_public_key == key.public_key_der
+            }
+        }
+    }
+
+    pub(crate) fn matches_x509_chain(&self, chain_der: &[Vec<u8>]) -> bool {
+        let Some(leaf_der) = chain_der.first() else {
+            return false;
+        };
+        let Ok(leaf) = Cert::parse(leaf_der) else {
+            return false;
+        };
+        self.matches_spki(&leaf.spki)
+            && chain_der
+                .iter()
+                .skip(1)
+                .all(|certificate| Cert::parse(certificate).is_ok())
     }
 }
 

@@ -329,3 +329,32 @@ fn config_validate_rejects_oversized_alpn_and_transport_params() {
 
     base().validate().unwrap();
 }
+
+#[test]
+fn server_config_validate_rejects_inconsistent_identity() {
+    let (certificate, _) = ed25519_self_signed();
+    let (_, unrelated_key) = ed25519_self_signed();
+    let mismatched = ServerConfig {
+        source: CertSource::X509 {
+            chain_der: vec![certificate],
+            signing_key: unrelated_key,
+        },
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        ticket_keys: None,
+        accept_early_data: false,
+    };
+    assert_eq!(mismatched.validate(), Err(shin::Error::BadConfig));
+
+    let empty_chain = ServerConfig {
+        source: CertSource::X509 {
+            chain_der: Vec::new(),
+            signing_key: ed25519_self_signed().1,
+        },
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        ticket_keys: None,
+        accept_early_data: false,
+    };
+    assert_eq!(empty_chain.validate(), Err(shin::Error::BadConfig));
+}

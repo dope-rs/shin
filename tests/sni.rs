@@ -2,6 +2,7 @@ use shin::client::{Client, Config, OwnedTrustAnchor, Verifier};
 use shin::codec::Reader;
 use shin::extension::ExtensionType;
 use shin::handshake::{ClientHello, Handshake};
+use shin::spki::SubjectPublicKey;
 use shin::{Epoch, Event};
 
 fn drive_client_hello(verifier: Verifier) -> ClientHello {
@@ -37,7 +38,7 @@ fn x509_verifier(hostname: &[u8]) -> Verifier {
     Verifier::X509 {
         anchors: vec![OwnedTrustAnchor {
             subject_der: vec![0x30, 0x00],
-            spki_der: vec![0x30, 0x00],
+            spki_der: SubjectPublicKey::Ed25519([0; 32]).encode().unwrap(),
         }],
         hostname: hostname.to_vec(),
     }
