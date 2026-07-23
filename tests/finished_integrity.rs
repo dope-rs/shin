@@ -5,9 +5,12 @@
 
 use ring::rand::{SecureRandom, SystemRandom};
 use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
+
+mod common;
+use common::{Server, ServerConfig};
 
 type TestServer = Server<fn() -> u64>;
 

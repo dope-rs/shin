@@ -1,7 +1,9 @@
 use alloc::vec::Vec;
 
 use crate::Error;
+use crate::marker::ThreadBound;
 use crate::record::CipherSuite;
+use zeroize::Zeroize;
 
 use super::EarlyDataGuard;
 
@@ -18,6 +20,7 @@ pub(super) struct AcceptedPsk {
     pub(super) obfuscated_ticket_age: u32,
     pub(super) binder: Vec<u8>,
     pub(super) alpn: Vec<u8>,
+    pub(super) _thread: ThreadBound,
 }
 
 impl AcceptedPsk {
@@ -27,33 +30,38 @@ impl AcceptedPsk {
     }
 }
 
-/// Couples 0-RTT policy, replay storage, freshness, and byte budget so advertised
-/// early data is both safe to accept and closed at EndOfEarlyData.
-pub(super) struct EarlyDataAdmission<G> {
+impl Drop for AcceptedPsk {
+    fn drop(&mut self) {
+        self.psk.zeroize();
+    }
+}
+
+pub(super) struct EarlyDataAdmission {
     enabled: bool,
-    guard: Option<G>,
     remaining: Option<u32>,
 }
 
-impl<G: EarlyDataGuard> EarlyDataAdmission<G> {
-    pub(super) fn new(configured: bool, guard: Option<G>) -> Self {
+impl EarlyDataAdmission {
+    pub(super) fn new() -> Self {
         Self {
-            enabled: configured && guard.is_some(),
-            guard,
+            enabled: false,
             remaining: None,
         }
     }
 
-    pub(super) fn admit(
+    pub(super) fn admit<G: EarlyDataGuard>(
         &mut self,
+        guard: &mut G,
         offered: bool,
         psk: Option<&AcceptedPsk>,
         selected_alpn: Option<&[u8]>,
         suite: Option<CipherSuite>,
         now_ms: u64,
     ) -> bool {
+        let enabled = G::ACCEPTS_EARLY_DATA;
         self.remaining = None;
-        if !self.enabled || !offered {
+        self.enabled = enabled;
+        if !enabled || !offered {
             return false;
         }
         let Some(psk) = psk else {
@@ -73,9 +81,6 @@ impl<G: EarlyDataGuard> EarlyDataAdmission<G> {
         {
             return false;
         }
-        let Some(guard) = self.guard.as_mut() else {
-            return false;
-        };
         if !guard.register(&psk.binder) {
             return false;
         }

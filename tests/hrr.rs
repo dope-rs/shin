@@ -2,12 +2,12 @@ use shin::client::{Client, Config as ClientConfig, Verifier};
 use shin::codec::Reader;
 use shin::extension::ExtensionType;
 use shin::handshake::{HELLO_RETRY_REQUEST_RANDOM, Handshake};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
 mod common;
-use common::send;
+use common::{Server, ServerConfig, send};
 
 fn signing_key() -> SigningKey {
     SigningKey::from_seed(&[0x71u8; 32]).unwrap()

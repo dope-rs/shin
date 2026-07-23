@@ -1,4 +1,3 @@
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use ring::rand::SystemRandom;
@@ -10,6 +9,7 @@ use ring::signature::{
 };
 
 use crate::cert::{Cert, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION, SubjectPublicKeyInfo};
+use crate::marker::ThreadBound;
 
 pub const PUBKEY_LEN: usize = 32;
 pub const SIG_LEN: usize = 64;
@@ -24,8 +24,15 @@ pub enum SigError {
     VerifyFailed,
 }
 
-#[derive(Clone)]
-pub struct SigningKey(Arc<SigningKeyInner>);
+/// ```compile_fail
+/// use shin::sig::SigningKey;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<SigningKey>();
+/// ```
+pub struct SigningKey {
+    inner: SigningKeyInner,
+    _thread: ThreadBound,
+}
 
 enum SigningKeyInner {
     Ed25519(Ed25519Inner),
@@ -59,10 +66,10 @@ impl SigningKey {
         let inner = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| SigError::InvalidSeed)?;
         let mut pubkey = [0u8; PUBKEY_LEN];
         pubkey.copy_from_slice(inner.public_key().as_ref());
-        Ok(Self(Arc::new(SigningKeyInner::Ed25519(Ed25519Inner {
-            inner,
-            pubkey,
-        }))))
+        Ok(Self {
+            inner: SigningKeyInner::Ed25519(Ed25519Inner { inner, pubkey }),
+            _thread: ThreadBound::NEW,
+        })
     }
 
     pub fn from_ecdsa_p256_pkcs8(pkcs8: &[u8]) -> Result<Self, SigError> {
@@ -70,10 +77,13 @@ impl SigningKey {
         let inner = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, &rng)
             .map_err(|_| SigError::InvalidKey)?;
         let pubkey_uncompressed = inner.public_key().as_ref().to_vec();
-        Ok(Self(Arc::new(SigningKeyInner::EcdsaP256(EcdsaP256Inner {
-            inner,
-            pubkey_uncompressed,
-        }))))
+        Ok(Self {
+            inner: SigningKeyInner::EcdsaP256(EcdsaP256Inner {
+                inner,
+                pubkey_uncompressed,
+            }),
+            _thread: ThreadBound::NEW,
+        })
     }
 
     pub fn from_ecdsa_p384_pkcs8(pkcs8: &[u8]) -> Result<Self, SigError> {
@@ -81,51 +91,57 @@ impl SigningKey {
         let inner = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8, &rng)
             .map_err(|_| SigError::InvalidKey)?;
         let pubkey_uncompressed = inner.public_key().as_ref().to_vec();
-        Ok(Self(Arc::new(SigningKeyInner::EcdsaP384(EcdsaP384Inner {
-            inner,
-            pubkey_uncompressed,
-        }))))
+        Ok(Self {
+            inner: SigningKeyInner::EcdsaP384(EcdsaP384Inner {
+                inner,
+                pubkey_uncompressed,
+            }),
+            _thread: ThreadBound::NEW,
+        })
     }
 
     pub fn from_rsa_pkcs8(pkcs8: &[u8]) -> Result<Self, SigError> {
         let inner = RsaKeyPair::from_pkcs8(pkcs8).map_err(|_| SigError::InvalidKey)?;
         let public_key_der = inner.public_key().as_ref().to_vec();
-        Ok(Self(Arc::new(SigningKeyInner::Rsa(RsaInner {
-            inner,
-            public_key_der,
-        }))))
+        Ok(Self {
+            inner: SigningKeyInner::Rsa(RsaInner {
+                inner,
+                public_key_der,
+            }),
+            _thread: ThreadBound::NEW,
+        })
     }
 
     pub fn pubkey(&self) -> Option<&[u8; PUBKEY_LEN]> {
-        match self.0.as_ref() {
+        match &self.inner {
             SigningKeyInner::Ed25519(k) => Some(&k.pubkey),
             _ => None,
         }
     }
 
     pub fn ecdsa_p256_pubkey(&self) -> Option<&[u8]> {
-        match self.0.as_ref() {
+        match &self.inner {
             SigningKeyInner::EcdsaP256(k) => Some(&k.pubkey_uncompressed),
             _ => None,
         }
     }
 
     pub fn ecdsa_p384_pubkey(&self) -> Option<&[u8]> {
-        match self.0.as_ref() {
+        match &self.inner {
             SigningKeyInner::EcdsaP384(k) => Some(&k.pubkey_uncompressed),
             _ => None,
         }
     }
 
     pub fn rsa_public_key_der(&self) -> Option<&[u8]> {
-        match self.0.as_ref() {
+        match &self.inner {
             SigningKeyInner::Rsa(k) => Some(&k.public_key_der),
             _ => None,
         }
     }
 
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, SigError> {
-        match self.0.as_ref() {
+        match &self.inner {
             SigningKeyInner::Ed25519(k) => Ok(k.inner.sign(msg).as_ref().to_vec()),
             SigningKeyInner::EcdsaP256(k) => {
                 let rng = SystemRandom::new();
@@ -155,7 +171,7 @@ impl SigningKey {
     }
 
     pub fn sig_scheme(&self) -> u16 {
-        match self.0.as_ref() {
+        match &self.inner {
             SigningKeyInner::Ed25519(_) => 0x0807,
             SigningKeyInner::EcdsaP256(_) => 0x0403,
             SigningKeyInner::EcdsaP384(_) => 0x0503,
@@ -164,11 +180,11 @@ impl SigningKey {
     }
 
     pub(crate) fn is_ed25519(&self) -> bool {
-        matches!(self.0.as_ref(), SigningKeyInner::Ed25519(_))
+        matches!(&self.inner, SigningKeyInner::Ed25519(_))
     }
 
     pub(crate) fn matches_spki(&self, spki: &SubjectPublicKeyInfo<'_>) -> bool {
-        match self.0.as_ref() {
+        match &self.inner {
             SigningKeyInner::Ed25519(key) => {
                 spki.algorithm.oid == OID_ED25519
                     && spki.subject_public_key == key.pubkey.as_slice()

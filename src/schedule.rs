@@ -1,5 +1,6 @@
 use crate::hash::{Digest, HASH_LEN, HashAlg, MAX_HASH_LEN, Secret, Transcript};
 use crate::kdf::{Hkdf, HkdfError};
+use crate::marker::ThreadBound;
 use crate::psk::RESUMPTION_HASH;
 use zeroize::Zeroize;
 
@@ -135,11 +136,14 @@ impl KeySchedule {
     }
 }
 
-pub struct ResumptionMaster([u8; HASH_LEN]);
+pub struct ResumptionMaster {
+    secret: [u8; HASH_LEN],
+    _thread: ThreadBound,
+}
 
 impl Drop for ResumptionMaster {
     fn drop(&mut self) {
-        self.0.zeroize();
+        self.secret.zeroize();
     }
 }
 
@@ -147,12 +151,15 @@ impl ResumptionMaster {
     pub fn from_secret(secret: &Digest) -> Self {
         let mut bytes = [0u8; HASH_LEN];
         bytes.copy_from_slice(secret.as_slice());
-        Self(bytes)
+        Self {
+            secret: bytes,
+            _thread: ThreadBound::NEW,
+        }
     }
 
     pub fn psk(&self, nonce: &[u8]) -> Result<[u8; HASH_LEN], HkdfError> {
         let mut out = [0u8; HASH_LEN];
-        Hkdf::new(RESUMPTION_HASH).expand_label(&self.0, "resumption", nonce, &mut out)?;
+        Hkdf::new(RESUMPTION_HASH).expand_label(&self.secret, "resumption", nonce, &mut out)?;
         Ok(out)
     }
 }
@@ -160,6 +167,7 @@ impl ResumptionMaster {
 pub struct TrafficKeys<const K: usize> {
     pub key: [u8; K],
     pub iv: [u8; 12],
+    _thread: ThreadBound,
 }
 
 impl<const K: usize> Drop for TrafficKeys<K> {
@@ -176,6 +184,10 @@ impl<const K: usize> TrafficKeys<K> {
         let hkdf = Hkdf::new(alg);
         hkdf.expand_label(secret, "key", &[], &mut key)?;
         hkdf.expand_label(secret, "iv", &[], &mut iv)?;
-        Ok(Self { key, iv })
+        Ok(Self {
+            key,
+            iv,
+            _thread: ThreadBound::NEW,
+        })
     }
 }

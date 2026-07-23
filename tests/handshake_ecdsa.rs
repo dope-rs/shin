@@ -3,11 +3,11 @@ use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDS
 use shin::Epoch;
 use shin::cert::Cert;
 use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 
 mod common;
-use common::{find_send, has_done};
+use common::{Server, ServerConfig, find_send, has_done};
 
 const HOSTNAME: &str = "p256.local";
 

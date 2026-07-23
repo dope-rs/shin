@@ -28,12 +28,12 @@ use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
 use shin::codec::Reader as CodecReader;
 use shin::extension::ExtensionType;
 use shin::handshake::Handshake;
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
 mod common;
-use common::find_send;
+use common::{Server, ServerConfig, find_send};
 
 const HOSTNAME: &str = "host.local";
 

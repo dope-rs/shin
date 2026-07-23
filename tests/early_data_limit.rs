@@ -1,29 +1,25 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, Server};
+use shin::server::{CertSource, EarlyDataGuard};
 use shin::sig::SigningKey;
 use shin::{Clock, Epoch, Error, Event};
 
 mod common;
-use common::find_send;
+use common::{Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
 const NOW_MS: u64 = 1_700_000_000_000;
 const MAX_EARLY_DATA_SIZE: u32 = 16384;
 
-#[derive(Clone)]
 struct TestGuard {
     now: u64,
-    seen: Rc<RefCell<Vec<Vec<u8>>>>,
+    seen: Vec<Vec<u8>>,
 }
 
 impl TestGuard {
     fn new(now: u64) -> Self {
         Self {
             now,
-            seen: Rc::new(RefCell::new(Vec::new())),
+            seen: Vec::new(),
         }
     }
 }
@@ -36,11 +32,10 @@ impl Clock for TestGuard {
 
 impl EarlyDataGuard for TestGuard {
     fn register(&mut self, token: &[u8]) -> bool {
-        let mut seen = self.seen.borrow_mut();
-        if seen.iter().any(|t| t.as_slice() == token) {
+        if self.seen.iter().any(|t| t.as_slice() == token) {
             return false;
         }
-        seen.push(token.to_vec());
+        self.seen.push(token.to_vec());
         true
     }
 }
@@ -109,12 +104,7 @@ fn issue_ticket() -> Resumption {
         }
     }
     let (age_add, ticket) = tkt.unwrap();
-    Resumption {
-        psk: psk.unwrap(),
-        ticket,
-        ticket_age_add: age_add,
-        age_millis: 0,
-    }
+    Resumption::new(psk.unwrap(), ticket, age_add, 0)
 }
 
 fn early_accepted_server() -> Server<TestGuard, TestGuard> {

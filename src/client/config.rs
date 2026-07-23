@@ -1,13 +1,15 @@
 use alloc::vec::Vec;
+use core::fmt;
 
 use crate::Error;
 use crate::cert::{Cert, CertError, SubjectPublicKeyInfo};
 use crate::chain::TrustAnchor;
 use crate::handshake::Certificate;
+use crate::marker::ThreadBound;
 use crate::proto::{CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509};
 use crate::sig::{self, SigningKey};
+use zeroize::Zeroize;
 
-#[derive(Clone)]
 pub struct Config {
     pub verifier: Verifier,
     pub transport_params: Vec<u8>,
@@ -16,12 +18,55 @@ pub struct Config {
     pub enable_early_data: bool,
 }
 
-#[derive(Clone, Debug)]
+/// ```compile_fail
+/// use shin::client::Resumption;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<Resumption>();
+/// ```
 pub struct Resumption {
     pub psk: [u8; 32],
     pub ticket: Vec<u8>,
     pub ticket_age_add: u32,
     pub age_millis: u32,
+    _thread: ThreadBound,
+}
+
+impl Resumption {
+    pub fn new(psk: [u8; 32], ticket: Vec<u8>, ticket_age_add: u32, age_millis: u32) -> Self {
+        Self {
+            psk,
+            ticket,
+            ticket_age_add,
+            age_millis,
+            _thread: ThreadBound::NEW,
+        }
+    }
+
+    pub(super) fn duplicate(&self) -> Self {
+        Self::new(
+            self.psk,
+            self.ticket.clone(),
+            self.ticket_age_add,
+            self.age_millis,
+        )
+    }
+}
+
+impl Drop for Resumption {
+    fn drop(&mut self) {
+        self.psk.zeroize();
+    }
+}
+
+impl fmt::Debug for Resumption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resumption")
+            .field("psk", &"[redacted]")
+            .field("ticket_len", &self.ticket.len())
+            .field("ticket_age_add", &self.ticket_age_add)
+            .field("age_millis", &self.age_millis)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -96,7 +141,6 @@ impl OwnedTrustAnchor {
 
 /// A client identity to present when the server requests client authentication
 /// (mutual TLS). Mirrors the server's [`CertSource`](crate::server::CertSource).
-#[derive(Clone)]
 pub enum ClientCertSource {
     /// Bare public key (RFC 7250). The signing key must be Ed25519 (the only
     /// RawPublicKey type shin encodes as a SubjectPublicKeyInfo).

@@ -7,15 +7,13 @@ use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDS
 
 use shin::cert::Cert;
 use shin::client::{Client, ClientCertSource, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::server::{
-    CertSource, ClientAuth, ClientCertVerifier, ClientIdentity, Config as ServerConfig, Server,
-};
+use shin::server::{CertSource, ClientAuth, ClientCertVerifier, ClientIdentity};
 use shin::sig::SigningKey;
 use shin::spki::SubjectPublicKey;
 use shin::{Epoch, Error};
 
 mod common;
-use common::{find_send, has_done};
+use common::{Server, ServerConfig, find_send, has_done};
 
 const SERVER_NAME: &str = "server.local";
 const CLIENT_NAME: &str = "client.local";
@@ -67,7 +65,7 @@ impl ClientCertVerifier for Pinned {
 /// Drive a full handshake to completion. Returns the server's view: the error
 /// is whatever the server raises while reading the client's auth flight +
 /// Finished (where client-auth rejections land), or Ok on success.
-fn drive<V: ClientCertVerifier>(
+fn drive<V: ClientCertVerifier + 'static>(
     server_cert: CertSource,
     client_verifier: Verifier,
     client_cert: Option<ClientCertSource>,

@@ -6,12 +6,12 @@ use shin::client::{Client, Config as ClientConfig, Verifier};
 use shin::codec::Reader;
 use shin::extension::{Extension, ExtensionType};
 use shin::handshake::{Handshake, KeyUpdate, RANDOM_LEN, ServerHello, TLS_1_2};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Error};
 
 mod common;
-use common::send;
+use common::{Server, ServerConfig, send};
 
 const HRR_RANDOM: [u8; RANDOM_LEN] = [
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,

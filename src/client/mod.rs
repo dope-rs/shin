@@ -16,6 +16,7 @@ use crate::hash::{Digest, HashAlg, MAX_HASH_LEN, Transcript};
 use crate::hostname::Hostname;
 use crate::kdf::Hkdf;
 use crate::kx::{EphemeralKey, KexGroup};
+use crate::marker::ThreadBound;
 use crate::proto::{
     Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertType, KeyShare, ServerName,
     SignatureAlgorithms, SupportedGroups, SupportedVersions, TLS_1_3,
@@ -44,6 +45,11 @@ use state::{HandshakeSecrets, State, StateKind};
 
 use crate::peer::{LeafKey, LeafKeyKind};
 
+/// ```compile_fail
+/// use shin::client::Client;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<Client<fn() -> u64>>();
+/// ```
 pub struct Client<C: Clock> {
     config: Config,
     state: State,
@@ -73,6 +79,7 @@ pub struct Client<C: Clock> {
     /// and the signature schemes it will accept in our CertificateVerify.
     cert_request: Option<CertRequest>,
     key_updates: KeyUpdateBudget<MAX_KEY_UPDATES_WITHOUT_APP_DATA>,
+    _thread: ThreadBound,
 }
 
 struct CertRequest {
@@ -125,6 +132,7 @@ impl<C: Clock> Client<C> {
             client_cert: None,
             cert_request: None,
             key_updates: KeyUpdateBudget::default(),
+            _thread: ThreadBound::NEW,
         }
     }
 
@@ -312,7 +320,7 @@ impl<C: Clock> Client<C> {
         let prefix_len = Offer::binder_transcript_prefix(ch_bytes, psk.len())
             .ok_or(Error::Encode)?
             .len();
-        let mut t = self.transcript.clone();
+        let mut t = self.transcript.fork();
         t.update(&ch_bytes[..prefix_len]);
         let partial_hash = t.hash(RESUMPTION_HASH);
         let binder = ResumptionBinder::compute(psk, partial_hash.as_slice())?;
@@ -340,7 +348,7 @@ impl<C: Clock> Client<C> {
 
         let mut extensions = self.base_extensions(eph.client_share(), None)?;
 
-        let resumption = self.config.resumption.clone();
+        let resumption = self.config.resumption.as_ref().map(Resumption::duplicate);
         let early_data_offered = self.config.enable_early_data && resumption.is_some();
         self.early_data_offered = early_data_offered;
         if let Some(r) = &resumption {
@@ -687,7 +695,7 @@ impl<C: Clock> Client<C> {
             .to_vec();
         let mut extensions = self.base_extensions(&eph_share, cookie.as_deref())?;
 
-        let resumption = self.config.resumption.clone();
+        let resumption = self.config.resumption.as_ref().map(Resumption::duplicate);
         if let Some(r) = &resumption {
             Self::push_psk_offer(&mut extensions, r)?;
         }

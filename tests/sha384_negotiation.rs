@@ -3,12 +3,12 @@ use shin::codec::Reader;
 use shin::extension::ExtensionType;
 use shin::handshake::{HELLO_RETRY_REQUEST_RANDOM, Handshake};
 use shin::record::CipherSuite;
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Error, Event};
 
 mod common;
-use common::{FixedClock, send};
+use common::{FixedClock, Server, ServerConfig, send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
 

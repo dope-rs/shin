@@ -12,9 +12,12 @@ use shin::cert::Cert;
 use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
 use shin::hash::Digest;
 use shin::record::{CipherSuite, ContentType, Opener, PlaintextRecord, Sealer};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
+
+mod common;
+use common::{Server, ServerConfig};
 
 const HOSTNAME: &str = "host.local";
 
@@ -38,15 +41,12 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
 struct TestCert {
     cert_der: Vec<u8>,
     pkcs8_der: Vec<u8>,
-    signing: SigningKey,
     now_ms: u64,
 }
 
 fn gen_ed25519_cert() -> TestCert {
     let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
     let pkcs8 = key.serialize_der();
-    let seed = extract_ed25519_seed(&pkcs8).expect("seed");
-    let signing = SigningKey::from_seed(&seed).unwrap();
 
     let mut params = CertificateParams::new(vec![HOSTNAME.into()]).unwrap();
     params.distinguished_name = rcgen::DistinguishedName::new();
@@ -66,7 +66,6 @@ fn gen_ed25519_cert() -> TestCert {
     TestCert {
         cert_der,
         pkcs8_der: pkcs8,
-        signing,
         now_ms,
     }
 }
@@ -302,11 +301,12 @@ fn shin_client(suite: CipherSuite, cert: &TestCert) -> Client<impl Fn() -> u64> 
 
 fn shin_server(cert: &TestCert) -> Server<impl Fn() -> u64> {
     let now_ms = cert.now_ms;
+    let seed = extract_ed25519_seed(&cert.pkcs8_der).expect("seed");
     Server::new(
         ServerConfig {
             source: CertSource::X509 {
                 chain_der: vec![cert.cert_der.clone()],
-                signing_key: cert.signing.clone(),
+                signing_key: SigningKey::from_seed(&seed).unwrap(),
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),

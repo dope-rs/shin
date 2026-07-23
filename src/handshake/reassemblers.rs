@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 use crate::codec::{DecodeError, Reader};
+use crate::marker::ThreadBound;
 use crate::{Epoch, Error};
 
 use super::{Handshake, MAX_HANDSHAKE_SIZE, MAX_KEY_UPDATES_PER_RECORD};
@@ -27,12 +28,12 @@ impl<const LIMIT: u32> KeyUpdateBudget<LIMIT> {
 
 /// Reassembles fragmented or coalesced handshake messages with their transcript
 /// bytes; a message may not cross record epochs (RFC 8446 §5.1).
-#[derive(Default)]
 pub struct HsReassembler {
     buf: Vec<u8>,
     pos: usize,
     epoch: Option<Epoch>,
     key_updates: KeyUpdateBudget<MAX_KEY_UPDATES_PER_RECORD>,
+    _thread: ThreadBound,
 }
 
 impl HsReassembler {
@@ -74,5 +75,17 @@ impl HsReassembler {
             return Err(Error::UnexpectedMessage);
         }
         Ok(Some((message, raw)))
+    }
+}
+
+impl Default for HsReassembler {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            pos: 0,
+            epoch: None,
+            key_updates: KeyUpdateBudget::default(),
+            _thread: ThreadBound::NEW,
+        }
     }
 }

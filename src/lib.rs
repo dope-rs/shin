@@ -32,6 +32,7 @@ pub mod spki;
 pub mod ticket;
 pub mod time;
 
+mod marker;
 mod peer;
 mod proto;
 mod uninit;
@@ -63,6 +64,11 @@ pub enum Epoch {
     Application,
 }
 
+/// ```compile_fail
+/// use shin::Event;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<Event>();
+/// ```
 #[derive(Clone, PartialEq, Eq)]
 pub enum Event {
     Send {

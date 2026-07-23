@@ -1,9 +1,8 @@
 use shin::client::{Client, Config as ClientConfig};
-use shin::server::{Config as ServerConfig, Server};
 use shin::{Epoch, Error};
 
 mod common;
-use common::{find_send, has_done, random_signing_key};
+use common::{Server, ServerConfig, find_send, has_done, random_signing_key};
 
 const SERVER_TP: &[u8] = b"server-transport-params";
 const CLIENT_TP: &[u8] = b"client-transport-params";

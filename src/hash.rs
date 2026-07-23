@@ -7,6 +7,8 @@ use ring::{
 
 use zeroize::Zeroize;
 
+use crate::marker::ThreadBound;
+
 pub const HASH_LEN: usize = SHA256_OUTPUT_LEN;
 
 /// Largest hash output handled (SHA-384). Fixed-size secret buffers use this so
@@ -53,6 +55,7 @@ impl HashAlg {
 pub struct Digest {
     bytes: [u8; MAX_HASH_LEN],
     len: usize,
+    _thread: ThreadBound,
 }
 
 impl Digest {
@@ -62,6 +65,7 @@ impl Digest {
         Self {
             bytes,
             len: s.len(),
+            _thread: ThreadBound::NEW,
         }
     }
 
@@ -107,6 +111,7 @@ impl fmt::Debug for Digest {
 pub struct Secret {
     bytes: [u8; MAX_HASH_LEN],
     len: usize,
+    _thread: ThreadBound,
 }
 
 impl Secret {
@@ -116,6 +121,7 @@ impl Secret {
         Self {
             bytes,
             len: s.len(),
+            _thread: ThreadBound::NEW,
         }
     }
 
@@ -139,6 +145,7 @@ impl Secret {
         Digest {
             bytes: self.bytes,
             len: self.len,
+            _thread: ThreadBound::NEW,
         }
     }
 }
@@ -158,10 +165,10 @@ impl fmt::Debug for Secret {
 /// Running handshake transcript. The hash algorithm is fixed only once the
 /// cipher suite is negotiated, so both SHA-256 and SHA-384 are advanced in
 /// lockstep and the chosen one is read with [`hash`](Self::hash).
-#[derive(Clone)]
 pub struct Transcript {
     sha256: Context,
     sha384: Context,
+    _thread: ThreadBound,
 }
 
 impl Transcript {
@@ -169,6 +176,15 @@ impl Transcript {
         Self {
             sha256: Context::new(&SHA256),
             sha384: Context::new(&SHA384),
+            _thread: ThreadBound::NEW,
+        }
+    }
+
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            sha256: self.sha256.clone(),
+            sha384: self.sha384.clone(),
+            _thread: ThreadBound::NEW,
         }
     }
 

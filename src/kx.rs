@@ -13,6 +13,8 @@ use ring::rand::SecureRandom;
 
 use zeroize::Zeroize;
 
+use crate::marker::ThreadBound;
+
 /// Largest (EC)DHE / hybrid shared secret: ML-KEM-768 (32) ‖ X25519 (32).
 pub const MAX_SHARED_LEN: usize = 64;
 
@@ -25,6 +27,7 @@ const MLKEM768_CT_LEN: usize = 1088;
 pub struct SharedSecret {
     bytes: [u8; MAX_SHARED_LEN],
     len: usize,
+    _thread: ThreadBound,
 }
 
 impl SharedSecret {
@@ -39,6 +42,7 @@ impl SharedSecret {
         Self {
             bytes,
             len: a.len() + b.len(),
+            _thread: ThreadBound::NEW,
         }
     }
 
@@ -163,6 +167,7 @@ pub struct EphemeralKey {
     secret: Secret,
     group: KexGroup,
     client_share: Vec<u8>,
+    _thread: ThreadBound,
 }
 
 impl EphemeralKey {
@@ -180,6 +185,7 @@ impl EphemeralKey {
                     secret: Secret::Ecdhe(inner),
                     group,
                     client_share,
+                    _thread: ThreadBound::NEW,
                 })
             }
             KexGroup::X25519Mlkem768 => {
@@ -195,6 +201,7 @@ impl EphemeralKey {
                     secret: Secret::Hybrid { x25519, mlkem_dk },
                     group,
                     client_share,
+                    _thread: ThreadBound::NEW,
                 })
             }
         }

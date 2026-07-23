@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 
+use crate::marker::ThreadBound;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AeadError {
     InvalidKey,
@@ -12,6 +14,7 @@ pub enum AeadError {
 pub struct AeadKey {
     inner: LessSafeKey,
     iv: [u8; 12],
+    _thread: ThreadBound,
 }
 
 impl AeadKey {
@@ -21,6 +24,7 @@ impl AeadKey {
         Ok(Self {
             inner: LessSafeKey::new(unbound),
             iv,
+            _thread: ThreadBound::NEW,
         })
     }
 
@@ -30,6 +34,7 @@ impl AeadKey {
         Ok(Self {
             inner: LessSafeKey::new(unbound),
             iv,
+            _thread: ThreadBound::NEW,
         })
     }
 
@@ -39,6 +44,7 @@ impl AeadKey {
         Ok(Self {
             inner: LessSafeKey::new(unbound),
             iv,
+            _thread: ThreadBound::NEW,
         })
     }
 

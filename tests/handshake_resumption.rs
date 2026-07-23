@@ -1,10 +1,10 @@
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
 mod common;
-use common::{FixedClock, find_send};
+use common::{FixedClock, Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
 
@@ -88,12 +88,12 @@ fn first_session_ticket(events: &[Event]) -> Option<(Resumption, [u8; 32])> {
         } = e
         {
             return Some((
-                Resumption {
-                    psk: psk.expect("ResumptionSecret precedes NewSessionTicket"),
-                    ticket: ticket.clone(),
-                    ticket_age_add: *ticket_age_add,
-                    age_millis: 0,
-                },
+                Resumption::new(
+                    psk.expect("ResumptionSecret precedes NewSessionTicket"),
+                    ticket.clone(),
+                    *ticket_age_add,
+                    0,
+                ),
                 psk.unwrap(),
             ));
         }

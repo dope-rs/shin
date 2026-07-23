@@ -3,11 +3,11 @@ use shin::client::{Client, Config as ClientConfig, Verifier};
 use shin::codec::Reader;
 use shin::handshake::Handshake;
 use shin::record::CipherSuite;
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 
 mod common;
-use common::send;
+use common::{Server, ServerConfig, send};
 
 type TestClient = Client<fn() -> u64>;
 type TestServer = Server<fn() -> u64>;

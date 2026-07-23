@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::{CertSource, Config as ShardConfig, ConnectionConfig, Server, Shard};
 use shin::sig::SigningKey;
 use shin::Epoch;
 
@@ -29,17 +29,18 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut server = Server::new(
-        ServerConfig {
-            source: CertSource::RawPublicKey {
-                signing_key: signing,
-            },
+        ConnectionConfig {
             transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            ticket_keys: None,
-            accept_early_data: false,
         },
         || 0,
     );
+    let mut shard = Shard::new(ShardConfig {
+        source: CertSource::RawPublicKey {
+            signing_key: signing,
+        },
+        alpn_protocols: Vec::new(),
+        ticket_keys: None,
+    });
     let mut client = Client::new(
         ClientConfig {
             verifier: Verifier::RawPublicKey {
@@ -64,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
         r = rest;
         let ep = epoch(hdr);
         if hdr & 0b100 == 0 {
-            let _ = server.read(ep, chunk);
+            let _ = server.read(ep, chunk, &mut shard);
         } else {
             let _ = client.read(ep, chunk);
         }

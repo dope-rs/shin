@@ -1,10 +1,9 @@
 use shin::client::{Client, Config as ClientConfig};
 use shin::hash::Digest;
-use shin::server::{Config as ServerConfig, Server};
 use shin::{Epoch, Event};
 
 mod common;
-use common::{find_send, has_done, random_signing_key};
+use common::{Server, ServerConfig, find_send, has_done, random_signing_key};
 
 const SERVER_TP: &[u8] = b"server-transport-params";
 const CLIENT_TP: &[u8] = b"client-transport-params";
@@ -190,14 +189,15 @@ fn server_rejects_tampered_client_finished() {
 
 #[test]
 fn keys_diverge_across_independent_handshakes() {
-    let server_key = random_signing_key();
+    let server_seed = [0x5au8; 32];
+    let server_key = shin::sig::SigningKey::from_seed(&server_seed).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
 
     let do_handshake = || -> (Digest, Digest) {
         let mut server = Server::new(
             ServerConfig {
                 source: shin::server::CertSource::RawPublicKey {
-                    signing_key: server_key.clone(),
+                    signing_key: shin::sig::SigningKey::from_seed(&server_seed).unwrap(),
                 },
                 transport_params: SERVER_TP.to_vec(),
                 alpn_protocols: Vec::new(),

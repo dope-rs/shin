@@ -1,10 +1,13 @@
 use alloc::vec::Vec;
+use core::fmt;
 
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::SecureRandom;
 
 use crate::hash::HashAlg;
 use crate::kdf::Hkdf;
+use crate::marker::ThreadBound;
+use zeroize::Zeroize;
 
 const TICKET_NONCE_LEN: usize = 12;
 const TICKET_TAG_LEN: usize = 16;
@@ -23,21 +26,32 @@ pub enum TicketError {
     BadKey,
 }
 
-#[derive(Clone)]
-pub struct TicketSecret([u8; 32]);
+/// ```compile_fail
+/// use shin::ticket::TicketSecret;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<TicketSecret>();
+/// ```
+pub struct TicketSecret {
+    secret: [u8; 32],
+    _thread: ThreadBound,
+}
 
 impl TicketSecret {
     pub fn new(secret: [u8; 32]) -> Self {
-        Self(secret)
+        Self {
+            secret,
+            _thread: ThreadBound::NEW,
+        }
     }
 
     fn aead_key(&self) -> Result<LessSafeKey, TicketError> {
         let mut key_bytes = [0u8; 16];
         Hkdf::new(HashAlg::Sha256)
-            .expand_label(&self.0, "ticket", &[], &mut key_bytes)
+            .expand_label(&self.secret, "ticket", &[], &mut key_bytes)
             .map_err(|_| TicketError::BadKey)?;
-        let unbound =
-            UnboundKey::new(&aead::AES_128_GCM, &key_bytes).map_err(|_| TicketError::BadKey)?;
+        let unbound = UnboundKey::new(&aead::AES_128_GCM, &key_bytes);
+        key_bytes.zeroize();
+        let unbound = unbound.map_err(|_| TicketError::BadKey)?;
         Ok(LessSafeKey::new(unbound))
     }
 
@@ -105,31 +119,58 @@ impl TicketSecret {
             return Err(TicketError::BadFormat);
         }
         let alpn = plain[FIXED_PLAINTEXT_LEN..].to_vec();
+        buf.zeroize();
         Ok(DecryptedTicket {
             psk,
             age_add: u32::from_be_bytes(age_bytes),
             issued_at_ms: u64::from_be_bytes(issued_bytes),
             suite,
             alpn,
+            _thread: ThreadBound::NEW,
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Drop for TicketSecret {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+#[derive(PartialEq, Eq)]
 pub struct DecryptedTicket {
     pub psk: [u8; PSK_LEN],
     pub age_add: u32,
     pub issued_at_ms: u64,
     pub suite: u16,
     pub alpn: Vec<u8>,
+    _thread: ThreadBound,
+}
+
+impl Drop for DecryptedTicket {
+    fn drop(&mut self) {
+        self.psk.zeroize();
+    }
+}
+
+impl fmt::Debug for DecryptedTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecryptedTicket")
+            .field("psk", &"[redacted]")
+            .field("age_add", &self.age_add)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("suite", &self.suite)
+            .field("alpn", &self.alpn)
+            .finish()
+    }
 }
 
 /// Two-generation key set: seal under `current`, still open `previous` for one
 /// rotation window. Produced by [`TicketRotator`].
-#[derive(Clone)]
 pub struct TicketKeys {
     current: TicketSecret,
     previous: Option<TicketSecret>,
+    _thread: ThreadBound,
 }
 
 impl TicketKeys {
@@ -137,6 +178,7 @@ impl TicketKeys {
         Self {
             current: TicketSecret::new(secret),
             previous: None,
+            _thread: ThreadBound::NEW,
         }
     }
 
@@ -144,6 +186,7 @@ impl TicketKeys {
         Self {
             current: TicketSecret::new(current),
             previous: previous.map(TicketSecret::new),
+            _thread: ThreadBound::NEW,
         }
     }
 
@@ -180,6 +223,7 @@ pub struct TicketRotator {
     issued_under_current: u64,
     rotate_after_ms: u64,
     rotate_after_count: u64,
+    _thread: ThreadBound,
 }
 
 impl TicketRotator {
@@ -198,6 +242,7 @@ impl TicketRotator {
             issued_under_current: 0,
             rotate_after_ms,
             rotate_after_count,
+            _thread: ThreadBound::NEW,
         })
     }
 
@@ -234,6 +279,14 @@ impl TicketRotator {
         TicketKeys {
             current: TicketSecret::new(self.current),
             previous: self.previous.map(TicketSecret::new),
+            _thread: ThreadBound::NEW,
         }
+    }
+}
+
+impl Drop for TicketRotator {
+    fn drop(&mut self) {
+        self.current.zeroize();
+        self.previous.zeroize();
     }
 }

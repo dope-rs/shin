@@ -2,9 +2,12 @@ use shin::client::{Client, Config as ClientConfig, Verifier};
 use shin::codec::Reader;
 use shin::extension::ExtensionType;
 use shin::handshake::{ClientHello, Handshake};
-use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, Server};
+use shin::server::{CertSource, EarlyDataGuard};
 use shin::sig::SigningKey;
 use shin::{Clock, Epoch, Event};
+
+mod common;
+use common::{Server, ServerConfig};
 
 fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
     let mut c = Client::new(

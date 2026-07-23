@@ -53,12 +53,12 @@ fn no_resumption_omits_psk_extensions() {
 
 #[test]
 fn resumption_attaches_psk_kx_modes_and_offer() {
-    let ch = drive_ch(Some(Resumption {
-        psk: [0x77u8; 32],
-        ticket: vec![0xAA; 64],
-        ticket_age_add: 0xCAFEBABE,
-        age_millis: 12_345,
-    }));
+    let ch = drive_ch(Some(Resumption::new(
+        [0x77u8; 32],
+        vec![0xAA; 64],
+        0xCAFEBABE,
+        12_345,
+    )));
 
     let kx_ext = ch
         .extensions
@@ -99,12 +99,7 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
     use shin::psk::ResumptionBinder;
 
     let psk = [0x99u8; 32];
-    let resumption = Resumption {
-        psk,
-        ticket: vec![0x5A; 48],
-        ticket_age_add: 7,
-        age_millis: 1_000,
-    };
+    let resumption = Resumption::new(psk, vec![0x5A; 48], 7, 1_000);
 
     let mut c = Client::new(
         Config {
@@ -113,7 +108,7 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: Some(resumption.clone()),
+            resumption: Some(resumption),
             enable_early_data: false,
         },
         || 0,
@@ -164,12 +159,7 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
 
 #[test]
 fn pre_shared_key_is_last_extension() {
-    let ch = drive_ch(Some(Resumption {
-        psk: [0u8; 32],
-        ticket: b"t".to_vec(),
-        ticket_age_add: 0,
-        age_millis: 0,
-    }));
+    let ch = drive_ch(Some(Resumption::new([0u8; 32], b"t".to_vec(), 0, 0)));
     let last = ch.extensions.last().expect("non-empty");
     assert_eq!(last.ty, ExtensionType::PRE_SHARED_KEY);
 }

@@ -14,6 +14,7 @@ use crate::handshake::{
 use crate::hash::{Digest, HashAlg, Transcript};
 use crate::kdf::Hkdf;
 use crate::kx::KexGroup;
+use crate::marker::ThreadBound;
 use crate::peer::LeafKey;
 use crate::proto::{
     CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, KeyShare, SignatureAlgorithms, SupportedGroups,
@@ -38,24 +39,18 @@ use early::{AcceptedPsk, EarlyDataAdmission, TICKET_LIFETIME_SECS};
 use negotiation::ClientHelloOffers;
 use state::State;
 
-#[derive(Clone)]
 pub struct Config {
     pub source: CertSource,
-    pub transport_params: Vec<u8>,
     pub alpn_protocols: Vec<Vec<u8>>,
     pub ticket_keys: Option<TicketKeys>,
-    pub accept_early_data: bool,
 }
 
 impl Config {
-    /// Check that every configured value can be encoded and that the
-    /// certificate identity is internally consistent.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.transport_params.len() > u16::MAX as usize
-            || self
-                .alpn_protocols
-                .iter()
-                .any(|protocol| protocol.is_empty() || protocol.len() > u8::MAX as usize)
+        if self
+            .alpn_protocols
+            .iter()
+            .any(|protocol| protocol.is_empty() || protocol.len() > u8::MAX as usize)
         {
             return Err(Error::BadConfig);
         }
@@ -73,9 +68,25 @@ impl Config {
     }
 }
 
+pub struct ConnectionConfig {
+    pub transport_params: Vec<u8>,
+}
+
+impl ConnectionConfig {
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.transport_params.len() > u16::MAX as usize {
+            return Err(Error::BadConfig);
+        }
+        Ok(())
+    }
+}
+
 /// Replay store required for safe 0-RTT. Without one, early data is refused even
 /// when configured because single-use cannot be proved (RFC 8446 §8).
 pub trait EarlyDataGuard {
+    #[doc(hidden)]
+    const ACCEPTS_EARLY_DATA: bool = true;
+
     /// Record a single-use token (the PSK binder); `false` means it was already
     /// seen — a replay. Tokens need only be kept for `TICKET_LIFETIME_SECS`.
     fn register(&mut self, token: &[u8]) -> bool;
@@ -86,12 +97,13 @@ pub trait EarlyDataGuard {
 pub struct NoGuard;
 
 impl EarlyDataGuard for NoGuard {
+    const ACCEPTS_EARLY_DATA: bool = false;
+
     fn register(&mut self, _token: &[u8]) -> bool {
         false
     }
 }
 
-#[derive(Clone)]
 pub enum CertSource {
     RawPublicKey {
         signing_key: SigningKey,
@@ -146,8 +158,83 @@ pub struct ClientIdentity<'a> {
     pub chain_der: &'a [Vec<u8>],
 }
 
-pub struct Server<C: Clock, G: EarlyDataGuard = NoGuard, V: ClientCertVerifier = NoClientAuth> {
+/// ```compile_fail
+/// use shin::server::{CertSource, Config, Shard};
+/// use shin::sig::SigningKey;
+/// fn assert_send<T: Send>() {}
+/// let config = Config {
+///     source: CertSource::RawPublicKey {
+///         signing_key: SigningKey::from_seed(&[7; 32]).unwrap(),
+///     },
+///     alpn_protocols: Vec::new(),
+///     ticket_keys: None,
+/// };
+/// assert_send::<Shard>();
+/// ```
+///
+/// ```compile_fail
+/// use shin::server::Shard;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<Shard>();
+/// ```
+pub struct Shard<G: EarlyDataGuard = NoGuard, V: ClientCertVerifier = NoClientAuth> {
     config: Config,
+    guard: G,
+    client_auth: Option<ClientAuth>,
+    verifier: V,
+    _thread: ThreadBound,
+}
+
+impl Shard<NoGuard, NoClientAuth> {
+    pub fn new(config: Config) -> Self {
+        Self::build(config, NoGuard, None, NoClientAuth)
+    }
+}
+
+impl<G: EarlyDataGuard> Shard<G, NoClientAuth> {
+    pub fn with_early_data_guard(config: Config, guard: G) -> Self {
+        Self::build(config, guard, None, NoClientAuth)
+    }
+}
+
+impl<V: ClientCertVerifier> Shard<NoGuard, V> {
+    pub fn with_client_auth(config: Config, mode: ClientAuth, verifier: V) -> Self {
+        Self::build(config, NoGuard, Some(mode), verifier)
+    }
+}
+
+impl<G: EarlyDataGuard, V: ClientCertVerifier> Shard<G, V> {
+    pub fn with_early_data_guard_and_client_auth(
+        config: Config,
+        guard: G,
+        mode: ClientAuth,
+        verifier: V,
+    ) -> Self {
+        Self::build(config, guard, Some(mode), verifier)
+    }
+
+    fn build(config: Config, guard: G, client_auth: Option<ClientAuth>, verifier: V) -> Self {
+        Self {
+            config,
+            guard,
+            client_auth,
+            verifier,
+            _thread: ThreadBound::NEW,
+        }
+    }
+
+    pub fn replace_ticket_keys(&mut self, keys: Option<TicketKeys>) {
+        self.config.ticket_keys = keys;
+    }
+}
+
+/// ```compile_fail
+/// use shin::server::Server;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<Server<fn() -> u64>>();
+/// ```
+pub struct Server<C: Clock> {
+    config: ConnectionConfig,
     state: State,
     transcript: Transcript,
     rng: SystemRandom,
@@ -155,14 +242,12 @@ pub struct Server<C: Clock, G: EarlyDataGuard = NoGuard, V: ClientCertVerifier =
     s_ap_traffic: Option<Digest>,
     selected_alpn: Option<Vec<u8>>,
     master: Option<KeySchedule>,
-    early_data: EarlyDataAdmission<G>,
+    early_data: EarlyDataAdmission,
     clock: C,
     hrr_done: bool,
     exporter_master: Option<Digest>,
     negotiated_suite: Option<CipherSuite>,
     reasm: HsReassembler,
-    client_auth: Option<ClientAuth>,
-    verifier: V,
     /// The client_certificate_type the server expects in the client's
     /// Certificate (CERT_TYPE_X509 by default, RFC 7250 §4.2).
     negotiated_client_cert_type: u8,
@@ -172,9 +257,10 @@ pub struct Server<C: Clock, G: EarlyDataGuard = NoGuard, V: ClientCertVerifier =
     client_spki_der: Vec<u8>,
     client_cert_chain: Vec<Vec<u8>>,
     key_updates: KeyUpdateBudget<MAX_KEY_UPDATES_WITHOUT_APP_DATA>,
+    _thread: ThreadBound,
 }
 
-impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Drop for Server<C, G, V> {
+impl<C: Clock> Drop for Server<C> {
     fn drop(&mut self) {
         self.state.zeroize_secrets();
         for b in [
@@ -190,55 +276,12 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Drop for Server<C, G, V
     }
 }
 
-impl<C: Clock> Server<C, NoGuard, NoClientAuth> {
-    /// A server that never accepts 0-RTT and does not authenticate clients. For
-    /// 0-RTT use [`with_early_data_guard`](Server::with_early_data_guard); for
-    /// mutual TLS use [`with_client_auth`](Server::with_client_auth).
-    pub fn new(config: Config, clock: C) -> Self {
-        Self::build(config, clock, None, None, NoClientAuth)
-    }
-}
-
-impl<C: Clock, G: EarlyDataGuard> Server<C, G, NoClientAuth> {
-    /// A server that accepts 0-RTT, gated by `guard` (replay store + freshness).
-    pub fn with_early_data_guard(config: Config, clock: C, guard: G) -> Self {
-        Self::build(config, clock, Some(guard), None, NoClientAuth)
-    }
-}
-
-impl<C: Clock, V: ClientCertVerifier> Server<C, NoGuard, V> {
-    /// A server that authenticates the client (mutual TLS). `verifier` decides
-    /// authorization of each possession-proven identity (the `authorized_keys`
-    /// model); `mode` chooses whether an anonymous client is tolerated.
-    pub fn with_client_auth(config: Config, clock: C, mode: ClientAuth, verifier: V) -> Self {
-        Self::build(config, clock, None, Some(mode), verifier)
-    }
-}
-
-impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
-    /// Both 0-RTT (gated by `guard`) and mutual TLS (`mode` + `verifier`).
-    pub fn with_early_data_guard_and_client_auth(
-        config: Config,
-        clock: C,
-        guard: G,
-        mode: ClientAuth,
-        verifier: V,
-    ) -> Self {
-        Self::build(config, clock, Some(guard), Some(mode), verifier)
-    }
-
-    fn build(
-        config: Config,
-        clock: C,
-        early_data_guard: Option<G>,
-        client_auth: Option<ClientAuth>,
-        verifier: V,
-    ) -> Self {
-        let early_data = EarlyDataAdmission::new(config.accept_early_data, early_data_guard);
+impl<C: Clock> Server<C> {
+    pub fn new(config: ConnectionConfig, clock: C) -> Self {
         Self {
             config,
             clock,
-            early_data,
+            early_data: EarlyDataAdmission::new(),
             state: State::ExpectClientHello,
             transcript: Transcript::new(),
             rng: SystemRandom::new(),
@@ -250,13 +293,12 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
             exporter_master: None,
             negotiated_suite: None,
             reasm: HsReassembler::default(),
-            client_auth,
-            verifier,
             negotiated_client_cert_type: CERT_TYPE_X509,
             client_leaf: None,
             client_spki_der: Vec::new(),
             client_cert_chain: Vec::new(),
             key_updates: KeyUpdateBudget::default(),
+            _thread: ThreadBound::NEW,
         }
     }
 
@@ -299,11 +341,16 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         self.early_data.charge(len)
     }
 
-    pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
+    pub fn read<G: EarlyDataGuard, V: ClientCertVerifier>(
+        &mut self,
+        epoch: Epoch,
+        data: &[u8],
+        shard: &mut Shard<G, V>,
+    ) -> Result<Vec<Event>, Error> {
         self.reasm.push(epoch, data)?;
         let mut events = Vec::new();
         while let Some((msg, raw)) = self.reasm.next_message()? {
-            self.process(epoch, msg, &raw, &mut events)?;
+            self.process(epoch, msg, &raw, shard, &mut events)?;
         }
         Ok(events)
     }
@@ -315,16 +362,17 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         self.key_updates.reset();
     }
 
-    fn process(
+    fn process<G: EarlyDataGuard, V: ClientCertVerifier>(
         &mut self,
         epoch: Epoch,
         msg: Handshake,
         raw: &[u8],
+        shard: &mut Shard<G, V>,
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         match (self.state, msg) {
             (State::ExpectClientHello, Handshake::ClientHello(ch)) if epoch == Epoch::Plaintext => {
-                self.handle_client_hello(ch, raw, events)
+                self.handle_client_hello(ch, raw, shard, events)
             }
             (
                 State::ExpectEndOfEarlyData {
@@ -340,7 +388,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
                 },
                 Handshake::Certificate(c),
             ) if epoch == Epoch::Handshake => {
-                self.handle_client_certificate(c, raw, client_handshake_traffic)
+                self.handle_client_certificate(c, raw, client_handshake_traffic, shard.client_auth)
             }
             (
                 State::ExpectClientCertVerify {
@@ -348,12 +396,12 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
                 },
                 Handshake::CertificateVerify(cv),
             ) if epoch == Epoch::Handshake => {
-                self.handle_client_cert_verify(cv, raw, client_handshake_traffic)
+                self.handle_client_cert_verify(cv, raw, client_handshake_traffic, shard)
             }
             (State::ExpectClientFinished { verify_data }, Handshake::Finished(f))
                 if epoch == Epoch::Handshake =>
             {
-                self.handle_client_finished(f, raw, verify_data, events)
+                self.handle_client_finished(f, raw, verify_data, shard, events)
             }
             (State::Done, Handshake::KeyUpdate(ku)) if epoch == Epoch::Application => {
                 self.handle_key_update(ku, events)
@@ -403,13 +451,15 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         Ok(())
     }
 
-    fn handle_client_hello(
+    fn handle_client_hello<G: EarlyDataGuard, V: ClientCertVerifier>(
         &mut self,
         ch: ClientHello,
         raw: &[u8],
+        shard: &mut Shard<G, V>,
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         self.config.validate()?;
+        shard.config.validate()?;
         let selected_suite = CipherSuite::SUPPORTED
             .iter()
             .copied()
@@ -447,7 +497,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
             .iter()
             .find(|e| e.ty == ExtensionType::SIGNATURE_ALGORITHMS)
             .ok_or(Error::MissingExtension)?;
-        let local_sig_scheme = self.config.source.signing_key().sig_scheme();
+        let local_sig_scheme = shard.config.source.signing_key().sig_scheme();
         if !SignatureAlgorithms::decode(&sigs.data)?.contains(&local_sig_scheme) {
             return Err(Error::UnsupportedSigScheme);
         }
@@ -472,7 +522,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         };
 
         let offers = ClientHelloOffers::parse(&ch.extensions)?;
-        self.selected_alpn = offers.select_alpn(&self.config.alpn_protocols)?;
+        self.selected_alpn = offers.select_alpn(&shard.config.alpn_protocols)?;
         if let Some(parameters) = offers.peer_quic_transport_parameters() {
             events.push(Event::PeerExtension {
                 ty: ExtensionType::QUIC_TRANSPORT_PARAMETERS.0,
@@ -481,12 +531,13 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         }
 
         let psk_accepted = if hash_alg == RESUMPTION_HASH {
-            self.try_accept_psk(&ch, raw)
+            self.try_accept_psk(&ch, raw, shard.config.ticket_keys.as_ref())
         } else {
             None
         };
         let now_ms = self.now_ms();
         let early_accepted = self.early_data.admit(
+            &mut shard.guard,
             offers.early_data(),
             psk_accepted.as_ref(),
             self.selected_alpn.as_deref(),
@@ -564,7 +615,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
             write_secret: s_hs,
         });
 
-        let certificate_negotiation = offers.certificate_negotiation(&self.config.source)?;
+        let certificate_negotiation = offers.certificate_negotiation(&shard.config.source)?;
         self.negotiated_client_cert_type = certificate_negotiation.client_type;
         let ee_exts = offers.encrypted_extensions(
             certificate_negotiation,
@@ -582,7 +633,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         let mut hs_blob = Vec::new();
         hs_blob.extend_from_slice(&ee_bytes);
 
-        if psk_accepted.is_none() && self.client_auth.is_some() {
+        if psk_accepted.is_none() && shard.client_auth.is_some() {
             let cr = CertificateRequest {
                 certificate_request_context: Vec::new(),
                 extensions: alloc::vec![Extension::new(
@@ -597,7 +648,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         }
 
         if psk_accepted.is_none() {
-            let certificate_list: Vec<CertificateEntry> = match &self.config.source {
+            let certificate_list: Vec<CertificateEntry> = match &shard.config.source {
                 CertSource::RawPublicKey { signing_key } => {
                     let pubkey = signing_key.pubkey().ok_or(Error::Sig)?;
                     alloc::vec![CertificateEntry {
@@ -625,14 +676,14 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
 
             let h_pre_cv = self.transcript.hash(hash_alg);
             let cv_msg = CertificateVerify::message(h_pre_cv.as_slice(), true);
-            let sig = self
+            let sig = shard
                 .config
                 .source
                 .signing_key()
                 .sign(&cv_msg)
                 .map_err(|_| Error::Sig)?;
             let cv = CertificateVerify {
-                algorithm: self.config.source.signing_key().sig_scheme(),
+                algorithm: shard.config.source.signing_key().sig_scheme(),
                 signature: sig,
             };
             let mut cv_bytes = Vec::new();
@@ -685,7 +736,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
             self.state = State::ExpectEndOfEarlyData {
                 client_handshake_traffic: c_hs,
             };
-        } else if psk_accepted.is_none() && self.client_auth.is_some() {
+        } else if psk_accepted.is_none() && shard.client_auth.is_some() {
             self.state = State::ExpectClientCertificate {
                 client_handshake_traffic: c_hs,
             };
@@ -768,12 +819,13 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         cert: Certificate,
         raw: &[u8],
         client_handshake_traffic: Digest,
+        client_auth: Option<ClientAuth>,
     ) -> Result<(), Error> {
         if !cert.certificate_request_context.is_empty() {
             return Err(Error::IllegalParameter);
         }
         if cert.certificate_list.is_empty() {
-            if self.client_auth == Some(ClientAuth::Required) {
+            if client_auth == Some(ClientAuth::Required) {
                 return Err(Error::ClientCertRequired);
             }
             self.transcript.update(raw);
@@ -809,11 +861,12 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
     /// Mutual TLS: the client's CertificateVerify (RFC 8446 §4.4.3). Verify
     /// possession of the leaf key, then ask the embedder to authorize the
     /// pinned identity. Only then is the expected client Finished computed.
-    fn handle_client_cert_verify(
+    fn handle_client_cert_verify<G: EarlyDataGuard, V: ClientCertVerifier>(
         &mut self,
         cv: CertificateVerify,
         raw: &[u8],
         client_handshake_traffic: Digest,
+        shard: &Shard<G, V>,
     ) -> Result<(), Error> {
         if !SignatureAlgorithms::x509_supported(cv.algorithm) {
             return Err(Error::SigSchemeNotOffered);
@@ -826,7 +879,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         let msg = CertificateVerify::message(h_pre_cv.as_slice(), false);
         leaf.verify(cv.algorithm, &msg, &cv.signature)?;
 
-        if self.client_auth.is_none() {
+        if shard.client_auth.is_none() {
             return Err(Error::UnexpectedMessage);
         }
         let identity = ClientIdentity {
@@ -834,7 +887,7 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
             spki_der: &self.client_spki_der,
             chain_der: &self.client_cert_chain,
         };
-        if !self.verifier.verify(&identity) {
+        if !shard.verifier.verify(&identity) {
             return Err(Error::AccessDenied);
         }
 
@@ -842,8 +895,13 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         self.expect_client_finished(client_handshake_traffic)
     }
 
-    fn try_accept_psk(&self, ch: &ClientHello, raw: &[u8]) -> Option<AcceptedPsk> {
-        let keys = self.config.ticket_keys.as_ref()?;
+    fn try_accept_psk(
+        &self,
+        ch: &ClientHello,
+        raw: &[u8],
+        keys: Option<&TicketKeys>,
+    ) -> Option<AcceptedPsk> {
+        let keys = keys?;
         let now = self.now_ms();
         let kx_ext = ch
             .extensions
@@ -863,15 +921,20 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         if bind.len() != 32 {
             return None;
         }
-        let dt = keys.decrypt(&id.identity).ok()?;
+        let mut dt = keys.decrypt(&id.identity).ok()?;
         let suite = dt.suite;
-        let (psk, age_add, issued_at_ms, alpn) = (dt.psk, dt.age_add, dt.issued_at_ms, dt.alpn);
+        let (psk, age_add, issued_at_ms, alpn) = (
+            dt.psk,
+            dt.age_add,
+            dt.issued_at_ms,
+            core::mem::take(&mut dt.alpn),
+        );
         if !AcceptedPsk::issued_at_is_resumable(issued_at_ms, now) {
             return None;
         }
         let binder_prefix = Offer::binder_transcript_prefix(raw, bind.len())?;
         let mut t = if self.hrr_done {
-            self.transcript.clone()
+            self.transcript.fork()
         } else {
             Transcript::new()
         };
@@ -891,14 +954,16 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
             obfuscated_ticket_age: id.obfuscated_ticket_age,
             binder: bind.clone(),
             alpn,
+            _thread: ThreadBound::NEW,
         })
     }
 
-    fn handle_client_finished(
+    fn handle_client_finished<G: EarlyDataGuard, V: ClientCertVerifier>(
         &mut self,
         f: Finished,
         raw: &[u8],
         expected: Digest,
+        shard: &Shard<G, V>,
         events: &mut Vec<Event>,
     ) -> Result<(), Error> {
         if !expected.ct_eq(f.verify_data.as_slice()) {
@@ -907,16 +972,20 @@ impl<C: Clock, G: EarlyDataGuard, V: ClientCertVerifier> Server<C, G, V> {
         self.transcript.update(raw);
         events.push(Event::Done);
         self.state = State::Done;
-        self.emit_session_ticket(events)?;
+        self.emit_session_ticket(shard.config.ticket_keys.as_ref(), events)?;
         Ok(())
     }
 
-    fn emit_session_ticket(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn emit_session_ticket(
+        &mut self,
+        keys: Option<&TicketKeys>,
+        events: &mut Vec<Event>,
+    ) -> Result<(), Error> {
         use ring::rand::SecureRandom;
         let Some(master) = self.master.as_ref() else {
             return Ok(());
         };
-        let Some(keys) = self.config.ticket_keys.as_ref() else {
+        let Some(keys) = keys else {
             return Ok(());
         };
         if master.hash_alg() != RESUMPTION_HASH {

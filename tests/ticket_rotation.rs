@@ -1,12 +1,12 @@
 use ring::rand::SystemRandom;
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::ticket::{TicketKeys, TicketRotator};
 use shin::{Epoch, Event};
 
 mod common;
-use common::{FixedClock, find_send};
+use common::{FixedClock, Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
 
@@ -78,12 +78,7 @@ fn ticket_from(events: &[Event]) -> Option<Resumption> {
             ..
         } = e
         {
-            return Some(Resumption {
-                psk: psk?,
-                ticket: ticket.clone(),
-                ticket_age_add: *ticket_age_add,
-                age_millis: 0,
-            });
+            return Some(Resumption::new(psk?, ticket.clone(), *ticket_age_add, 0));
         }
     }
     None
@@ -117,7 +112,12 @@ fn expired_ticket_is_rejected_even_without_early_data_guard() {
     let mut issuing = server_with(Some(TicketKeys::single(TICKET_SECRET)), ISSUE_MS);
     let mut client = fresh_client(None);
     let events = full_handshake(&mut client, &mut issuing);
-    let resumption = ticket_from(&events).expect("ticket issued");
+    let stale_resumption = ticket_from(&events).expect("ticket issued");
+
+    let mut issuing = server_with(Some(TicketKeys::single(TICKET_SECRET)), ISSUE_MS);
+    let mut client = fresh_client(None);
+    let events = full_handshake(&mut client, &mut issuing);
+    let fresh_resumption = ticket_from(&events).expect("second ticket issued");
 
     // Past lifetime (7200s) plus skew -> must not resume.
     let mut stale = server_with(
@@ -125,14 +125,14 @@ fn expired_ticket_is_rejected_even_without_early_data_guard() {
         ISSUE_MS + 7_300_000,
     );
     assert!(
-        !server_resumed(&mut stale, resumption.clone()),
+        !server_resumed(&mut stale, stale_resumption),
         "expired ticket must force a full handshake",
     );
 
     // Well inside lifetime -> resumes.
     let mut fresh = server_with(Some(TicketKeys::single(TICKET_SECRET)), ISSUE_MS + 60_000);
     assert!(
-        server_resumed(&mut fresh, resumption),
+        server_resumed(&mut fresh, fresh_resumption),
         "fresh ticket must resume",
     );
 }

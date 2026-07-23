@@ -4,11 +4,11 @@ use shin::Epoch;
 use shin::asn1::{Reader, Tag};
 use shin::cert::Cert;
 use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 
 mod common;
-use common::{find_send, has_done};
+use common::{Server, ServerConfig, find_send, has_done};
 
 const HOSTNAME: &str = "host.local";
 

@@ -1,33 +1,31 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
 use shin::extension::ExtensionType;
 use shin::hash::Digest;
-use shin::server::{CertSource, Config as ServerConfig, EarlyDataGuard, NoGuard, Server};
+use shin::server::{
+    CertSource, Config as ShardConfig, ConnectionConfig, EarlyDataGuard, NoGuard,
+    Server as Connection, Shard,
+};
 use shin::sig::SigningKey;
 use shin::{Clock, Epoch, Event};
 
 mod common;
-use common::find_send;
+use common::{Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
 
 // Fixed clock so the measured ticket age is ~0 in happy-path tests.
 const NOW_MS: u64 = 1_700_000_000_000;
 
-// Fixed-clock guard; clones share one strike list so two servers can model a replay.
-#[derive(Clone)]
 struct TestGuard {
     now: u64,
-    seen: Rc<RefCell<Vec<Vec<u8>>>>,
+    seen: Vec<Vec<u8>>,
 }
 
 impl TestGuard {
     fn new(now: u64) -> Self {
         Self {
             now,
-            seen: Rc::new(RefCell::new(Vec::new())),
+            seen: Vec::new(),
         }
     }
 }
@@ -40,11 +38,10 @@ impl Clock for TestGuard {
 
 impl EarlyDataGuard for TestGuard {
     fn register(&mut self, token: &[u8]) -> bool {
-        let mut seen = self.seen.borrow_mut();
-        if seen.iter().any(|t| t.as_slice() == token) {
+        if self.seen.iter().any(|t| t.as_slice() == token) {
             return false;
         }
-        seen.push(token.to_vec());
+        self.seen.push(token.to_vec());
         true
     }
 }
@@ -85,14 +82,6 @@ fn server_alpn(
         server_config(accept, alpn_protocols),
         TestGuard::new(now_ms),
         TestGuard::new(now_ms),
-    )
-}
-
-fn server_with_guard(accept: bool, now_ms: u64, guard: TestGuard) -> Server<TestGuard, TestGuard> {
-    Server::with_early_data_guard(
-        server_config(accept, Vec::new()),
-        TestGuard::new(now_ms),
-        guard,
     )
 }
 
@@ -157,12 +146,7 @@ fn first_handshake_ticket_cfg(alpn_protocols: Vec<Vec<u8>>, now_ms: u64) -> Resu
         }
     }
     let (age_add, ticket) = tkt.unwrap();
-    Resumption {
-        psk: psk.unwrap(),
-        ticket,
-        ticket_age_add: age_add,
-        age_millis: 0,
-    }
+    Resumption::new(psk.unwrap(), ticket, age_add, 0)
 }
 
 #[test]
@@ -262,20 +246,32 @@ fn server_without_guard_refuses_early_data() {
 
 #[test]
 fn replayed_early_data_is_rejected() {
-    // Same ClientHello to two servers sharing a strike list: the 2nd is a replay.
     let resumption = first_handshake_ticket();
-    let guard = TestGuard::new(NOW_MS);
 
     let mut c = client(Some(resumption), true);
     let c1 = c.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
 
-    let mut s1 = server_with_guard(true, NOW_MS, guard.clone());
-    let out1 = s1.read(Epoch::Plaintext, &ch).unwrap();
+    let mut shard = Shard::with_early_data_guard(
+        ShardConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: signing_key(),
+            },
+            alpn_protocols: Vec::new(),
+            ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+        },
+        TestGuard::new(NOW_MS),
+    );
+    let connection_config = || ConnectionConfig {
+        transport_params: Vec::new(),
+    };
+
+    let mut s1 = Connection::new(connection_config(), TestGuard::new(NOW_MS));
+    let out1 = s1.read(Epoch::Plaintext, &ch, &mut shard).unwrap();
     assert!(cets(&out1).is_some(), "first use accepts early data");
 
-    let mut s2 = server_with_guard(true, NOW_MS, guard.clone());
-    let out2 = s2.read(Epoch::Plaintext, &ch).unwrap();
+    let mut s2 = Connection::new(connection_config(), TestGuard::new(NOW_MS));
+    let out2 = s2.read(Epoch::Plaintext, &ch, &mut shard).unwrap();
     assert!(
         cets(&out2).is_none(),
         "replayed binder => early data refused"

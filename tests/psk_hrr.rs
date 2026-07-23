@@ -12,12 +12,12 @@ use shin::handshake::{
 };
 use shin::hash::{HashAlg, Transcript};
 use shin::psk::ResumptionBinder;
-use shin::server::{CertSource, Config as ServerConfig, Server};
+use shin::server::CertSource;
 use shin::sig::SigningKey;
 use shin::{Epoch, Event};
 
 mod common;
-use common::{FixedClock, send};
+use common::{FixedClock, Server, ServerConfig, send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
 const SUITE_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -156,12 +156,12 @@ fn obtain_resumption() -> Resumption {
             ..
         } = e
         {
-            return Resumption {
-                psk: psk.expect("ResumptionSecret precedes NewSessionTicket"),
-                ticket: ticket.clone(),
-                ticket_age_add: *ticket_age_add,
-                age_millis: 0,
-            };
+            return Resumption::new(
+                psk.expect("ResumptionSecret precedes NewSessionTicket"),
+                ticket.clone(),
+                *ticket_age_add,
+                0,
+            );
         }
     }
     panic!("no ticket emitted");
@@ -172,8 +172,9 @@ fn obtain_resumption() -> Resumption {
 #[test]
 fn server_accepts_psk_binder_computed_across_hrr() {
     let resumption = obtain_resumption();
+    let psk = resumption.psk;
 
-    let mut client = fresh_client(Some(resumption.clone()));
+    let mut client = fresh_client(Some(resumption));
     let ch1f = send(&client.start().unwrap(), Epoch::Plaintext);
     let ch1s = strip_key_share(&ch1f);
 
@@ -192,7 +193,7 @@ fn server_accepts_psk_binder_computed_across_hrr() {
     // a binder recomputed over message_hash(CH1) ‖ HRR ‖ Truncate(CH2).
     let mut ch2 = ch1f.clone();
     let n = ch2.len();
-    let binder = post_hrr_binder(&resumption.psk, &ch1s, &hrr, &ch2);
+    let binder = post_hrr_binder(&psk, &ch1s, &hrr, &ch2);
     ch2[n - 32..].copy_from_slice(&binder);
 
     let s2 = server.read(Epoch::Plaintext, &ch2).unwrap();
@@ -222,8 +223,9 @@ fn server_accepts_psk_binder_computed_across_hrr() {
 #[test]
 fn server_rejects_psk_binder_ignoring_hrr_prefix() {
     let resumption = obtain_resumption();
+    let psk = resumption.psk;
 
-    let mut client = fresh_client(Some(resumption.clone()));
+    let mut client = fresh_client(Some(resumption));
     let ch1f = send(&client.start().unwrap(), Epoch::Plaintext);
     let ch1s = strip_key_share(&ch1f);
 
@@ -238,8 +240,7 @@ fn server_rejects_psk_binder_ignoring_hrr_prefix() {
     let n = ch2.len();
     let mut fresh = Transcript::new();
     fresh.update(&ch2[..n - BINDERS_FIELD_LEN]);
-    let wrong =
-        ResumptionBinder::compute(&resumption.psk, fresh.hash(HashAlg::Sha256).as_slice()).unwrap();
+    let wrong = ResumptionBinder::compute(&psk, fresh.hash(HashAlg::Sha256).as_slice()).unwrap();
     ch2[n - 32..].copy_from_slice(wrong.as_slice());
 
     let types = handshake_types(&send(
@@ -259,8 +260,9 @@ fn server_rejects_psk_binder_ignoring_hrr_prefix() {
 #[test]
 fn client_offers_psk_binder_computed_across_hrr() {
     let resumption = obtain_resumption();
+    let psk = resumption.psk;
 
-    let mut client = fresh_client(Some(resumption.clone()));
+    let mut client = fresh_client(Some(resumption));
     let ch1 = send(&client.start().unwrap(), Epoch::Plaintext);
     assert_eq!(
         psk_binder(&ch1).len(),
@@ -291,7 +293,7 @@ fn client_offers_psk_binder_computed_across_hrr() {
         "retry must carry a key_share",
     );
 
-    let expected = post_hrr_binder(&resumption.psk, &ch1, &hrr, &ch2);
+    let expected = post_hrr_binder(&psk, &ch1, &hrr, &ch2);
     assert_eq!(
         psk_binder(&ch2),
         expected,
