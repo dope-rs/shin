@@ -38,7 +38,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 #[test]
-fn open_into_uninit_hot_path_allocates_nothing() {
+fn caller_buffer_record_hot_paths_allocate_nothing() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
     let warmup = sealer
         .seal(ContentType::ApplicationData, b"warm up crypto state")
@@ -47,8 +47,11 @@ fn open_into_uninit_hot_path_allocates_nothing() {
         .seal(ContentType::ApplicationData, b"caller-owned output")
         .unwrap();
     let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
+    let mut parts_sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
     let mut warmup_output = [MaybeUninit::uninit(); 128];
     let mut measured_output = [MaybeUninit::uninit(); 128];
+    let mut sealed_output = [MaybeUninit::uninit(); 128];
+    let parts = [&b"caller-"[..], &b"owned "[..], &b"input"[..]];
 
     opener
         .open_into_uninit(&warmup, &mut warmup_output)
@@ -60,8 +63,17 @@ fn open_into_uninit_hot_path_allocates_nothing() {
         .open_into_uninit(&measured, &mut measured_output)
         .unwrap()
         .unwrap();
+    let sealed = parts_sealer
+        .seal_parts_into_uninit(
+            ContentType::ApplicationData,
+            b"caller-owned input".len(),
+            parts,
+            &mut sealed_output,
+        )
+        .unwrap();
     let allocations = ALLOCATIONS.load(Ordering::Relaxed);
 
     assert_eq!(opened.body, b"caller-owned output");
+    assert!(!sealed.is_empty());
     assert_eq!(allocations, 0);
 }

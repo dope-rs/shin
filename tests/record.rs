@@ -157,6 +157,46 @@ fn seal_into_staged_equals_seal_and_round_trips() {
 }
 
 #[test]
+fn seal_parts_crosses_slice_boundaries_without_changing_the_record() {
+    let parts = [&b"response-"[..], &b""[..], &b"header"[..], &b"+body"[..]];
+    let body_len = parts.iter().map(|part| part.len()).sum();
+    let mut output = [MaybeUninit::uninit(); 128];
+    let mut vectored = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let wire = vectored
+        .seal_parts_into_uninit(ContentType::ApplicationData, body_len, parts, &mut output)
+        .unwrap();
+
+    let mut contiguous = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let expected = contiguous
+        .seal(ContentType::ApplicationData, b"response-header+body")
+        .unwrap();
+
+    assert_eq!(wire, expected);
+}
+
+#[test]
+fn seal_parts_rejects_length_mismatch_without_consuming_sequence() {
+    let mut output = [MaybeUninit::uninit(); 128];
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+
+    assert_eq!(
+        sealer
+            .seal_parts_into_uninit(ContentType::ApplicationData, 4, [&b"abc"[..]], &mut output,)
+            .unwrap_err(),
+        RecordError::LengthMismatch
+    );
+    assert_eq!(sealer.seq(), 0);
+
+    assert_eq!(
+        sealer
+            .seal_parts_into_uninit(ContentType::ApplicationData, 2, [&b"abc"[..]], &mut output,)
+            .unwrap_err(),
+        RecordError::LengthMismatch
+    );
+    assert_eq!(sealer.seq(), 0);
+}
+
+#[test]
 fn seal_output_methods_match_byte_for_byte() {
     let body = b"hello tls record body";
 
