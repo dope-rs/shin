@@ -93,6 +93,50 @@ fn ciphertext_round_trip_app_data_inner() {
 }
 
 #[test]
+fn ciphertext_open_into_copies_once_to_caller_storage() {
+    let body = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let wire = sealer.seal(ContentType::ApplicationData, body).unwrap();
+    let original = wire.clone();
+    let mut output = vec![MaybeUninit::uninit(); wire.len() - HEADER_LEN];
+    let output_start = output.as_ptr().cast::<u8>();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
+
+    let opened = opener
+        .open_into_uninit(&wire, &mut output)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(opened.content_type, ContentType::ApplicationData);
+    assert_eq!(opened.body, body);
+    assert_eq!(opened.body.as_ptr(), output_start);
+    assert_eq!(opened.consumed, wire.len());
+    assert_eq!(wire, original);
+}
+
+#[test]
+fn ciphertext_open_into_retries_after_small_destination() {
+    let body = b"destination bound";
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let wire = sealer.seal(ContentType::ApplicationData, body).unwrap();
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
+    let mut small = [MaybeUninit::uninit(); AEAD_TAG_LEN];
+
+    assert!(matches!(
+        opener.open_into_uninit(&wire, &mut small),
+        Err(RecordError::BufferTooSmall)
+    ));
+    assert_eq!(opener.seq(), 0);
+
+    let mut output = vec![MaybeUninit::uninit(); wire.len() - HEADER_LEN];
+    let opened = opener
+        .open_into_uninit(&wire, &mut output)
+        .unwrap()
+        .unwrap();
+    assert_eq!(opened.body, body);
+}
+
+#[test]
 fn seal_into_staged_equals_seal_and_round_trips() {
     let body = b"hello tls record body";
 

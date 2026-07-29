@@ -51,24 +51,6 @@ impl CipherSuite {
     }
 }
 
-fn aead_for_suite(secret: &[u8], suite: CipherSuite) -> Result<AeadKey, RecordKeyError> {
-    let alg = suite.hash_alg();
-    match suite {
-        CipherSuite::Aes128GcmSha256 => {
-            let keys = TrafficKeys::<16>::derive(alg, secret)?;
-            Ok(AeadKey::aes_128_gcm(&keys.key, keys.iv)?)
-        }
-        CipherSuite::ChaCha20Poly1305Sha256 => {
-            let keys = TrafficKeys::<32>::derive(alg, secret)?;
-            Ok(AeadKey::chacha20_poly1305(&keys.key, keys.iv)?)
-        }
-        CipherSuite::Aes256GcmSha384 => {
-            let keys = TrafficKeys::<32>::derive(alg, secret)?;
-            Ok(AeadKey::aes_256_gcm(&keys.key, keys.iv)?)
-        }
-    }
-}
-
 pub const MAX_PLAINTEXT_BODY: usize = 1 << 14;
 
 pub const MAX_CIPHERTEXT_BODY: usize = (1 << 14) + 256;
@@ -153,12 +135,7 @@ pub struct PlaintextRecord<'a> {
 
 impl<'a> PlaintextRecord<'a> {
     /// Encodes a plaintext record into a fresh buffer.
-    ///
-    /// ```
-    /// use shin::record::{ContentType, HEADER_LEN, PlaintextRecord};
-    /// let wire = PlaintextRecord::encode(ContentType::Alert, &[1, 2]).unwrap();
-    /// assert_eq!(wire.len(), HEADER_LEN + 2);
-    /// ```
+    #[doc = include_str!("docs/plaintext_encode.md")]
     pub fn encode(content_type: ContentType, body: &[u8]) -> Result<Vec<u8>, RecordError> {
         let mut out = Vec::new();
         Self::encode_into(content_type, body, &mut out)?;
@@ -166,13 +143,7 @@ impl<'a> PlaintextRecord<'a> {
     }
 
     /// Appends a plaintext record to `out` without a fresh allocation.
-    ///
-    /// ```
-    /// use shin::record::{ContentType, HEADER_LEN, PlaintextRecord};
-    /// let mut wire = Vec::new();
-    /// PlaintextRecord::encode_into(ContentType::Alert, &[1, 2], &mut wire).unwrap();
-    /// assert_eq!(wire.len(), HEADER_LEN + 2);
-    /// ```
+    #[doc = include_str!("docs/plaintext_encode_into.md")]
     pub fn encode_into(
         content_type: ContentType,
         body: &[u8],
@@ -184,13 +155,7 @@ impl<'a> PlaintextRecord<'a> {
     }
 
     /// Encodes a plaintext record into `out`, returning its length. No allocation.
-    ///
-    /// ```
-    /// use shin::record::{ContentType, HEADER_LEN, PlaintextRecord};
-    /// let mut wire = [0u8; 32];
-    /// let n = PlaintextRecord::encode_into_slice(ContentType::Alert, &[1, 2], &mut wire).unwrap();
-    /// assert_eq!(n, HEADER_LEN + 2);
-    /// ```
+    #[doc = include_str!("docs/plaintext_encode_into_slice.md")]
     pub fn encode_into_slice(
         content_type: ContentType,
         body: &[u8],
@@ -271,14 +236,7 @@ impl Sealer {
     }
 
     /// Appends a sealed record to `out` without a per-record allocation.
-    ///
-    /// ```
-    /// use shin::record::{ContentType, Sealer};
-    /// let mut sealer = Sealer::from_secret(&[0u8; 32]).unwrap();
-    /// let mut staged = Vec::new();
-    /// sealer.seal_into(ContentType::ApplicationData, b"a", &mut staged).unwrap();
-    /// sealer.seal_into(ContentType::ApplicationData, b"b", &mut staged).unwrap();
-    /// ```
+    #[doc = include_str!("docs/seal_into.md")]
     pub fn seal_into(
         &mut self,
         inner_type: ContentType,
@@ -292,16 +250,7 @@ impl Sealer {
     }
 
     /// Seals one record into `out`, returning its length. No allocation.
-    ///
-    /// ```
-    /// use shin::record::{AEAD_TAG_LEN, ContentType, HEADER_LEN, Sealer};
-    /// let mut sealer = Sealer::from_secret(&[0u8; 32]).unwrap();
-    /// let mut wire = [0u8; 64];
-    /// let n = sealer
-    ///     .seal_into_slice(ContentType::ApplicationData, b"hi", &mut wire)
-    ///     .unwrap();
-    /// assert_eq!(n, HEADER_LEN + b"hi".len() + 1 + AEAD_TAG_LEN);
-    /// ```
+    #[doc = include_str!("docs/seal_into_slice.md")]
     pub fn seal_into_slice(
         &mut self,
         inner_type: ContentType,
@@ -359,38 +308,22 @@ impl Sealer {
     }
 }
 
-fn check_body_len(body: &[u8]) -> Result<(), RecordError> {
-    if body.len() > MAX_PLAINTEXT_BODY {
-        return Err(RecordError::BodyTooLarge);
-    }
-    Ok(())
-}
-
-fn sealed_record_len(body: &[u8]) -> Result<usize, RecordError> {
-    check_body_len(body)?;
-    Ok(HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN)
-}
-
-fn plaintext_record_len(body: &[u8]) -> Result<usize, RecordError> {
-    check_body_len(body)?;
-    Ok(HEADER_LEN + body.len())
-}
-
-fn write_header(content_type: ContentType, body_len: u16, out: &mut UninitWriter<'_>) {
-    out.push(content_type as u8);
-    out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    out.extend_from_slice(&body_len.to_be_bytes());
-}
-
-fn write_plaintext(content_type: ContentType, body: &[u8], out: &mut UninitWriter<'_>) {
-    write_header(content_type, body.len() as u16, out);
-    out.extend_from_slice(body);
-}
-
 pub struct Opener {
     aead: AeadKey,
     seq: u64,
     poisoned: bool,
+}
+
+pub struct Opened<'a> {
+    pub content_type: ContentType,
+    pub body: &'a mut [u8],
+    pub consumed: usize,
+}
+
+struct Ciphertext {
+    aad: [u8; HEADER_LEN],
+    body: Range<usize>,
+    total: usize,
 }
 
 impl Opener {
@@ -419,6 +352,43 @@ impl Opener {
         &mut self,
         input: &mut [u8],
     ) -> Result<Option<(ContentType, Range<usize>, usize)>, RecordError> {
+        let Some(ciphertext) = self.ciphertext(input)? else {
+            return Ok(None);
+        };
+        let (content_type, content_len) =
+            self.open_body(&ciphertext.aad, &mut input[ciphertext.body])?;
+        Ok(Some((
+            content_type,
+            HEADER_LEN..HEADER_LEN + content_len,
+            ciphertext.total,
+        )))
+    }
+
+    /// Copies one ciphertext body into caller storage, then opens it in place.
+    /// The hot path allocates nothing and a short destination does not advance `seq`.
+    pub fn open_into_uninit<'a>(
+        &mut self,
+        input: &[u8],
+        output: &'a mut [MaybeUninit<u8>],
+    ) -> Result<Option<Opened<'a>>, RecordError> {
+        let Some(ciphertext) = self.ciphertext(input)? else {
+            return Ok(None);
+        };
+        let dst = output
+            .get_mut(..ciphertext.body.len())
+            .ok_or(RecordError::BufferTooSmall)?;
+        let mut copied = UninitWriter::new(dst);
+        copied.extend_from_slice(&input[ciphertext.body]);
+        let body = copied.into_initialized();
+        let (content_type, content_len) = self.open_body(&ciphertext.aad, body)?;
+        Ok(Some(Opened {
+            content_type,
+            body: &mut body[..content_len],
+            consumed: ciphertext.total,
+        }))
+    }
+
+    fn ciphertext(&self, input: &[u8]) -> Result<Option<Ciphertext>, RecordError> {
         if self.poisoned {
             return Err(RecordError::Poisoned);
         }
@@ -440,27 +410,34 @@ impl Opener {
         if self.seq == u64::MAX {
             return Err(RecordError::SeqExhausted);
         }
-
         let mut aad = [0u8; HEADER_LEN];
         aad.copy_from_slice(&input[..HEADER_LEN]);
+        Ok(Some(Ciphertext {
+            aad,
+            body: HEADER_LEN..total,
+            total,
+        }))
+    }
 
+    fn open_body(
+        &mut self,
+        aad: &[u8; HEADER_LEN],
+        body: &mut [u8],
+    ) -> Result<(ContentType, usize), RecordError> {
         let seq = self.seq;
-
-        let body = &mut input[HEADER_LEN..total];
-        let plaintext_len = match self.aead.open(seq, &aad, body) {
+        let plaintext_len = match self.aead.open(seq, aad, body) {
             Ok(plain) => plain.len(),
             Err(_) => {
                 self.poisoned = true;
                 return Err(RecordError::OpenFailed);
             }
         };
-
         self.seq += 1;
 
-        let inner_slice = &input[HEADER_LEN..HEADER_LEN + plaintext_len];
+        let inner_slice = &body[..plaintext_len];
         let content_len = inner_slice
             .iter()
-            .rposition(|&b| b != 0)
+            .rposition(|&byte| byte != 0)
             .ok_or(RecordError::AllZeroInner)?;
         if content_len > MAX_PLAINTEXT_BODY {
             return Err(RecordError::RecordOverflow);
@@ -469,9 +446,52 @@ impl Opener {
         if inner_type == ContentType::ChangeCipherSpec {
             return Err(RecordError::UnexpectedChangeCipherSpec);
         }
-
-        let plaintext_start = HEADER_LEN;
-        let plaintext_end = HEADER_LEN + content_len;
-        Ok(Some((inner_type, plaintext_start..plaintext_end, total)))
+        Ok((inner_type, content_len))
     }
+}
+
+fn aead_for_suite(secret: &[u8], suite: CipherSuite) -> Result<AeadKey, RecordKeyError> {
+    let alg = suite.hash_alg();
+    match suite {
+        CipherSuite::Aes128GcmSha256 => {
+            let keys = TrafficKeys::<16>::derive(alg, secret)?;
+            Ok(AeadKey::aes_128_gcm(&keys.key, keys.iv)?)
+        }
+        CipherSuite::ChaCha20Poly1305Sha256 => {
+            let keys = TrafficKeys::<32>::derive(alg, secret)?;
+            Ok(AeadKey::chacha20_poly1305(&keys.key, keys.iv)?)
+        }
+        CipherSuite::Aes256GcmSha384 => {
+            let keys = TrafficKeys::<32>::derive(alg, secret)?;
+            Ok(AeadKey::aes_256_gcm(&keys.key, keys.iv)?)
+        }
+    }
+}
+
+fn check_body_len(body: &[u8]) -> Result<(), RecordError> {
+    if body.len() > MAX_PLAINTEXT_BODY {
+        return Err(RecordError::BodyTooLarge);
+    }
+    Ok(())
+}
+
+fn sealed_record_len(body: &[u8]) -> Result<usize, RecordError> {
+    check_body_len(body)?;
+    Ok(HEADER_LEN + body.len() + 1 + AEAD_TAG_LEN)
+}
+
+fn plaintext_record_len(body: &[u8]) -> Result<usize, RecordError> {
+    check_body_len(body)?;
+    Ok(HEADER_LEN + body.len())
+}
+
+fn write_header(content_type: ContentType, body_len: u16, out: &mut UninitWriter<'_>) {
+    out.push(content_type as u8);
+    out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    out.extend_from_slice(&body_len.to_be_bytes());
+}
+
+fn write_plaintext(content_type: ContentType, body: &[u8], out: &mut UninitWriter<'_>) {
+    write_header(content_type, body.len() as u16, out);
+    out.extend_from_slice(body);
 }
