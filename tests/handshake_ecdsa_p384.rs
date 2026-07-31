@@ -1,12 +1,14 @@
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDSA_P384_SHA384};
 
-use shin::Epoch;
-use shin::cert::Cert;
-use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::identity::cert::Cert;
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, find_send, has_done};
 
 const HOSTNAME: &str = "p384.local";
@@ -29,8 +31,8 @@ fn ecdsa_p384_self_signed() -> (Vec<u8>, SigningKey) {
 
 fn now_inside(cert_der: &[u8]) -> u64 {
     let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = shin::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
+    let na = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
     (nb.0 + na.0) / 2
 }
 

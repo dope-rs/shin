@@ -3,9 +3,9 @@ use rcgen::{
     Issuer, KeyPair, KeyUsagePurpose, NameConstraints, PKCS_ECDSA_P256_SHA256,
 };
 
-use shin::cert::Cert;
-use shin::chain::{Chain, ChainError, TrustAnchor};
-use shin::time::UnixTime;
+use shin::identity::cert::Cert;
+use shin::identity::chain::{Chain, ChainError, TrustAnchor};
+use shin::identity::time::UnixTime;
 
 struct Ca {
     params: CertificateParams,

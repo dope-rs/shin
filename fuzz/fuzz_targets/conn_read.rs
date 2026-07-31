@@ -1,10 +1,25 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::server::{CertSource, Config as ShardConfig, ConnectionConfig, Server, Shard};
-use shin::sig::SigningKey;
-use shin::Epoch;
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::server::{config::CertSource, config::Config as ShardConfig, config::ConnectionConfig, Server, Shard};
+use shin::crypto::sig::SigningKey;
+use shin::connection::{Epoch, Event, EventContext, EventSink};
+
+struct IgnoreEvents;
+
+impl EventSink for IgnoreEvents {
+    type Error = core::convert::Infallible;
+
+    fn event(
+        &mut self,
+        _event: Event<'_>,
+        _context: EventContext,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 fn epoch(b: u8) -> Epoch {
     match b & 0b11 {
@@ -53,7 +68,8 @@ fuzz_target!(|data: &[u8]| {
         },
         || 0,
     );
-    let _ = client.start();
+    let mut events = IgnoreEvents;
+    let _ = client.start_into(&mut events);
 
     let mut r = data;
     while r.len() >= 2 {
@@ -65,9 +81,9 @@ fuzz_target!(|data: &[u8]| {
         r = rest;
         let ep = epoch(hdr);
         if hdr & 0b100 == 0 {
-            let _ = server.read(ep, chunk, &mut shard);
+            let _ = server.read_into(ep, chunk, &mut shard, &mut events);
         } else {
-            let _ = client.read(ep, chunk);
+            let _ = client.read_into(ep, chunk, &mut events);
         }
     }
 });

@@ -1,12 +1,16 @@
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::codec::Reader;
-use shin::extension::ExtensionType;
-use shin::handshake::{ClientHello, Handshake};
-use shin::server::{CertSource, EarlyDataGuard};
-use shin::sig::SigningKey;
-use shin::{Clock, Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::{Clock, Epoch};
+use shin::crypto::sig::SigningKey;
+use shin::server::{config::CertSource, config::EarlyDataGuard};
+use shin::wire::codec::Reader;
+use shin::wire::extension::ExtensionType;
+use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::messages::ClientHello;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig};
 
 fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
@@ -34,8 +38,8 @@ fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
         })
         .unwrap();
     let mut r = Reader::new(&ch_bytes);
-    match Handshake::decode(&mut r).unwrap() {
-        Handshake::ClientHello(ch) => ch,
+    match Frame::decode(&mut r).unwrap() {
+        Frame::ClientHello(ch) => ch,
         _ => panic!(),
     }
 }
@@ -152,10 +156,10 @@ fn no_overlap_aborts_with_no_application_protocol() {
     let evs = client.start().unwrap();
     let ch = take_send(evs, Epoch::Plaintext);
     let err = server.read(Epoch::Plaintext, &ch).unwrap_err();
-    assert_eq!(err, shin::Error::NoApplicationProtocol);
+    assert_eq!(err, shin::connection::Error::NoApplicationProtocol);
     assert_eq!(
         err.alert().description,
-        shin::alert::AlertDescription::NoApplicationProtocol,
+        shin::wire::alert::AlertDescription::NoApplicationProtocol,
     );
 }
 

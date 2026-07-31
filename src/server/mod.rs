@@ -1,166 +1,64 @@
-use alloc::vec::Vec;
+use arrayvec::ArrayVec;
+use core::mem;
 
 use ring::rand::{SecureRandom, SystemRandom};
-use subtle::ConstantTimeEq;
 
-use crate::codec::Encode;
-use crate::extension::{Extension, ExtensionType};
-use crate::handshake::reassemblers::KeyUpdateBudget;
-use crate::handshake::{
-    Certificate, CertificateEntry, CertificateRequest, CertificateVerify, ClientHello,
-    EncryptedExtensions, Finished, HELLO_RETRY_REQUEST_RANDOM, Handshake, HsReassembler, KeyUpdate,
-    MAX_KEY_UPDATES_WITHOUT_APP_DATA, NewSessionTicket, RANDOM_LEN, ServerHello, TLS_1_2,
+use crate::connection::{
+    Clock, DriveError, Epoch, Error, Event, EventContext, EventSink, KeyDirection, WorkspaceRegion,
 };
-use crate::hash::{Digest, HashAlg, Transcript};
-use crate::kdf::Hkdf;
-use crate::kx::KexGroup;
-use crate::marker::ThreadBound;
-use crate::peer::LeafKey;
-use crate::proto::{
-    CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, KeyShare, SignatureAlgorithms, SupportedGroups,
+use crate::crypto::hash::{Digest, HashAlg, Transcript};
+use crate::crypto::kdf::Hkdf;
+use crate::crypto::kx::KexGroup;
+use crate::crypto::schedule::{KeySchedule, ResumptionMaster};
+use crate::crypto::ticket::TicketKeys;
+use crate::identity::peer::LeafKey;
+use crate::identity::spki::SubjectPublicKey;
+use crate::memory::bound::ThreadBound;
+use crate::wire::codec::{Encode, EncodeError};
+use crate::wire::extension::{Extension, ExtensionType};
+use crate::wire::handshake::frame::Frame;
+use crate::wire::handshake::messages::{CertificateVerify, Finished, HandshakeType, KeyUpdate};
+use crate::wire::handshake::reassemblers::{HsReassembler, KeyUpdateBudget};
+use crate::wire::handshake::views::{
+    CertificateRef, CertificateVerifyRef, ClientHelloRef, HandshakeRef,
+};
+use crate::wire::handshake::workspace::{BoundedBuffer, HandshakeWorkspace};
+use crate::wire::handshake::{
+    HELLO_RETRY_REQUEST_RANDOM, MAX_KEY_UPDATES_WITHOUT_APP_DATA, RANDOM_LEN, TLS_1_2,
+};
+use crate::wire::proto::{
+    CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, KeyShares, SignatureAlgorithms, SupportedGroups,
     SupportedVersions, TLS_1_3,
 };
-use crate::psk::{
-    KX_MODE_PSK_DHE, KxModes, Offer, RESUMPTION_HASH, ResumptionBinder, SelectedIdentity,
-};
-use crate::record::CipherSuite;
-use crate::schedule::{KeySchedule, ResumptionMaster};
-use crate::sig::SigningKey;
-use crate::spki;
-use crate::ticket::TicketKeys;
-use crate::{Clock, Epoch, Error, Event, KeyDirection};
+use crate::wire::psk::{KX_MODE_PSK_DHE, KxModes, Offer, RESUMPTION_HASH, ResumptionBinder};
+use crate::wire::record::CipherSuite;
 use zeroize::Zeroize;
 
+mod authentication;
+pub mod config;
 mod early;
+mod hello;
 mod negotiation;
+mod resumption;
 mod state;
+mod updates;
 
+use authentication::ClientAuthentication as _;
+use config::{
+    CertSource, ClientAuth, ClientCertVerifier, ClientCertificateChain, ClientIdentity, Config,
+    ConnectionConfig, EarlyDataGuard, NoClientAuth, NoGuard,
+};
 use early::{AcceptedPsk, EarlyDataAdmission, TICKET_LIFETIME_SECS};
+use hello::Hello as _;
 use negotiation::ClientHelloOffers;
+use resumption::Resumption as _;
 use state::State;
-
-pub struct Config {
-    pub source: CertSource,
-    pub alpn_protocols: Vec<Vec<u8>>,
-    pub ticket_keys: Option<TicketKeys>,
-}
-
-impl Config {
-    pub fn validate(&self) -> Result<(), Error> {
-        if self
-            .alpn_protocols
-            .iter()
-            .any(|protocol| protocol.is_empty() || protocol.len() > u8::MAX as usize)
-        {
-            return Err(Error::BadConfig);
-        }
-        let identity_is_valid = match &self.source {
-            CertSource::RawPublicKey { signing_key } => signing_key.is_ed25519(),
-            CertSource::X509 {
-                chain_der,
-                signing_key,
-            } => Certificate::chain_fits(chain_der) && signing_key.matches_x509_chain(chain_der),
-        };
-        if !identity_is_valid {
-            return Err(Error::BadConfig);
-        }
-        Ok(())
-    }
-}
-
-pub struct ConnectionConfig {
-    pub transport_params: Vec<u8>,
-}
-
-impl ConnectionConfig {
-    pub fn validate(&self) -> Result<(), Error> {
-        if self.transport_params.len() > u16::MAX as usize {
-            return Err(Error::BadConfig);
-        }
-        Ok(())
-    }
-}
-
-/// Replay store required for safe 0-RTT. Without one, early data is refused even
-/// when configured because single-use cannot be proved (RFC 8446 §8).
-pub trait EarlyDataGuard {
-    #[doc(hidden)]
-    const ACCEPTS_EARLY_DATA: bool = true;
-
-    /// Record a single-use token (the PSK binder); `false` means it was already
-    /// seen — a replay. Tokens need only be kept for `TICKET_LIFETIME_SECS`.
-    fn register(&mut self, token: &[u8]) -> bool;
-}
-
-/// Default guard for servers that never accept 0-RTT: reports every token as
-/// already-seen, so early data is always refused.
-pub struct NoGuard;
-
-impl EarlyDataGuard for NoGuard {
-    const ACCEPTS_EARLY_DATA: bool = false;
-
-    fn register(&mut self, _token: &[u8]) -> bool {
-        false
-    }
-}
-
-pub enum CertSource {
-    RawPublicKey {
-        signing_key: SigningKey,
-    },
-    X509 {
-        chain_der: Vec<Vec<u8>>,
-        signing_key: SigningKey,
-    },
-}
-
-impl CertSource {
-    fn signing_key(&self) -> &SigningKey {
-        match self {
-            Self::RawPublicKey { signing_key } => signing_key,
-            Self::X509 { signing_key, .. } => signing_key,
-        }
-    }
-}
-
-/// Mutual-TLS policy: `Requested` permits an empty Certificate while `Required`
-/// rejects one; presented identities still pass [`ClientCertVerifier`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ClientAuth {
-    Requested,
-    Required,
-}
-
-/// Default [`ClientCertVerifier`] for a server that does not authenticate
-/// clients; its [`verify`](ClientCertVerifier::verify) is never reached.
-pub struct NoClientAuth;
-
-impl ClientCertVerifier for NoClientAuth {
-    fn verify(&self, _identity: &ClientIdentity<'_>) -> bool {
-        false
-    }
-}
-
-/// Authorizes a possession-proven client identity, typically by pinning
-/// `spki_der`; CertificateVerify authenticity has already succeeded.
-pub trait ClientCertVerifier {
-    fn verify(&self, identity: &ClientIdentity<'_>) -> bool;
-}
-
-/// A signature-verified client identity handed to [`ClientCertVerifier`].
-pub struct ClientIdentity<'a> {
-    /// `CERT_TYPE_X509` (0) or `CERT_TYPE_RAW_PUBLIC_KEY` (2).
-    pub cert_type: u8,
-    /// The leaf SubjectPublicKeyInfo DER — a uniform pinning target across key
-    /// types. For RawPublicKey this is the entire certificate.
-    pub spki_der: &'a [u8],
-    /// The presented X.509 chain (leaf first); empty for RawPublicKey.
-    pub chain_der: &'a [Vec<u8>],
-}
+use updates::Updates as _;
 
 /// ```compile_fail
-/// use shin::server::{CertSource, Config, Shard};
-/// use shin::sig::SigningKey;
+/// use shin::server::Shard;
+/// use shin::server::config::{CertSource, Config};
+/// use shin::crypto::sig::SigningKey;
 /// fn assert_send<T: Send>() {}
 /// let config = Config {
 ///     source: CertSource::RawPublicKey {
@@ -240,7 +138,7 @@ pub struct Server<C: Clock> {
     rng: SystemRandom,
     c_ap_traffic: Option<Digest>,
     s_ap_traffic: Option<Digest>,
-    selected_alpn: Option<Vec<u8>>,
+    selected_alpn: Option<ArrayVec<u8, 255>>,
     master: Option<KeySchedule>,
     early_data: EarlyDataAdmission,
     clock: C,
@@ -254,9 +152,9 @@ pub struct Server<C: Clock> {
     /// The client's leaf key, captured during its Certificate, used to verify
     /// its CertificateVerify.
     client_leaf: Option<LeafKey>,
-    client_spki_der: Vec<u8>,
-    client_cert_chain: Vec<Vec<u8>>,
     key_updates: KeyUpdateBudget<MAX_KEY_UPDATES_WITHOUT_APP_DATA>,
+    flight: BoundedBuffer,
+    identity_workspace: BoundedBuffer,
     _thread: ThreadBound,
 }
 
@@ -278,6 +176,19 @@ impl<C: Clock> Drop for Server<C> {
 
 impl<C: Clock> Server<C> {
     pub fn new(config: ConnectionConfig, clock: C) -> Self {
+        Self::with_workspace(config, clock, HandshakeWorkspace::for_server())
+    }
+
+    pub fn with_workspace(
+        config: ConnectionConfig,
+        clock: C,
+        workspace: HandshakeWorkspace,
+    ) -> Self {
+        let HandshakeWorkspace {
+            reassembly,
+            flight,
+            identity,
+        } = workspace;
         Self {
             config,
             clock,
@@ -292,14 +203,23 @@ impl<C: Clock> Server<C> {
             hrr_done: false,
             exporter_master: None,
             negotiated_suite: None,
-            reasm: HsReassembler::default(),
+            reasm: HsReassembler::with_buffer(reassembly),
             negotiated_client_cert_type: CERT_TYPE_X509,
             client_leaf: None,
-            client_spki_der: Vec::new(),
-            client_cert_chain: Vec::new(),
             key_updates: KeyUpdateBudget::default(),
+            flight,
+            identity_workspace: identity,
             _thread: ThreadBound::NEW,
         }
+    }
+
+    /// Returns the caller-owned handshake storage after clearing protocol bytes.
+    pub fn into_workspace(mut self) -> HandshakeWorkspace {
+        HandshakeWorkspace::from_buffers(
+            self.reasm.release_buffer(),
+            mem::take(&mut self.flight),
+            mem::take(&mut self.identity_workspace),
+        )
     }
 
     fn now_ms(&self) -> u64 {
@@ -341,18 +261,27 @@ impl<C: Clock> Server<C> {
         self.early_data.charge(len)
     }
 
-    pub fn read<G: EarlyDataGuard, V: ClientCertVerifier>(
+    /// Processes one record payload and emits events without an intermediate batch.
+    pub fn read_into<G, V, S>(
         &mut self,
         epoch: Epoch,
         data: &[u8],
         shard: &mut Shard<G, V>,
-    ) -> Result<Vec<Event>, Error> {
-        self.reasm.push(epoch, data)?;
-        let mut events = Vec::new();
-        while let Some((msg, raw)) = self.reasm.next_message()? {
-            self.process(epoch, msg, &raw, shard, &mut events)?;
+        events: &mut S,
+    ) -> Result<(), DriveError<S::Error>>
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+        S: EventSink + ?Sized,
+    {
+        self.reasm.begin_record(epoch)?;
+        let mut input = data;
+        while let Some(raw) = self.reasm.next_record(epoch, &mut input)? {
+            let msg = HandshakeRef::decode(raw.as_ref())?;
+            self.process(epoch, msg, raw.as_ref(), shard, events)?;
+            self.reasm.recycle(raw);
         }
-        Ok(events)
+        Ok(())
     }
 
     /// Mark application-data progress and reset the consecutive KeyUpdate budget.
@@ -362,51 +291,66 @@ impl<C: Clock> Server<C> {
         self.key_updates.reset();
     }
 
-    fn process<G: EarlyDataGuard, V: ClientCertVerifier>(
+    fn process<G, V, S>(
         &mut self,
         epoch: Epoch,
-        msg: Handshake,
+        msg: HandshakeRef<'_>,
         raw: &[u8],
         shard: &mut Shard<G, V>,
-        events: &mut Vec<Event>,
-    ) -> Result<(), Error> {
+        events: &mut S,
+    ) -> Result<(), DriveError<S::Error>>
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+        S: EventSink + ?Sized,
+    {
         match (self.state, msg) {
-            (State::ExpectClientHello, Handshake::ClientHello(ch)) if epoch == Epoch::Plaintext => {
+            (State::ExpectClientHello, HandshakeRef::ClientHello(ch))
+                if epoch == Epoch::Plaintext =>
+            {
                 self.handle_client_hello(ch, raw, shard, events)
             }
             (
                 State::ExpectEndOfEarlyData {
                     client_handshake_traffic,
                 },
-                Handshake::EndOfEarlyData,
+                HandshakeRef::EndOfEarlyData,
             ) if epoch == Epoch::EarlyData => {
-                self.handle_end_of_early_data(raw, client_handshake_traffic)
+                self.handle_end_of_early_data(raw, client_handshake_traffic)?;
+                Ok(())
             }
             (
                 State::ExpectClientCertificate {
                     client_handshake_traffic,
                 },
-                Handshake::Certificate(c),
+                HandshakeRef::Certificate(c),
             ) if epoch == Epoch::Handshake => {
-                self.handle_client_certificate(c, raw, client_handshake_traffic, shard.client_auth)
+                self.handle_client_certificate(
+                    c,
+                    raw,
+                    client_handshake_traffic,
+                    shard.client_auth,
+                )?;
+                Ok(())
             }
             (
                 State::ExpectClientCertVerify {
                     client_handshake_traffic,
                 },
-                Handshake::CertificateVerify(cv),
+                HandshakeRef::CertificateVerify(cv),
             ) if epoch == Epoch::Handshake => {
-                self.handle_client_cert_verify(cv, raw, client_handshake_traffic, shard)
+                self.handle_client_cert_verify(cv, raw, client_handshake_traffic, shard)?;
+                Ok(())
             }
-            (State::ExpectClientFinished { verify_data }, Handshake::Finished(f))
+            (State::ExpectClientFinished { verify_data }, HandshakeRef::Finished(f))
                 if epoch == Epoch::Handshake =>
             {
                 self.handle_client_finished(f, raw, verify_data, shard, events)
             }
-            (State::Done, Handshake::KeyUpdate(ku)) if epoch == Epoch::Application => {
+            (State::Done, HandshakeRef::KeyUpdate(ku)) if epoch == Epoch::Application => {
                 self.handle_key_update(ku, events)
             }
-            _ => Err(Error::UnexpectedMessage),
+            _ => Err(Error::UnexpectedMessage.into()),
         }
     }
 
@@ -416,630 +360,18 @@ impl<C: Clock> Server<C> {
             .unwrap_or(HashAlg::Sha256)
     }
 
-    fn handle_key_update(&mut self, ku: KeyUpdate, events: &mut Vec<Event>) -> Result<(), Error> {
-        if !self.key_updates.consume() {
-            return Err(Error::UnexpectedMessage);
-        }
-        let c_ap = self.c_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-        let new_c_ap = Hkdf::new(self.hash_alg())
-            .traffic_update(&c_ap)?
-            .to_digest();
-        self.c_ap_traffic = Some(new_c_ap);
-        events.push(Event::KeyUpdate {
-            direction: KeyDirection::Read,
-            secret: new_c_ap,
-        });
-
-        if ku.request_update == 1 {
-            let reply = KeyUpdate { request_update: 0 };
-            let mut bytes = Vec::new();
-            Handshake::KeyUpdate(reply).encode(&mut bytes)?;
-            events.push(Event::Send {
-                epoch: Epoch::Application,
-                data: bytes,
-            });
-            let s_ap = self.s_ap_traffic.ok_or(Error::UnexpectedMessage)?;
-            let new_s_ap = Hkdf::new(self.hash_alg())
-                .traffic_update(&s_ap)?
-                .to_digest();
-            self.s_ap_traffic = Some(new_s_ap);
-            events.push(Event::KeyUpdate {
-                direction: KeyDirection::Write,
-                secret: new_s_ap,
-            });
-        }
-        Ok(())
-    }
-
-    fn handle_client_hello<G: EarlyDataGuard, V: ClientCertVerifier>(
-        &mut self,
-        ch: ClientHello,
-        raw: &[u8],
-        shard: &mut Shard<G, V>,
-        events: &mut Vec<Event>,
-    ) -> Result<(), Error> {
-        self.config.validate()?;
-        shard.config.validate()?;
-        let selected_suite = CipherSuite::SUPPORTED
-            .iter()
-            .copied()
-            .find(|s| ch.cipher_suites.contains(&s.to_u16()))
-            .ok_or(Error::UnsupportedCipherSuite)?;
-        self.negotiated_suite = Some(selected_suite);
-        let hash_alg = selected_suite.hash_alg();
-        if ch.legacy_compression_methods != [0] {
-            return Err(Error::IllegalParameter);
-        }
-        if ch.legacy_session_id.len() > 32 {
-            return Err(Error::Decode);
-        }
-        let sv = ch
-            .extensions
-            .iter()
-            .find(|e| e.ty == ExtensionType::SUPPORTED_VERSIONS)
-            .ok_or(Error::MissingExtension)?;
-        if !SupportedVersions::client_decode(&sv.data)?.contains(&TLS_1_3) {
-            return Err(Error::BadVersion);
-        }
-        let groups = ch
-            .extensions
-            .iter()
-            .find(|e| e.ty == ExtensionType::SUPPORTED_GROUPS)
-            .ok_or(Error::MissingExtension)?;
-        let client_groups = SupportedGroups::decode(&groups.data)?;
-        let hrr_group = KexGroup::SUPPORTED
-            .iter()
-            .copied()
-            .find(|g| client_groups.contains(&g.to_u16()))
-            .ok_or(Error::UnsupportedGroup)?;
-        let sigs = ch
-            .extensions
-            .iter()
-            .find(|e| e.ty == ExtensionType::SIGNATURE_ALGORITHMS)
-            .ok_or(Error::MissingExtension)?;
-        let local_sig_scheme = shard.config.source.signing_key().sig_scheme();
-        if !SignatureAlgorithms::decode(&sigs.data)?.contains(&local_sig_scheme) {
-            return Err(Error::UnsupportedSigScheme);
-        }
-        let chosen_share = ch
-            .extensions
-            .iter()
-            .find(|e| e.ty == ExtensionType::KEY_SHARE)
-            .map(|ks| KeyShare::select_client_entry(&ks.data, &KexGroup::SUPPORTED))
-            .transpose()?
-            .flatten();
-        let (kex_group, peer_pubkey) = match chosen_share {
-            Some(v) => v,
-            None if !self.hrr_done => {
-                return self.send_hello_retry_request(
-                    raw,
-                    &ch.legacy_session_id,
-                    hrr_group,
-                    events,
-                );
-            }
-            None => return Err(Error::MissingExtension),
-        };
-
-        let offers = ClientHelloOffers::parse(&ch.extensions)?;
-        self.selected_alpn = offers.select_alpn(&shard.config.alpn_protocols)?;
-        if let Some(parameters) = offers.peer_quic_transport_parameters() {
-            events.push(Event::PeerExtension {
-                ty: ExtensionType::QUIC_TRANSPORT_PARAMETERS.0,
-                data: parameters.to_vec(),
-            });
-        }
-
-        let psk_accepted = if hash_alg == RESUMPTION_HASH {
-            self.try_accept_psk(&ch, raw, shard.config.ticket_keys.as_ref())
-        } else {
-            None
-        };
-        let now_ms = self.now_ms();
-        let early_accepted = self.early_data.admit(
-            &mut shard.guard,
-            offers.early_data(),
-            psk_accepted.as_ref(),
-            self.selected_alpn.as_deref(),
-            self.negotiated_suite,
-            now_ms,
-        );
-
-        self.transcript.update(raw);
-
-        if let (Some(p), true) = (psk_accepted.as_ref(), early_accepted) {
-            let h_ch = self.transcript.hash(RESUMPTION_HASH);
-            let cets =
-                KeySchedule::client_early_traffic_secret(&p.psk, h_ch.as_slice())?.to_digest();
-            events.push(Event::ZeroRttKeysReady { secret: cets });
-        }
-
-        let session_id_echo = ch.legacy_session_id.clone();
-
-        let (server_share, dhe) = kex_group
-            .respond(&peer_pubkey, &self.rng)
-            .map_err(|_| Error::Kx)?;
-        let mut server_random = [0u8; RANDOM_LEN];
-        self.rng.fill(&mut server_random).map_err(|_| Error::Rng)?;
-
-        let mut sh_extensions = alloc::vec![
-            Extension::new(
-                ExtensionType::SUPPORTED_VERSIONS,
-                SupportedVersions::tls13().server_encode()
-            ),
-            Extension::new(
-                ExtensionType::KEY_SHARE,
-                KeyShare::new(kex_group, &server_share).server_encode()?
-            ),
-        ];
-        if psk_accepted.is_some() {
-            sh_extensions.push(Extension::new(
-                ExtensionType::PRE_SHARED_KEY,
-                SelectedIdentity::new(0).encode(),
-            ));
-        }
-        let sh = ServerHello {
-            legacy_version: TLS_1_2,
-            random: server_random,
-            legacy_session_id_echo: session_id_echo,
-            cipher_suite: selected_suite.to_u16(),
-            legacy_compression_method: 0,
-            extensions: sh_extensions,
-        };
-        let mut sh_bytes = Vec::new();
-        Handshake::ServerHello(sh).encode(&mut sh_bytes)?;
-        self.transcript.update(&sh_bytes);
-
-        events.push(Event::Send {
-            epoch: Epoch::Plaintext,
-            data: sh_bytes,
-        });
-
-        let ks_handshake = match &psk_accepted {
-            Some(p) => {
-                KeySchedule::new_psk(RESUMPTION_HASH, &p.psk).into_handshake(dhe.as_slice())?
-            }
-            None => KeySchedule::new(hash_alg).into_handshake(dhe.as_slice())?,
-        };
-        let h_chsh = self.transcript.hash(hash_alg);
-        let c_hs = ks_handshake
-            .client_handshake_traffic_secret(h_chsh.as_slice())?
-            .to_digest();
-        let s_hs = ks_handshake
-            .server_handshake_traffic_secret(h_chsh.as_slice())?
-            .to_digest();
-
-        events.push(Event::KeysReady {
-            epoch: Epoch::Handshake,
-            read_secret: c_hs,
-            write_secret: s_hs,
-        });
-
-        let certificate_negotiation = offers.certificate_negotiation(&shard.config.source)?;
-        self.negotiated_client_cert_type = certificate_negotiation.client_type;
-        let ee_exts = offers.encrypted_extensions(
-            certificate_negotiation,
-            &self.config.transport_params,
-            self.selected_alpn.as_ref(),
-            early_accepted,
-        )?;
-        let ee = EncryptedExtensions {
-            extensions: ee_exts,
-        };
-        let mut ee_bytes = Vec::new();
-        Handshake::EncryptedExtensions(ee).encode(&mut ee_bytes)?;
-        self.transcript.update(&ee_bytes);
-
-        let mut hs_blob = Vec::new();
-        hs_blob.extend_from_slice(&ee_bytes);
-
-        if psk_accepted.is_none() && shard.client_auth.is_some() {
-            let cr = CertificateRequest {
-                certificate_request_context: Vec::new(),
-                extensions: alloc::vec![Extension::new(
-                    ExtensionType::SIGNATURE_ALGORITHMS,
-                    SignatureAlgorithms::x509().encode()?,
-                )],
-            };
-            let mut cr_bytes = Vec::new();
-            Handshake::CertificateRequest(cr).encode(&mut cr_bytes)?;
-            self.transcript.update(&cr_bytes);
-            hs_blob.extend_from_slice(&cr_bytes);
-        }
-
-        if psk_accepted.is_none() {
-            let certificate_list: Vec<CertificateEntry> = match &shard.config.source {
-                CertSource::RawPublicKey { signing_key } => {
-                    let pubkey = signing_key.pubkey().ok_or(Error::Sig)?;
-                    alloc::vec![CertificateEntry {
-                        cert_data: spki::SubjectPublicKey::Ed25519(*pubkey)
-                            .encode()
-                            .map_err(|_| Error::Spki)?,
-                        extensions: Vec::new(),
-                    }]
-                }
-                CertSource::X509 { chain_der, .. } => chain_der
-                    .iter()
-                    .map(|der| CertificateEntry {
-                        cert_data: der.clone(),
-                        extensions: Vec::new(),
-                    })
-                    .collect(),
-            };
-            let cert = Certificate {
-                certificate_request_context: Vec::new(),
-                certificate_list,
-            };
-            let mut cert_bytes = Vec::new();
-            Handshake::Certificate(cert).encode(&mut cert_bytes)?;
-            self.transcript.update(&cert_bytes);
-
-            let h_pre_cv = self.transcript.hash(hash_alg);
-            let cv_msg = CertificateVerify::message(h_pre_cv.as_slice(), true);
-            let sig = shard
-                .config
-                .source
-                .signing_key()
-                .sign(&cv_msg)
-                .map_err(|_| Error::Sig)?;
-            let cv = CertificateVerify {
-                algorithm: shard.config.source.signing_key().sig_scheme(),
-                signature: sig,
-            };
-            let mut cv_bytes = Vec::new();
-            Handshake::CertificateVerify(cv).encode(&mut cv_bytes)?;
-            self.transcript.update(&cv_bytes);
-
-            hs_blob.extend_from_slice(&cert_bytes);
-            hs_blob.extend_from_slice(&cv_bytes);
-        }
-
-        let h_pre_sf = self.transcript.hash(hash_alg);
-        let sf_data = Finished::verify_data(hash_alg, s_hs.as_slice(), h_pre_sf.as_slice())?;
-        let sf = Finished {
-            verify_data: sf_data.as_slice().to_vec(),
-        };
-        let mut sf_bytes = Vec::new();
-        Handshake::Finished(sf).encode(&mut sf_bytes)?;
-        self.transcript.update(&sf_bytes);
-
-        hs_blob.extend_from_slice(&sf_bytes);
-        events.push(Event::Send {
-            epoch: Epoch::Handshake,
-            data: hs_blob,
-        });
-
-        let h_sf = self.transcript.hash(hash_alg);
-        let ks_master = ks_handshake.into_master()?;
-        let c_ap = ks_master
-            .client_application_traffic_secret(h_sf.as_slice())?
-            .to_digest();
-        let s_ap = ks_master
-            .server_application_traffic_secret(h_sf.as_slice())?
-            .to_digest();
-        self.c_ap_traffic = Some(c_ap);
-        self.s_ap_traffic = Some(s_ap);
-        self.exporter_master = Some(
-            ks_master
-                .exporter_master_secret(h_sf.as_slice())?
-                .to_digest(),
-        );
-        self.master = Some(ks_master);
-
-        events.push(Event::KeysReady {
-            epoch: Epoch::Application,
-            read_secret: c_ap,
-            write_secret: s_ap,
-        });
-
-        if early_accepted {
-            self.state = State::ExpectEndOfEarlyData {
-                client_handshake_traffic: c_hs,
-            };
-        } else if psk_accepted.is_none() && shard.client_auth.is_some() {
-            self.state = State::ExpectClientCertificate {
-                client_handshake_traffic: c_hs,
-            };
-        } else {
-            let verify_data = Finished::verify_data(hash_alg, c_hs.as_slice(), h_sf.as_slice())?;
-            self.state = State::ExpectClientFinished { verify_data };
-        }
-        Ok(())
-    }
-
-    /// RFC 8446 §4.1.4: ask for a retry (one only) when the ClientHello carried
-    /// no usable key_share, rewriting the transcript to `message_hash(CH1)`.
-    fn send_hello_retry_request(
-        &mut self,
-        ch_raw: &[u8],
-        session_id_echo: &[u8],
-        request_group: KexGroup,
-        events: &mut Vec<Event>,
-    ) -> Result<(), Error> {
-        let suite = self.negotiated_suite.ok_or(Error::UnsupportedCipherSuite)?;
-        let hrr = ServerHello {
-            legacy_version: TLS_1_2,
-            random: HELLO_RETRY_REQUEST_RANDOM,
-            legacy_session_id_echo: session_id_echo.to_vec(),
-            cipher_suite: suite.to_u16(),
-            legacy_compression_method: 0,
-            extensions: alloc::vec![
-                Extension::new(
-                    ExtensionType::SUPPORTED_VERSIONS,
-                    SupportedVersions::tls13().server_encode(),
-                ),
-                Extension::new(
-                    ExtensionType::KEY_SHARE,
-                    KeyShare::new(request_group, &[]).hrr_encode()
-                ),
-            ],
-        };
-        let mut hrr_bytes = Vec::new();
-        Handshake::ServerHello(hrr).encode(&mut hrr_bytes)?;
-
-        let mut t = Transcript::new();
-        t.update(ch_raw);
-        self.transcript = Transcript::restart_with_message_hash(&t.hash(self.hash_alg()));
-        self.transcript.update(&hrr_bytes);
-
-        self.hrr_done = true;
-        events.push(Event::Send {
-            epoch: Epoch::Plaintext,
-            data: hrr_bytes,
-        });
-        Ok(())
-    }
-
-    fn handle_end_of_early_data(
-        &mut self,
-        raw: &[u8],
-        client_handshake_traffic: Digest,
-    ) -> Result<(), Error> {
-        self.early_data.close();
-        self.transcript.update(raw);
-        self.expect_client_finished(client_handshake_traffic)
-    }
-
-    fn expect_client_finished(&mut self, client_handshake_traffic: Digest) -> Result<(), Error> {
-        let h = self.transcript.hash(self.hash_alg());
-        let verify_data = Finished::verify_data(
-            self.hash_alg(),
-            client_handshake_traffic.as_slice(),
-            h.as_slice(),
-        )?;
-        self.state = State::ExpectClientFinished { verify_data };
-        Ok(())
-    }
-
-    /// Mutual TLS: the client's Certificate (RFC 8446 §4.4.2). Capture the leaf
-    /// key for the CertificateVerify that follows; an empty list is an anonymous
-    /// client (allowed only under `Requested`).
-    fn handle_client_certificate(
-        &mut self,
-        cert: Certificate,
-        raw: &[u8],
-        client_handshake_traffic: Digest,
-        client_auth: Option<ClientAuth>,
-    ) -> Result<(), Error> {
-        if !cert.certificate_request_context.is_empty() {
-            return Err(Error::IllegalParameter);
-        }
-        if cert.certificate_list.is_empty() {
-            if client_auth == Some(ClientAuth::Required) {
-                return Err(Error::ClientCertRequired);
-            }
-            self.transcript.update(raw);
-            return self.expect_client_finished(client_handshake_traffic);
-        }
-        let leaf_entry = &cert.certificate_list[0];
-        let (leaf_key, spki_der, chain) =
-            if self.negotiated_client_cert_type == CERT_TYPE_RAW_PUBLIC_KEY {
-                if cert.certificate_list.len() != 1 {
-                    return Err(Error::BadCertificate);
-                }
-                let lk = LeafKey::from_spki(&leaf_entry.cert_data)?;
-                (lk, leaf_entry.cert_data.clone(), Vec::new())
-            } else {
-                let (lk, spki) = LeafKey::parse_x509(&leaf_entry.cert_data)?;
-                let chain: Vec<Vec<u8>> = cert
-                    .certificate_list
-                    .iter()
-                    .map(|e| e.cert_data.clone())
-                    .collect();
-                (lk, spki, chain)
-            };
-        self.client_leaf = Some(leaf_key);
-        self.client_spki_der = spki_der;
-        self.client_cert_chain = chain;
-        self.transcript.update(raw);
-        self.state = State::ExpectClientCertVerify {
-            client_handshake_traffic,
-        };
-        Ok(())
-    }
-
-    /// Mutual TLS: the client's CertificateVerify (RFC 8446 §4.4.3). Verify
-    /// possession of the leaf key, then ask the embedder to authorize the
-    /// pinned identity. Only then is the expected client Finished computed.
-    fn handle_client_cert_verify<G: EarlyDataGuard, V: ClientCertVerifier>(
-        &mut self,
-        cv: CertificateVerify,
-        raw: &[u8],
-        client_handshake_traffic: Digest,
-        shard: &Shard<G, V>,
-    ) -> Result<(), Error> {
-        if !SignatureAlgorithms::x509_supported(cv.algorithm) {
-            return Err(Error::SigSchemeNotOffered);
-        }
-        let leaf = self
-            .client_leaf
-            .as_ref()
-            .ok_or(Error::BadCertificateVerify)?;
-        let h_pre_cv = self.transcript.hash(self.hash_alg());
-        let msg = CertificateVerify::message(h_pre_cv.as_slice(), false);
-        leaf.verify(cv.algorithm, &msg, &cv.signature)?;
-
-        if shard.client_auth.is_none() {
-            return Err(Error::UnexpectedMessage);
-        }
-        let identity = ClientIdentity {
-            cert_type: self.negotiated_client_cert_type,
-            spki_der: &self.client_spki_der,
-            chain_der: &self.client_cert_chain,
-        };
-        if !shard.verifier.verify(&identity) {
-            return Err(Error::AccessDenied);
-        }
-
-        self.transcript.update(raw);
-        self.expect_client_finished(client_handshake_traffic)
-    }
-
-    fn try_accept_psk(
-        &self,
-        ch: &ClientHello,
-        raw: &[u8],
-        keys: Option<&TicketKeys>,
-    ) -> Option<AcceptedPsk> {
-        let keys = keys?;
-        let now = self.now_ms();
-        let kx_ext = ch
-            .extensions
-            .iter()
-            .find(|e| e.ty == ExtensionType::PSK_KEY_EXCHANGE_MODES)?;
-        let modes = KxModes::decode(&kx_ext.data).ok()?;
-        if !modes.as_slice().contains(&KX_MODE_PSK_DHE) {
-            return None;
-        }
-        let psk_ext = ch
-            .extensions
-            .iter()
-            .find(|e| e.ty == ExtensionType::PRE_SHARED_KEY)?;
-        let offer = Offer::decode(&psk_ext.data).ok()?;
-        let id = offer.identities.first()?;
-        let bind = offer.binders.first()?;
-        if bind.len() != 32 {
-            return None;
-        }
-        let mut dt = keys.decrypt(&id.identity).ok()?;
-        let suite = dt.suite;
-        let (psk, age_add, issued_at_ms, alpn) = (
-            dt.psk,
-            dt.age_add,
-            dt.issued_at_ms,
-            core::mem::take(&mut dt.alpn),
-        );
-        if !AcceptedPsk::issued_at_is_resumable(issued_at_ms, now) {
-            return None;
-        }
-        let binder_prefix = Offer::binder_transcript_prefix(raw, bind.len())?;
-        let mut t = if self.hrr_done {
-            self.transcript.fork()
-        } else {
-            Transcript::new()
-        };
-        t.update(binder_prefix);
-        let partial_hash = t.hash(RESUMPTION_HASH);
-        let expected = ResumptionBinder::compute(&psk, partial_hash.as_slice()).ok()?;
-        if expected.as_slice().len() != bind.len()
-            || !bool::from(expected.as_slice().ct_eq(bind.as_slice()))
-        {
-            return None;
-        }
-        Some(AcceptedPsk {
-            psk,
-            age_add,
-            issued_at_ms,
-            suite,
-            obfuscated_ticket_age: id.obfuscated_ticket_age,
-            binder: bind.clone(),
-            alpn,
-            _thread: ThreadBound::NEW,
-        })
-    }
-
-    fn handle_client_finished<G: EarlyDataGuard, V: ClientCertVerifier>(
-        &mut self,
-        f: Finished,
-        raw: &[u8],
-        expected: Digest,
-        shard: &Shard<G, V>,
-        events: &mut Vec<Event>,
-    ) -> Result<(), Error> {
-        if !expected.ct_eq(f.verify_data.as_slice()) {
-            return Err(Error::BadFinished);
-        }
-        self.transcript.update(raw);
-        events.push(Event::Done);
-        self.state = State::Done;
-        self.emit_session_ticket(shard.config.ticket_keys.as_ref(), events)?;
-        Ok(())
-    }
-
-    fn emit_session_ticket(
-        &mut self,
-        keys: Option<&TicketKeys>,
-        events: &mut Vec<Event>,
-    ) -> Result<(), Error> {
-        use ring::rand::SecureRandom;
-        let Some(master) = self.master.as_ref() else {
-            return Ok(());
-        };
-        let Some(keys) = keys else {
-            return Ok(());
-        };
-        if master.hash_alg() != RESUMPTION_HASH {
-            return Ok(());
-        }
-        let issued_at_ms = self.now_ms();
-        let h_cf = self.transcript.hash(RESUMPTION_HASH);
-        let rms_digest = master
-            .resumption_master_secret(h_cf.as_slice())?
-            .to_digest();
-        let mut nonce = [0u8; 8];
-        let mut age_add_bytes = [0u8; 4];
-        self.rng.fill(&mut nonce).map_err(|_| Error::Rng)?;
-        self.rng.fill(&mut age_add_bytes).map_err(|_| Error::Rng)?;
-        let age_add = u32::from_be_bytes(age_add_bytes);
-        let psk = ResumptionMaster::from_secret(&rms_digest).psk(&nonce)?;
-        let alpn = self.selected_alpn.clone().unwrap_or_default();
-        let suite = self
-            .negotiated_suite
-            .ok_or(Error::UnexpectedMessage)?
-            .to_u16();
-        let ticket = keys
-            .encrypt(&psk, age_add, issued_at_ms, suite, &alpn, &self.rng)
-            .map_err(|_| Error::Rng)?;
-        let mut nst_extensions = Vec::new();
-        if let Some(maximum) = self.early_data.advertised_size() {
-            let mut body = Vec::new();
-            body.put_u32(maximum);
-            nst_extensions.push(Extension::new(ExtensionType::EARLY_DATA, body));
-        }
-        let nst = NewSessionTicket {
-            ticket_lifetime: TICKET_LIFETIME_SECS,
-            ticket_age_add: age_add,
-            ticket_nonce: nonce.to_vec(),
-            ticket,
-            extensions: nst_extensions,
-        };
-        let mut bytes = Vec::new();
-        Handshake::NewSessionTicket(nst).encode(&mut bytes)?;
-        events.push(Event::Send {
-            epoch: Epoch::Application,
-            data: bytes,
-        });
-        events.push(Event::ResumptionSecret { psk });
-        Ok(())
-    }
-
     pub fn is_done(&self) -> bool {
         matches!(self.state, State::Done)
     }
 
-    pub fn send_key_update(&mut self, request_update: bool) -> Result<Vec<Event>, Error> {
+    /// Emits a KeyUpdate directly into `events`.
+    pub fn send_key_update_into<S: EventSink + ?Sized>(
+        &mut self,
+        request_update: bool,
+        events: &mut S,
+    ) -> Result<(), DriveError<S::Error>> {
         if self.state != State::Done {
-            return Err(Error::UnexpectedMessage);
+            return Err(Error::UnexpectedMessage.into());
         }
         let s_ap = self.s_ap_traffic.ok_or(Error::UnexpectedMessage)?;
         let new_s_ap = Hkdf::new(self.hash_alg())
@@ -1050,17 +382,23 @@ impl<C: Clock> Server<C> {
         let ku = KeyUpdate {
             request_update: u8::from(request_update),
         };
-        let mut bytes = Vec::new();
-        Handshake::KeyUpdate(ku).encode(&mut bytes)?;
-        Ok(alloc::vec![
+        let bytes = ku.encode_framed();
+        EventContext::emit(
+            events,
+            self.negotiated_suite,
             Event::Send {
                 epoch: Epoch::Application,
-                data: bytes,
+                data: &bytes,
             },
+        )?;
+        EventContext::emit(
+            events,
+            self.negotiated_suite,
             Event::KeyUpdate {
                 direction: KeyDirection::Write,
                 secret: new_s_ap,
             },
-        ])
+        )?;
+        Ok(())
     }
 }

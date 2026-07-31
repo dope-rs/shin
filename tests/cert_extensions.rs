@@ -1,7 +1,8 @@
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 
-use shin::cert::{
-    BasicConstraints, Cert, ExtensionIter, GeneralName, KeyUsage, OID_EKU_CLIENT_AUTH,
+use shin::identity::cert::Cert;
+use shin::identity::cert::ext::{
+    BasicConstraints, ExtensionIter, GeneralName, KeyUsage, OID_EKU_CLIENT_AUTH,
     OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE,
     OID_EXT_SAN,
 };

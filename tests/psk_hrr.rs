@@ -4,19 +4,22 @@
 //! the binder over the post-HRR transcript with the public primitives) and check
 //! that both the real server and the real client agree on that transcript.
 
-use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::codec::Reader;
-use shin::extension::{Extension, ExtensionType};
-use shin::handshake::{
-    HELLO_RETRY_REQUEST_RANDOM, Handshake, HandshakeType, RANDOM_LEN, ServerHello, TLS_1_2,
-};
-use shin::hash::{HashAlg, Transcript};
-use shin::psk::ResumptionBinder;
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::hash::{HashAlg, Transcript};
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
+use shin::wire::codec::Reader;
+use shin::wire::extension::{Extension, ExtensionType};
+use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::messages::{HandshakeType, ServerHello};
+use shin::wire::handshake::{HELLO_RETRY_REQUEST_RANDOM, RANDOM_LEN, TLS_1_2};
+use shin::wire::psk::ResumptionBinder;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{FixedClock, Server, ServerConfig, send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
@@ -37,7 +40,7 @@ fn fresh_server() -> Server<FixedClock> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::TicketKeys::single(TICKET_SECRET)),
             accept_early_data: false,
         },
         FixedClock(1_000_000),
@@ -61,18 +64,18 @@ fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
 
 fn strip_key_share(ch_bytes: &[u8]) -> Vec<u8> {
     let mut r = Reader::new(ch_bytes);
-    let Handshake::ClientHello(mut ch) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(mut ch) = Frame::decode(&mut r).unwrap() else {
         panic!("not a ClientHello");
     };
     ch.extensions.retain(|e| e.ty != ExtensionType::KEY_SHARE);
     let mut out = Vec::new();
-    Handshake::ClientHello(ch).encode(&mut out).unwrap();
+    Frame::ClientHello(ch).encode(&mut out).unwrap();
     out
 }
 
 fn server_hello_random(blob: &[u8]) -> [u8; RANDOM_LEN] {
     let mut r = Reader::new(blob);
-    let Handshake::ServerHello(sh) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ServerHello(sh) = Frame::decode(&mut r).unwrap() else {
         panic!("not a ServerHello");
     };
     sh.random
@@ -82,7 +85,7 @@ fn handshake_types(blob: &[u8]) -> Vec<HandshakeType> {
     let mut r = Reader::new(blob);
     let mut types = Vec::new();
     while !r.is_empty() {
-        types.push(Handshake::decode(&mut r).unwrap().msg_type());
+        types.push(Frame::decode(&mut r).unwrap().msg_type());
     }
     types
 }
@@ -110,7 +113,7 @@ fn craft_hrr() -> Vec<u8> {
         ],
     };
     let mut out = Vec::new();
-    Handshake::ServerHello(sh).encode(&mut out).unwrap();
+    Frame::ServerHello(sh).encode(&mut out).unwrap();
     out
 }
 
@@ -275,7 +278,7 @@ fn client_offers_psk_binder_computed_across_hrr() {
     let ch2 = send(&c2, Epoch::Plaintext);
 
     let mut r = Reader::new(&ch2);
-    let Handshake::ClientHello(parsed) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(parsed) = Frame::decode(&mut r).unwrap() else {
         panic!("retry must be a ClientHello");
     };
     assert!(

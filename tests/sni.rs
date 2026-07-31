@@ -1,9 +1,14 @@
-use shin::client::{Client, Config, OwnedTrustAnchor, Verifier};
-use shin::codec::Reader;
-use shin::extension::ExtensionType;
-use shin::handshake::{ClientHello, Handshake};
-use shin::spki::SubjectPublicKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
+use shin::connection::Epoch;
+use shin::identity::spki::SubjectPublicKey;
+use shin::wire::codec::Reader;
+use shin::wire::extension::ExtensionType;
+use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::messages::ClientHello;
+
+mod common;
+use common::{CollectEvents as _, Event};
 
 fn drive_client_hello(verifier: Verifier) -> ClientHello {
     let mut c = Client::new(
@@ -28,8 +33,8 @@ fn drive_client_hello(verifier: Verifier) -> ClientHello {
         })
         .expect("ClientHello sent at Plaintext epoch");
     let mut r = Reader::new(&ch_bytes);
-    match Handshake::decode(&mut r).unwrap() {
-        Handshake::ClientHello(ch) => ch,
+    match Frame::decode(&mut r).unwrap() {
+        Frame::ClientHello(ch) => ch,
         _ => panic!("expected ClientHello"),
     }
 }

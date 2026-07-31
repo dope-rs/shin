@@ -1,6 +1,7 @@
-use shin::codec::{DecodeError, Encode, Reader};
-use shin::extension::{Extension, MAX_EXTENSIONS};
-use shin::handshake::{Certificate, CertificateEntry, MAX_CERTIFICATE_ENTRIES};
+use shin::wire::codec::{DecodeError, Encode, Reader};
+use shin::wire::extension::{Extension, MAX_EXTENSIONS};
+use shin::wire::handshake::MAX_CERTIFICATE_ENTRIES;
+use shin::wire::handshake::messages::{Certificate, CertificateEntry};
 
 #[test]
 fn duplicate_extension_type_is_rejected() {

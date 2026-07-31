@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shin::ticket::TicketKeys;
+use shin::crypto::ticket::TicketKeys;
 
 // Ticket decryption runs on attacker-supplied PSK identities before any
 // authentication, so it must reject arbitrary bytes without panicking. Both the

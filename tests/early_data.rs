@@ -1,14 +1,17 @@
-use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::extension::ExtensionType;
-use shin::hash::Digest;
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::connection::{Clock, Epoch};
+use shin::crypto::hash::Digest;
+use shin::crypto::sig::SigningKey;
 use shin::server::{
-    CertSource, Config as ShardConfig, ConnectionConfig, EarlyDataGuard, NoGuard,
-    Server as Connection, Shard,
+    Server as Connection, Shard, config::CertSource, config::Config as ShardConfig,
+    config::ConnectionConfig, config::EarlyDataGuard, config::NoGuard,
 };
-use shin::sig::SigningKey;
-use shin::{Clock, Epoch, Event};
+use shin::wire::extension::ExtensionType;
 
 mod common;
+use common::Event;
+use common::{CollectEvents as _, CollectServerEvents as _};
 use common::{Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
@@ -64,7 +67,7 @@ fn server_config(accept: bool, alpn_protocols: Vec<Vec<u8>>) -> ServerConfig {
         },
         transport_params: Vec::new(),
         alpn_protocols,
-        ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+        ticket_keys: Some(shin::crypto::ticket::TicketKeys::single(TICKET_SECRET)),
         accept_early_data: accept,
     }
 }
@@ -164,13 +167,11 @@ fn client_offers_early_data_emits_cets_and_ext() {
     let evs = c.start().unwrap();
 
     let ch_bytes = find_send(&evs, Epoch::Plaintext).unwrap();
-    use shin::codec::Reader;
-    use shin::handshake::Handshake;
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
     let mut r = Reader::new(&ch_bytes);
-    let m = Handshake::decode(&mut r).unwrap();
-    let Handshake::ClientHello(ch) = m else {
-        panic!()
-    };
+    let m = Frame::decode(&mut r).unwrap();
+    let Frame::ClientHello(ch) = m else { panic!() };
     assert!(
         ch.extensions
             .iter()
@@ -199,11 +200,11 @@ fn server_accepts_early_data_emits_matching_cets_and_ee_ext() {
     assert_eq!(client_cets, server_cets, "CETS must match across sides");
 
     let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
-    use shin::codec::Reader;
-    use shin::handshake::Handshake;
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
     let mut r = Reader::new(&s_hs_blob);
-    let m = Handshake::decode(&mut r).unwrap();
-    let Handshake::EncryptedExtensions(ee) = m else {
+    let m = Frame::decode(&mut r).unwrap();
+    let Frame::EncryptedExtensions(ee) = m else {
         panic!(
             "first message in hs blob must be EE; got {:?}",
             m.msg_type()
@@ -258,7 +259,7 @@ fn replayed_early_data_is_rejected() {
                 signing_key: signing_key(),
             },
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::TicketKeys::single(TICKET_SECRET)),
         },
         TestGuard::new(NOW_MS),
     );
@@ -363,12 +364,13 @@ fn expired_ticket_does_not_resume_via_psk() {
 
     // PSK rejected => full handshake => Certificate is sent in the handshake blob.
     let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
-    use shin::codec::Reader;
-    use shin::handshake::{Handshake, HandshakeType};
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::messages::HandshakeType;
     let mut r = Reader::new(&s_hs_blob);
     let mut types = Vec::new();
     while !r.is_empty() {
-        types.push(Handshake::decode(&mut r).unwrap().msg_type());
+        types.push(Frame::decode(&mut r).unwrap().msg_type());
     }
     assert!(
         types.contains(&HandshakeType::Certificate),
@@ -390,12 +392,13 @@ fn fresh_ticket_still_resumes_via_psk() {
     let s1 = s.read(Epoch::Plaintext, &ch).unwrap();
 
     let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
-    use shin::codec::Reader;
-    use shin::handshake::{Handshake, HandshakeType};
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::messages::HandshakeType;
     let mut r = Reader::new(&s_hs_blob);
     let mut types = Vec::new();
     while !r.is_empty() {
-        types.push(Handshake::decode(&mut r).unwrap().msg_type());
+        types.push(Frame::decode(&mut r).unwrap().msg_type());
     }
     assert!(
         !types.contains(&HandshakeType::Certificate),
@@ -414,19 +417,19 @@ fn fresh_client_hello() -> Vec<u8> {
     find_send(&c1, Epoch::Plaintext).unwrap()
 }
 
-fn reencode_ch<F: FnOnce(&mut shin::handshake::ClientHello)>(
+fn reencode_ch<F: FnOnce(&mut shin::wire::handshake::messages::ClientHello)>(
     ch_bytes: &[u8],
     mutate: F,
 ) -> Vec<u8> {
-    use shin::codec::Reader;
-    use shin::handshake::Handshake;
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
     let mut r = Reader::new(ch_bytes);
-    let Handshake::ClientHello(mut ch) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(mut ch) = Frame::decode(&mut r).unwrap() else {
         panic!()
     };
     mutate(&mut ch);
     let mut out = Vec::new();
-    Handshake::ClientHello(ch).encode(&mut out).unwrap();
+    Frame::ClientHello(ch).encode(&mut out).unwrap();
     out
 }
 
@@ -437,7 +440,7 @@ fn server_rejects_nonnull_compression_method() {
     });
     let mut s = server(false, NOW_MS);
     let err = s.read(Epoch::Plaintext, &ch).unwrap_err();
-    assert_eq!(err, shin::Error::IllegalParameter);
+    assert_eq!(err, shin::connection::Error::IllegalParameter);
 }
 
 #[test]
@@ -455,7 +458,7 @@ fn server_rejects_oversized_session_id() {
     });
     let mut s = server(false, NOW_MS);
     let err = s.read(Epoch::Plaintext, &ch).unwrap_err();
-    assert_eq!(err, shin::Error::Decode);
+    assert_eq!(err, shin::connection::Error::Decode);
 }
 
 #[test]
@@ -487,26 +490,28 @@ fn established_server() -> Server<TestGuard, TestGuard> {
 
 #[test]
 fn server_caps_key_updates_per_record() {
-    use shin::handshake::{Handshake, KeyUpdate};
+    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::messages::KeyUpdate;
     let mut s = established_server();
     // Many KeyUpdate(request_update=1) in one record => bounded reply amplification.
     let mut record = Vec::new();
     for _ in 0..64 {
-        Handshake::KeyUpdate(KeyUpdate { request_update: 1 })
+        Frame::KeyUpdate(KeyUpdate { request_update: 1 })
             .encode(&mut record)
             .unwrap();
     }
     let err = s.read(Epoch::Application, &record).unwrap_err();
-    assert_eq!(err, shin::Error::UnexpectedMessage);
+    assert_eq!(err, shin::connection::Error::UnexpectedMessage);
 }
 
 #[test]
 fn server_allows_bounded_key_updates() {
-    use shin::handshake::{Handshake, KeyUpdate};
+    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::messages::KeyUpdate;
     let mut s = established_server();
     let mut record = Vec::new();
     for _ in 0..8 {
-        Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+        Frame::KeyUpdate(KeyUpdate { request_update: 0 })
             .encode(&mut record)
             .unwrap();
     }
@@ -515,9 +520,9 @@ fn server_allows_bounded_key_updates() {
 
 #[test]
 fn nst_advertises_early_data_when_accept_enabled() {
-    use shin::codec::Reader;
-    use shin::extension::ExtensionType;
-    use shin::handshake::Handshake;
+    use shin::wire::codec::Reader;
+    use shin::wire::extension::ExtensionType;
+    use shin::wire::handshake::frame::Frame;
 
     let mut s = server(true, NOW_MS);
     let mut c = client(None, false);
@@ -533,7 +538,7 @@ fn nst_advertises_early_data_when_accept_enabled() {
     let nst_bytes = find_send(&s2, Epoch::Application).unwrap();
 
     let mut r = Reader::new(&nst_bytes);
-    let Handshake::NewSessionTicket(nst) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::NewSessionTicket(nst) = Frame::decode(&mut r).unwrap() else {
         panic!("expected NewSessionTicket")
     };
     let ext = nst
@@ -550,8 +555,8 @@ fn nst_advertises_early_data_when_accept_enabled() {
 
 #[test]
 fn nst_does_not_advertise_early_data_without_replay_guard() {
-    use shin::codec::Reader;
-    use shin::handshake::Handshake;
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
 
     let mut s = server_no_guard(true, NOW_MS);
     let mut c = client(None, false);
@@ -567,7 +572,7 @@ fn nst_does_not_advertise_early_data_without_replay_guard() {
     let nst_bytes = find_send(&s2, Epoch::Application).unwrap();
 
     let mut r = Reader::new(&nst_bytes);
-    let Handshake::NewSessionTicket(nst) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::NewSessionTicket(nst) = Frame::decode(&mut r).unwrap() else {
         panic!("expected NewSessionTicket")
     };
     assert!(
@@ -580,9 +585,9 @@ fn nst_does_not_advertise_early_data_without_replay_guard() {
 
 #[test]
 fn nst_omits_early_data_when_accept_disabled() {
-    use shin::codec::Reader;
-    use shin::extension::ExtensionType;
-    use shin::handshake::Handshake;
+    use shin::wire::codec::Reader;
+    use shin::wire::extension::ExtensionType;
+    use shin::wire::handshake::frame::Frame;
 
     let mut s = server(false, NOW_MS);
     let mut c = client(None, false);
@@ -598,7 +603,7 @@ fn nst_omits_early_data_when_accept_disabled() {
     let nst_bytes = find_send(&s2, Epoch::Application).unwrap();
 
     let mut r = Reader::new(&nst_bytes);
-    let Handshake::NewSessionTicket(nst) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::NewSessionTicket(nst) = Frame::decode(&mut r).unwrap() else {
         panic!("expected NewSessionTicket")
     };
     assert!(

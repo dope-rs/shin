@@ -1,9 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shin::cert::Cert;
-use shin::chain::{Chain, TrustAnchor};
-use shin::time::UnixTime;
+use shin::identity::cert::Cert;
+use shin::identity::chain::{Chain, TrustAnchor};
+use shin::identity::time::UnixTime;
 
 // Split the input into length-prefixed DER blobs, parse each as a certificate,
 // and run full chain validation. Exercises the hand-written cert-value parser

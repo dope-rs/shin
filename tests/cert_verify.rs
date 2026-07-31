@@ -3,7 +3,7 @@ use rcgen::{
     SignatureAlgorithm,
 };
 
-use shin::cert::{Cert, VerifyError};
+use shin::identity::cert::{Cert, VerifyError};
 
 fn self_signed(alg: &'static SignatureAlgorithm, name: &str) -> Vec<u8> {
     let key = KeyPair::generate_for(alg).unwrap();

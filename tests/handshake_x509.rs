@@ -1,13 +1,15 @@
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 
-use shin::Epoch;
-use shin::asn1::{Reader, Tag};
-use shin::cert::Cert;
-use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::identity::asn1::{Reader, Tag};
+use shin::identity::cert::Cert;
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, find_send, has_done};
 
 const HOSTNAME: &str = "host.local";
@@ -48,8 +50,8 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
 
 fn now_inside(cert_der: &[u8]) -> u64 {
     let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = shin::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
+    let na = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
     (nb.0 + na.0) / 2
 }
 
@@ -206,7 +208,7 @@ fn rejects_unknown_anchor() {
 
 fn not_after(cert_der: &[u8]) -> u64 {
     let cert = Cert::parse(cert_der).unwrap();
-    shin::time::UnixTime::from_time_value(&cert.validity.not_after)
+    shin::identity::time::UnixTime::from_time_value(&cert.validity.not_after)
         .unwrap()
         .0
 }
@@ -257,7 +259,7 @@ fn stale_clock_rejects_expired_certificate() {
     client.read(Epoch::Plaintext, &sh).unwrap();
     assert_eq!(
         client.read(Epoch::Handshake, &s_hs).unwrap_err(),
-        shin::Error::BadCertificateChain(shin::chain::ChainError::Expired),
+        shin::connection::Error::BadCertificateChain(shin::identity::chain::ChainError::Expired),
     );
 }
 
@@ -275,7 +277,7 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
     };
     assert_eq!(
         empty_anchors.validate().unwrap_err(),
-        shin::Error::BadConfig
+        shin::connection::Error::BadConfig
     );
 
     let (cert_der, _) = ed25519_self_signed();
@@ -294,7 +296,10 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
         resumption: None,
         enable_early_data: false,
     };
-    assert_eq!(empty_host.validate().unwrap_err(), shin::Error::BadConfig);
+    assert_eq!(
+        empty_host.validate().unwrap_err(),
+        shin::connection::Error::BadConfig
+    );
 }
 
 #[test]
@@ -313,19 +318,22 @@ fn config_validate_rejects_oversized_alpn_and_transport_params() {
     over_protocol.alpn_protocols = vec![vec![b'x'; 256]];
     assert_eq!(
         over_protocol.validate().unwrap_err(),
-        shin::Error::BadConfig
+        shin::connection::Error::BadConfig
     );
 
     let mut empty_protocol = base();
     empty_protocol.alpn_protocols = vec![Vec::new()];
     assert_eq!(
         empty_protocol.validate().unwrap_err(),
-        shin::Error::BadConfig
+        shin::connection::Error::BadConfig
     );
 
     let mut over_tp = base();
     over_tp.transport_params = vec![0u8; 65536];
-    assert_eq!(over_tp.validate().unwrap_err(), shin::Error::BadConfig);
+    assert_eq!(
+        over_tp.validate().unwrap_err(),
+        shin::connection::Error::BadConfig
+    );
 
     base().validate().unwrap();
 }
@@ -344,7 +352,10 @@ fn server_config_validate_rejects_inconsistent_identity() {
         ticket_keys: None,
         accept_early_data: false,
     };
-    assert_eq!(mismatched.validate(), Err(shin::Error::BadConfig));
+    assert_eq!(
+        mismatched.validate(),
+        Err(shin::connection::Error::BadConfig)
+    );
 
     let empty_chain = ServerConfig {
         source: CertSource::X509 {
@@ -356,5 +367,8 @@ fn server_config_validate_rejects_inconsistent_identity() {
         ticket_keys: None,
         accept_early_data: false,
     };
-    assert_eq!(empty_chain.validate(), Err(shin::Error::BadConfig));
+    assert_eq!(
+        empty_chain.validate(),
+        Err(shin::connection::Error::BadConfig)
+    );
 }

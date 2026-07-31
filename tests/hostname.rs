@@ -1,4 +1,4 @@
-use shin::hostname::Hostname;
+use shin::identity::hostname::Hostname;
 
 #[test]
 fn exact_match_is_case_insensitive() {

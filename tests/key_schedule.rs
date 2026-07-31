@@ -1,7 +1,7 @@
-use shin::aead::{AeadError, AeadKey};
-use shin::hash::{HashAlg, Transcript};
-use shin::kdf::Hkdf;
-use shin::schedule::{KeySchedule, TrafficKeys};
+use shin::crypto::aead::{AeadError, AeadKey};
+use shin::crypto::hash::{HashAlg, Transcript};
+use shin::crypto::kdf::Hkdf;
+use shin::crypto::schedule::{KeySchedule, TrafficKeys};
 
 const EARLY_SECRET: [u8; 32] = [
     0x33, 0xad, 0x0a, 0x1c, 0x60, 0x7e, 0xc0, 0x3b, 0x09, 0xe6, 0xcd, 0x98, 0x93, 0x68, 0x0c, 0xe2,

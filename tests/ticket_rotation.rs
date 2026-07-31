@@ -1,11 +1,14 @@
 use ring::rand::SystemRandom;
-use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::ticket::{TicketKeys, TicketRotator};
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::crypto::ticket::{TicketKeys, TicketRotator};
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{FixedClock, Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
@@ -85,8 +88,9 @@ fn ticket_from(events: &[Event]) -> Option<Resumption> {
 }
 
 fn server_resumed(server: &mut Server<FixedClock>, resumption: Resumption) -> bool {
-    use shin::codec::Reader;
-    use shin::handshake::{Handshake, HandshakeType};
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::messages::HandshakeType;
 
     let mut client = fresh_client(Some(resumption));
     let c1 = client.start().unwrap();
@@ -97,7 +101,7 @@ fn server_resumed(server: &mut Server<FixedClock>, resumption: Resumption) -> bo
     let mut r = Reader::new(&s_hs);
     let mut saw_cert = false;
     while !r.is_empty() {
-        let m = Handshake::decode(&mut r).unwrap();
+        let m = Frame::decode(&mut r).unwrap();
         if m.msg_type() == HandshakeType::Certificate {
             saw_cert = true;
         }

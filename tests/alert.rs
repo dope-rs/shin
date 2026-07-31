@@ -1,6 +1,6 @@
-use shin::Error;
-use shin::alert::{Alert, AlertDescription, AlertParseError};
-use shin::record::ContentType;
+use shin::connection::Error;
+use shin::wire::alert::{Alert, AlertDescription, AlertParseError};
+use shin::wire::record::ContentType;
 
 #[test]
 fn close_notify_and_user_canceled_are_not_fatal() {

@@ -1,7 +1,9 @@
-use shin::client::{Client, Config as ClientConfig};
-use shin::{Epoch, Error};
+use shin::client::Client;
+use shin::client::config::Config as ClientConfig;
+use shin::connection::{Epoch, Error};
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, find_send, has_done, random_signing_key};
 
 const SERVER_TP: &[u8] = b"server-transport-params";
@@ -13,7 +15,7 @@ fn make_pair() -> (Client<fn() -> u64>, Server<fn() -> u64>) {
     let server_pubkey = *server_key.pubkey().unwrap();
     let server: Server<fn() -> u64> = Server::new(
         ServerConfig {
-            source: shin::server::CertSource::RawPublicKey {
+            source: shin::server::config::CertSource::RawPublicKey {
                 signing_key: server_key,
             },
             transport_params: SERVER_TP.to_vec(),
@@ -25,7 +27,7 @@ fn make_pair() -> (Client<fn() -> u64>, Server<fn() -> u64>) {
     );
     let client: Client<fn() -> u64> = Client::new(
         ClientConfig {
-            verifier: shin::client::Verifier::RawPublicKey {
+            verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
             transport_params: CLIENT_TP.to_vec(),

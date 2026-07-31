@@ -1,5 +1,5 @@
 use ring::rand::SystemRandom;
-use shin::ticket::{TicketError, TicketSecret};
+use shin::crypto::ticket::{TicketError, TicketSecret};
 
 const SECRET: [u8; 32] = [0x42u8; 32];
 
@@ -21,7 +21,7 @@ fn encrypt_then_decrypt_recovers_psk_age_add_and_issued_at() {
     assert_eq!(dt.age_add, age_add);
     assert_eq!(dt.issued_at_ms, issued_at);
     assert_eq!(dt.suite, 0x1301);
-    assert_eq!(dt.alpn, b"");
+    assert_eq!(dt.alpn.as_slice(), b"");
 }
 
 #[test]
@@ -31,11 +31,11 @@ fn encrypt_then_decrypt_round_trips_alpn() {
     let ticket = s().encrypt(&psk, 7, 42, 0x1301, b"h2", &rng).unwrap();
     let dt = s().decrypt(&ticket).unwrap();
     assert_eq!(dt.psk, psk);
-    assert_eq!(dt.alpn, b"h2");
+    assert_eq!(dt.alpn.as_slice(), b"h2");
 
     let ticket2 = s().encrypt(&psk, 7, 42, 0x1301, b"http/1.1", &rng).unwrap();
     let dt2 = s().decrypt(&ticket2).unwrap();
-    assert_eq!(dt2.alpn, b"http/1.1");
+    assert_eq!(dt2.alpn.as_slice(), b"http/1.1");
 }
 
 #[test]
@@ -52,10 +52,11 @@ fn encrypt_rejects_overlong_alpn() {
 fn decrypt_rejects_tampered_tail() {
     let rng = SystemRandom::new();
     let psk = [0u8; 32];
-    let mut ticket = s().encrypt(&psk, 0, 0, 0x1301, b"", &rng).unwrap();
-    let n = ticket.len();
-    ticket[n - 1] ^= 0xFF;
-    assert_eq!(s().decrypt(&ticket), Err(TicketError::BadAuth));
+    let ticket = s().encrypt(&psk, 0, 0, 0x1301, b"", &rng).unwrap();
+    let mut tampered = ticket.as_slice().to_vec();
+    let n = tampered.len();
+    tampered[n - 1] ^= 0xFF;
+    assert_eq!(s().decrypt(&tampered), Err(TicketError::BadAuth));
 }
 
 #[test]

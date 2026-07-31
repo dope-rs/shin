@@ -1,4 +1,4 @@
-use shin::psk::{KX_MODE_PSK_DHE, KxModes, Offer, PskIdentity, SelectedIdentity};
+use shin::wire::psk::{KX_MODE_PSK_DHE, KxModes, Offer, PskIdentity, SelectedIdentity};
 
 #[test]
 fn kx_modes_round_trip() {

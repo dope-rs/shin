@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shin::record::{Opener, PlaintextRecord};
+use shin::wire::record::{Opener, PlaintextRecord};
 
 fuzz_target!(|data: &[u8]| {
     let _ = PlaintextRecord::parse(data);

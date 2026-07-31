@@ -7,16 +7,19 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme, SupportedCipherSuite};
 
-use shin::asn1::{Reader, Tag};
-use shin::cert::Cert;
-use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::hash::Digest;
-use shin::record::{CipherSuite, ContentType, Opener, PlaintextRecord, Sealer};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::hash::Digest;
+use shin::crypto::sig::SigningKey;
+use shin::identity::asn1::{Reader, Tag};
+use shin::identity::cert::Cert;
+use shin::server::config::CertSource;
+use shin::wire::record::{CipherSuite, ContentType, Opener, PlaintextRecord, Sealer};
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig};
 
 const HOSTNAME: &str = "host.local";
@@ -59,8 +62,8 @@ fn gen_ed25519_cert() -> TestCert {
     let cert_der = cert.der().to_vec();
 
     let parsed = Cert::parse(&cert_der).unwrap();
-    let nb = shin::time::UnixTime::from_time_value(&parsed.validity.not_before).unwrap();
-    let na = shin::time::UnixTime::from_time_value(&parsed.validity.not_after).unwrap();
+    let nb = shin::identity::time::UnixTime::from_time_value(&parsed.validity.not_before).unwrap();
+    let na = shin::identity::time::UnixTime::from_time_value(&parsed.validity.not_after).unwrap();
     let now_ms = ((nb.0 + na.0) / 2) * 1000;
 
     TestCert {

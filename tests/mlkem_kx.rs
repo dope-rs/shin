@@ -1,10 +1,12 @@
-use shin::Epoch;
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::kx::KexGroup;
-use shin::server::CertSource;
-use shin::sig::SigningKey;
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::kx::KexGroup;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, send};
 
 type TestClient = Client<fn() -> u64>;
@@ -86,16 +88,16 @@ fn handshake_completes_over_x25519_mlkem768() {
 fn pq_client_hello_carries_hybrid_key_share() {
     // The ClientHello key_share for the hybrid group is mlkem_ek(1184) ‖
     // x25519(32) = 1216 bytes, far larger than a classical share.
-    use shin::codec::Reader;
-    use shin::extension::ExtensionType;
-    use shin::handshake::Handshake;
+    use shin::wire::codec::Reader;
+    use shin::wire::extension::ExtensionType;
+    use shin::wire::handshake::frame::Frame;
 
     let mut client = client();
     client.set_kex_group(KexGroup::X25519Mlkem768);
     let ch = send(&client.start().unwrap(), Epoch::Plaintext);
 
     let mut r = Reader::new(&ch);
-    let Handshake::ClientHello(chm) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(chm) = Frame::decode(&mut r).unwrap() else {
         panic!("not a ClientHello");
     };
     let ks = chm

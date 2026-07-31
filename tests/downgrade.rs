@@ -1,7 +1,13 @@
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::extension::{Extension, ExtensionType};
-use shin::handshake::{Handshake, RANDOM_LEN, ServerHello, TLS_1_2};
-use shin::{Epoch, Error, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::{Epoch, Error};
+use shin::wire::extension::{Extension, ExtensionType};
+use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::messages::ServerHello;
+use shin::wire::handshake::{RANDOM_LEN, TLS_1_2};
+
+mod common;
+use common::{CollectEvents as _, Event};
 
 fn client() -> Client<fn() -> u64> {
     Client::new(
@@ -49,7 +55,7 @@ fn server_hello_bytes(random_tail: [u8; 8], echo: Vec<u8>) -> Vec<u8> {
         ],
     };
     let mut bytes = Vec::new();
-    Handshake::ServerHello(sh).encode(&mut bytes).unwrap();
+    Frame::ServerHello(sh).encode(&mut bytes).unwrap();
     bytes
 }
 

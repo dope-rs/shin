@@ -1,0 +1,297 @@
+use arrayvec::ArrayVec;
+
+use crate::identity::asn1::{DerError, Reader, Tag, Tlv};
+use crate::identity::cert::CertError;
+
+pub const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+pub const OID_EXT_SAN: &[u8] = &[0x55, 0x1d, 0x11];
+pub const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+pub const OID_EXT_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+pub const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+
+pub const OID_EKU_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+pub const OID_EKU_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+pub const OID_EKU_ANY: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+pub const MAX_EXTENSION_VALUES: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExtensionEntry<'a> {
+    pub oid: &'a [u8],
+    pub critical: bool,
+    pub value: &'a [u8],
+}
+
+impl ExtensionEntry<'_> {
+    pub fn is_handled(oid: &[u8]) -> bool {
+        matches!(
+            oid,
+            OID_EXT_KEY_USAGE
+                | OID_EXT_SAN
+                | OID_EXT_BASIC_CONSTRAINTS
+                | OID_EXT_NAME_CONSTRAINTS
+                | OID_EXT_EXTENDED_KEY_USAGE
+        )
+    }
+}
+
+pub struct ExtensionIter<'a> {
+    reader: Reader<'a>,
+}
+
+impl<'a> ExtensionIter<'a> {
+    pub fn new(extensions_der: &'a [u8]) -> Self {
+        Self {
+            reader: Reader::new(extensions_der),
+        }
+    }
+
+    pub fn find(
+        extensions_der: &'a [u8],
+        oid: &[u8],
+    ) -> Result<Option<(bool, &'a [u8])>, CertError> {
+        for ext in Self::new(extensions_der) {
+            let ext = ext?;
+            if ext.oid == oid {
+                return Ok(Some((ext.critical, ext.value)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_entry(&mut self) -> Result<ExtensionEntry<'a>, CertError> {
+        let inner = self.reader.read_tagged(Tag::SEQUENCE)?;
+        let mut r = Reader::new(inner);
+        let oid = r.read_tagged(Tag::OID)?;
+        let critical = if r.peek_tag() == Some(Tag::BOOLEAN) {
+            Tlv::boolean(r.read_tagged(Tag::BOOLEAN)?).map_err(CertError::Der)?
+        } else {
+            false
+        };
+        let value = r.read_tagged(Tag::OCTET_STRING)?;
+        r.finish()?;
+        Ok(ExtensionEntry {
+            oid,
+            critical,
+            value,
+        })
+    }
+}
+
+impl<'a> Iterator for ExtensionIter<'a> {
+    type Item = Result<ExtensionEntry<'a>, CertError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reader.is_empty() {
+            return None;
+        }
+        Some(self.parse_entry())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BasicConstraints {
+    pub ca: bool,
+    pub path_len_constraint: Option<u64>,
+}
+
+impl BasicConstraints {
+    pub fn parse(value: &[u8]) -> Result<Self, CertError> {
+        let mut r = Reader::new(value);
+        let inner = r.read_tagged(Tag::SEQUENCE)?;
+        r.finish()?;
+        let mut ir = Reader::new(inner);
+        let ca = if ir.peek_tag() == Some(Tag::BOOLEAN) {
+            if !Tlv::boolean(ir.read_tagged(Tag::BOOLEAN)?).map_err(CertError::Der)? {
+                return Err(CertError::Der(DerError::BadBool));
+            }
+            true
+        } else {
+            false
+        };
+        let path_len_constraint = if ir.peek_tag() == Some(Tag::INTEGER) {
+            if !ca {
+                return Err(CertError::Der(DerError::Mismatch));
+            }
+            Some(Tlv::integer_u64(ir.read_tagged(Tag::INTEGER)?)?)
+        } else {
+            None
+        };
+        ir.finish()?;
+        Ok(Self {
+            ca,
+            path_len_constraint,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyUsage {
+    bits: u16,
+}
+
+impl KeyUsage {
+    pub const DIGITAL_SIGNATURE: u16 = 1 << 0;
+    pub const NON_REPUDIATION: u16 = 1 << 1;
+    pub const KEY_ENCIPHERMENT: u16 = 1 << 2;
+    pub const DATA_ENCIPHERMENT: u16 = 1 << 3;
+    pub const KEY_AGREEMENT: u16 = 1 << 4;
+    pub const KEY_CERT_SIGN: u16 = 1 << 5;
+    pub const CRL_SIGN: u16 = 1 << 6;
+    pub const ENCIPHER_ONLY: u16 = 1 << 7;
+    pub const DECIPHER_ONLY: u16 = 1 << 8;
+
+    pub fn has(&self, mask: u16) -> bool {
+        self.bits & mask == mask
+    }
+
+    pub fn raw_bits(&self) -> u16 {
+        self.bits
+    }
+
+    pub fn parse(value: &[u8]) -> Result<Self, CertError> {
+        let mut r = Reader::new(value);
+        let bs = r.read_tagged(Tag::BIT_STRING)?;
+        r.finish()?;
+        if bs.is_empty() {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
+        let unused = bs[0] as usize;
+        if unused > 7 {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
+        let content = &bs[1..];
+        if content.is_empty() {
+            if unused != 0 {
+                return Err(CertError::Der(DerError::BadBitString));
+            }
+            return Ok(Self { bits: 0 });
+        }
+        if content.len() > 2 {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
+        let last = *content
+            .last()
+            .ok_or(CertError::Der(DerError::BadBitString))?;
+        if unused != 0 && last & ((1u16 << unused) - 1) as u8 != 0 {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
+        if last == 0 {
+            return Err(CertError::Der(DerError::BadBitString));
+        }
+        let mut bits = 0u16;
+        let b0 = content[0];
+        for i in 0..8 {
+            if (b0 >> (7 - i)) & 1 != 0 {
+                bits |= 1 << i;
+            }
+        }
+        if content.len() == 2 {
+            let b1 = content[1];
+            if (b1 >> 7) & 1 != 0 {
+                bits |= 1 << 8;
+            }
+        }
+        Ok(Self { bits })
+    }
+
+    pub fn parse_extended(
+        value: &[u8],
+    ) -> Result<ArrayVec<&[u8], MAX_EXTENSION_VALUES>, CertError> {
+        let mut r = Reader::new(value);
+        let inner = r.read_tagged(Tag::SEQUENCE)?;
+        r.finish()?;
+        let mut out = ArrayVec::new();
+        let mut ir = Reader::new(inner);
+        while !ir.is_empty() {
+            out.try_push(ir.read_tagged(Tag::OID)?)
+                .map_err(|_| CertError::TooManyEntries)?;
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeneralName<'a> {
+    DnsName(&'a [u8]),
+    IpAddress(&'a [u8]),
+    Other { tag: u8, value: &'a [u8] },
+}
+
+impl<'a> GeneralName<'a> {
+    pub fn parse_alt_names(
+        value: &'a [u8],
+    ) -> Result<ArrayVec<Self, MAX_EXTENSION_VALUES>, CertError> {
+        let mut r = Reader::new(value);
+        let inner = r.read_tagged(Tag::SEQUENCE)?;
+        r.finish()?;
+        let mut ir = Reader::new(inner);
+        let mut out = ArrayVec::new();
+        while !ir.is_empty() {
+            let tlv = ir.next()?;
+            out.try_push(if tlv.tag == Tag::context(2, false) {
+                Self::DnsName(tlv.contents)
+            } else if tlv.tag == Tag::context(7, false) {
+                Self::IpAddress(tlv.contents)
+            } else {
+                Self::Other {
+                    tag: tlv.tag.0,
+                    value: tlv.contents,
+                }
+            })
+            .map_err(|_| CertError::TooManyEntries)?;
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Subtrees<'a> {
+    pub dns: ArrayVec<&'a [u8], MAX_EXTENSION_VALUES>,
+    pub ip: ArrayVec<&'a [u8], MAX_EXTENSION_VALUES>,
+    pub has_unsupported: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NameConstraints<'a> {
+    pub permitted: Subtrees<'a>,
+    pub excluded: Subtrees<'a>,
+}
+
+impl<'a> NameConstraints<'a> {
+    pub fn parse(value: &'a [u8]) -> Result<Self, CertError> {
+        let mut r = Reader::new(value);
+        let inner = r.read_tagged(Tag::SEQUENCE)?;
+        r.finish()?;
+        let mut ir = Reader::new(inner);
+        let mut nc = Self::default();
+        if ir.peek_tag() == Some(Tag::context(0, true)) {
+            nc.permitted = Self::parse_subtrees(ir.next()?.contents)?;
+        }
+        if ir.peek_tag() == Some(Tag::context(1, true)) {
+            nc.excluded = Self::parse_subtrees(ir.next()?.contents)?;
+        }
+        ir.finish()?;
+        Ok(nc)
+    }
+
+    fn parse_subtrees(bytes: &'a [u8]) -> Result<Subtrees<'a>, CertError> {
+        let mut r = Reader::new(bytes);
+        let mut out = Subtrees::default();
+        while !r.is_empty() {
+            let subtree = r.read_tagged(Tag::SEQUENCE)?;
+            let base = Reader::new(subtree).next()?;
+            if base.tag == Tag::context(2, false) {
+                out.dns
+                    .try_push(base.contents)
+                    .map_err(|_| CertError::TooManyEntries)?;
+            } else if base.tag == Tag::context(7, false) {
+                out.ip
+                    .try_push(base.contents)
+                    .map_err(|_| CertError::TooManyEntries)?;
+            } else {
+                out.has_unsupported = true;
+            }
+        }
+        Ok(out)
+    }
+}

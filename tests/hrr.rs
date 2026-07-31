@@ -1,12 +1,16 @@
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::codec::Reader;
-use shin::extension::ExtensionType;
-use shin::handshake::{HELLO_RETRY_REQUEST_RANDOM, Handshake};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
+use shin::wire::codec::Reader;
+use shin::wire::extension::ExtensionType;
+use shin::wire::handshake::HELLO_RETRY_REQUEST_RANDOM;
+use shin::wire::handshake::frame::Frame;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig, send};
 
 fn signing_key() -> SigningKey {
@@ -45,18 +49,18 @@ fn client() -> Client<fn() -> u64> {
 
 fn strip_key_share(ch_bytes: &[u8]) -> Vec<u8> {
     let mut r = Reader::new(ch_bytes);
-    let Handshake::ClientHello(mut ch) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(mut ch) = Frame::decode(&mut r).unwrap() else {
         panic!("not a ClientHello");
     };
     ch.extensions.retain(|e| e.ty != ExtensionType::KEY_SHARE);
     let mut out = Vec::new();
-    Handshake::ClientHello(ch).encode(&mut out).unwrap();
+    Frame::ClientHello(ch).encode(&mut out).unwrap();
     out
 }
 
 fn server_hello_random(blob: &[u8]) -> [u8; 32] {
     let mut r = Reader::new(blob);
-    let Handshake::ServerHello(sh) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ServerHello(sh) = Frame::decode(&mut r).unwrap() else {
         panic!("not a ServerHello");
     };
     sh.random

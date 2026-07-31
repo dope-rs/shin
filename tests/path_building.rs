@@ -3,9 +3,9 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 
-use shin::cert::Cert;
-use shin::chain::{Chain, ChainError, TrustAnchor};
-use shin::time::UnixTime;
+use shin::identity::cert::Cert;
+use shin::identity::chain::{Chain, ChainError, TrustAnchor};
+use shin::identity::time::UnixTime;
 
 type Ca = (CertificateParams, KeyPair, Vec<u8>);
 

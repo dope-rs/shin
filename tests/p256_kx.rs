@@ -1,10 +1,12 @@
-use shin::Epoch;
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::kx::KexGroup;
-use shin::server::CertSource;
-use shin::sig::SigningKey;
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::kx::KexGroup;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, send};
 
 type TestClient = Client<fn() -> u64>;

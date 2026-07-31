@@ -1,9 +1,14 @@
-use shin::client::{Client, Config, Resumption, Verifier};
-use shin::codec::Reader;
-use shin::extension::ExtensionType;
-use shin::handshake::{ClientHello, Handshake};
-use shin::psk::{KX_MODE_PSK_DHE, KxModes, Offer};
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config, Resumption, Verifier};
+use shin::connection::Epoch;
+use shin::wire::codec::Reader;
+use shin::wire::extension::ExtensionType;
+use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::messages::ClientHello;
+use shin::wire::psk::{KX_MODE_PSK_DHE, KxModes, Offer};
+
+mod common;
+use common::{CollectEvents as _, Event};
 
 fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
     let mut c = Client::new(
@@ -30,8 +35,8 @@ fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
         })
         .unwrap();
     let mut r = Reader::new(&ch_bytes);
-    match Handshake::decode(&mut r).unwrap() {
-        Handshake::ClientHello(ch) => ch,
+    match Frame::decode(&mut r).unwrap() {
+        Frame::ClientHello(ch) => ch,
         _ => panic!(),
     }
 }
@@ -95,8 +100,8 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
 /// SHA-256 binder. A naive len - 32 is off by 3 and breaks interop.
 #[test]
 fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
-    use shin::hash::{HashAlg, Transcript};
-    use shin::psk::ResumptionBinder;
+    use shin::crypto::hash::{HashAlg, Transcript};
+    use shin::wire::psk::ResumptionBinder;
 
     let psk = [0x99u8; 32];
     let resumption = Resumption::new(psk, vec![0x5A; 48], 7, 1_000);
@@ -126,8 +131,8 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
         })
         .unwrap();
 
-    let ch = match Handshake::decode(&mut Reader::new(&ch_bytes)).unwrap() {
-        Handshake::ClientHello(ch) => ch,
+    let ch = match Frame::decode(&mut Reader::new(&ch_bytes)).unwrap() {
+        Frame::ClientHello(ch) => ch,
         _ => panic!(),
     };
     let on_wire_binder = {

@@ -1,10 +1,13 @@
-use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::hash::Digest;
-use shin::server::{CertSource, EarlyDataGuard};
-use shin::sig::SigningKey;
-use shin::{Clock, Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::connection::{Clock, Epoch};
+use shin::crypto::hash::Digest;
+use shin::crypto::sig::SigningKey;
+use shin::server::{config::CertSource, config::EarlyDataGuard};
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
@@ -67,7 +70,7 @@ fn server(accept: bool) -> Server<TestGuard, TestGuard> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::TicketKeys::single(TICKET_SECRET)),
             accept_early_data: accept,
         },
         TestGuard::new(NOW_MS),
@@ -206,6 +209,6 @@ fn server_rejects_finished_before_end_of_early_data() {
 
     assert_eq!(
         s.read(Epoch::Handshake, &cf).unwrap_err(),
-        shin::Error::UnexpectedMessage
+        shin::connection::Error::UnexpectedMessage
     );
 }

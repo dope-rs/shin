@@ -1,4 +1,4 @@
-use crate::hash::Digest;
+use crate::crypto::hash::Digest;
 use zeroize::Zeroize;
 
 /// Server phase carrying the traffic secret or Finished verifier required by

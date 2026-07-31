@@ -1,4 +1,4 @@
-use shin::record::{CipherSuite, ContentType, Opener, RecordError, Sealer};
+use shin::wire::record::{CipherSuite, ContentType, Opener, RecordError, Sealer};
 
 const SECRET: [u8; 32] = [0x42u8; 32];
 

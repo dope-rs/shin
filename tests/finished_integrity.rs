@@ -4,12 +4,15 @@
 //! MAC check (every tamper position yields the same rejection).
 
 use ring::rand::{SecureRandom, SystemRandom};
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig};
 
 type TestServer = Server<fn() -> u64>;
@@ -75,7 +78,7 @@ fn server_rejects_tampered_client_finished() {
     tampered[n - 1] ^= 0xff;
     assert_eq!(
         server.read(Epoch::Handshake, &tampered).unwrap_err(),
-        shin::Error::BadFinished,
+        shin::connection::Error::BadFinished,
     );
 
     let ok = server.read(Epoch::Handshake, &client_finished).unwrap();
@@ -101,7 +104,10 @@ fn finished_rejection_is_independent_of_tamper_position() {
         tampered[idx] ^= 0xff;
         let err = server.read(Epoch::Handshake, &tampered).unwrap_err();
         assert!(
-            matches!(err, shin::Error::BadFinished | shin::Error::Decode),
+            matches!(
+                err,
+                shin::connection::Error::BadFinished | shin::connection::Error::Decode
+            ),
             "tamper at {idx} must reject, got {err:?}",
         );
     }
@@ -113,6 +119,6 @@ fn finished_rejection_is_independent_of_tamper_position() {
     tampered[n - 1] ^= 0x01;
     assert_eq!(
         server.read(Epoch::Handshake, &tampered).unwrap_err(),
-        shin::Error::BadFinished,
+        shin::connection::Error::BadFinished,
     );
 }

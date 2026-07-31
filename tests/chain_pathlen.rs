@@ -3,9 +3,9 @@ use rcgen::{
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 
-use shin::cert::Cert;
-use shin::chain::{Chain, ChainError, TrustAnchor};
-use shin::time::UnixTime;
+use shin::identity::cert::Cert;
+use shin::identity::chain::{Chain, ChainError, TrustAnchor};
+use shin::identity::time::UnixTime;
 
 struct Ca {
     params: CertificateParams,
@@ -74,7 +74,7 @@ fn chain_too_long_is_rejected() {
     let leaf_der = leaf("host.local", &r);
     let leaf_cert = Cert::parse(&leaf_der).unwrap();
     let anchor_cert = Cert::parse(&r.der).unwrap();
-    let chain: Vec<Cert<'_>> = (0..shin::chain::MAX_CHAIN_LEN + 1)
+    let chain: Vec<Cert<'_>> = (0..shin::identity::chain::MAX_CHAIN_LEN + 1)
         .map(|_| leaf_cert.clone())
         .collect();
     let anchors = [TrustAnchor::from_cert(&anchor_cert)];

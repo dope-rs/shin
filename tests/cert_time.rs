@@ -1,6 +1,6 @@
-use shin::asn1::Tag;
-use shin::cert::TimeValue;
-use shin::time::UnixTime;
+use shin::identity::asn1::Tag;
+use shin::identity::cert::TimeValue;
+use shin::identity::time::UnixTime;
 
 fn utc_time(s: &[u8]) -> TimeValue<'_> {
     TimeValue {

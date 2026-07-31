@@ -1,5 +1,5 @@
-use crate::hash::Digest;
-use crate::peer::LeafKey;
+use crate::crypto::hash::Digest;
+use crate::identity::peer::LeafKey;
 use zeroize::Zeroize;
 
 #[derive(Clone, Copy)]
@@ -9,7 +9,8 @@ pub(super) struct HandshakeSecrets {
     pub(super) server_traffic: Digest,
 }
 
-/// The phase of the client handshake and the data guaranteed in that phase.
+/// Client phase whose inline peer key keeps CertificateVerify allocation-free.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum State {
     Initial,
     ExpectServerHello,

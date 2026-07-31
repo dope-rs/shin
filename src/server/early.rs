@@ -1,8 +1,8 @@
-use alloc::vec::Vec;
+use arrayvec::ArrayVec;
 
-use crate::Error;
-use crate::marker::ThreadBound;
-use crate::record::CipherSuite;
+use crate::connection::Error;
+use crate::memory::bound::ThreadBound;
+use crate::wire::record::CipherSuite;
 use zeroize::Zeroize;
 
 use super::EarlyDataGuard;
@@ -18,8 +18,8 @@ pub(super) struct AcceptedPsk {
     pub(super) issued_at_ms: u64,
     pub(super) suite: u16,
     pub(super) obfuscated_ticket_age: u32,
-    pub(super) binder: Vec<u8>,
-    pub(super) alpn: Vec<u8>,
+    pub(super) binder: [u8; 32],
+    pub(super) alpn: ArrayVec<u8, 255>,
     pub(super) _thread: ThreadBound,
 }
 
@@ -68,7 +68,9 @@ impl EarlyDataAdmission {
             return false;
         };
         let selected_alpn = selected_alpn.unwrap_or_default();
-        if selected_alpn != psk.alpn || suite.map(CipherSuite::to_u16) != Some(psk.suite) {
+        if selected_alpn != psk.alpn.as_slice()
+            || suite.map(CipherSuite::wire_id) != Some(psk.suite)
+        {
             return false;
         }
         if now_ms < psk.issued_at_ms {

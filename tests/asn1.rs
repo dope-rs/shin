@@ -1,4 +1,4 @@
-use shin::asn1::{DerError, Reader, Tag, Tlv};
+use shin::identity::asn1::{DerError, Reader, Tag, Tlv};
 
 #[test]
 fn short_form_length_decodes() {

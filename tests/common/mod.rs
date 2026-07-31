@@ -1,17 +1,166 @@
 #![allow(dead_code)]
 
+use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
 use ring::rand::{SecureRandom, SystemRandom};
 
-use shin::server::{
-    CertSource, ClientAuth, ClientCertVerifier, Config as ShardConfig, ConnectionConfig,
-    EarlyDataGuard, NoClientAuth, NoGuard, Server as Connection, Shard,
+use shin::connection::{
+    Clock, DriveError, Epoch, Error, Event as BorrowedEvent, EventContext, EventSink, KeyDirection,
 };
-use shin::sig::SigningKey;
-use shin::ticket::TicketKeys;
-use shin::{Clock, Epoch, Error, Event};
+use shin::crypto::hash::Digest;
+use shin::crypto::sig::SigningKey;
+use shin::crypto::ticket::TicketKeys;
+use shin::server::{
+    Server as Connection, Shard, config::CertSource, config::ClientAuth,
+    config::ClientCertVerifier, config::Config as ShardConfig, config::ConnectionConfig,
+    config::EarlyDataGuard, config::NoClientAuth, config::NoGuard,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Send {
+        epoch: Epoch,
+        data: Vec<u8>,
+    },
+    KeysReady {
+        epoch: Epoch,
+        read_secret: Digest,
+        write_secret: Digest,
+    },
+    PeerExtension {
+        ty: u16,
+        data: Vec<u8>,
+    },
+    KeyUpdate {
+        direction: KeyDirection,
+        secret: Digest,
+    },
+    NewSessionTicket {
+        ticket_lifetime: u32,
+        ticket_age_add: u32,
+        ticket_nonce: Vec<u8>,
+        ticket: Vec<u8>,
+        max_early_data: Option<u32>,
+    },
+    ResumptionSecret {
+        psk: [u8; 32],
+    },
+    ZeroRttKeysReady {
+        secret: Digest,
+    },
+    EarlyDataAccepted,
+    EarlyDataRejected,
+    Done,
+}
+
+#[derive(Default)]
+struct Events(Vec<Event>);
+
+impl EventSink for Events {
+    type Error = Infallible;
+
+    fn event(
+        &mut self,
+        event: BorrowedEvent<'_>,
+        _context: EventContext,
+    ) -> Result<(), Self::Error> {
+        let event = match event {
+            BorrowedEvent::Send { epoch, data } => Event::Send {
+                epoch,
+                data: data.to_vec(),
+            },
+            BorrowedEvent::KeysReady {
+                epoch,
+                read_secret,
+                write_secret,
+            } => Event::KeysReady {
+                epoch,
+                read_secret,
+                write_secret,
+            },
+            BorrowedEvent::PeerExtension { ty, data } => Event::PeerExtension {
+                ty,
+                data: data.to_vec(),
+            },
+            BorrowedEvent::KeyUpdate { direction, secret } => {
+                Event::KeyUpdate { direction, secret }
+            }
+            BorrowedEvent::NewSessionTicket {
+                ticket_lifetime,
+                ticket_age_add,
+                ticket_nonce,
+                ticket,
+                max_early_data,
+            } => Event::NewSessionTicket {
+                ticket_lifetime,
+                ticket_age_add,
+                ticket_nonce: ticket_nonce.to_vec(),
+                ticket: ticket.to_vec(),
+                max_early_data,
+            },
+            BorrowedEvent::ResumptionSecret { psk } => Event::ResumptionSecret { psk },
+            BorrowedEvent::ZeroRttKeysReady { secret } => Event::ZeroRttKeysReady { secret },
+            BorrowedEvent::EarlyDataAccepted => Event::EarlyDataAccepted,
+            BorrowedEvent::EarlyDataRejected => Event::EarlyDataRejected,
+            BorrowedEvent::Done => Event::Done,
+        };
+        self.0.push(event);
+        Ok(())
+    }
+}
+
+fn collect(
+    run: impl FnOnce(&mut Events) -> Result<(), DriveError<Infallible>>,
+) -> Result<Vec<Event>, Error> {
+    let mut events = Events::default();
+    match run(&mut events) {
+        Ok(()) => Ok(events.0),
+        Err(DriveError::Protocol(error)) => Err(error),
+        Err(DriveError::Sink(never)) => match never {},
+    }
+}
+
+pub trait CollectEvents {
+    fn start(&mut self) -> Result<Vec<Event>, Error>;
+    fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error>;
+}
+
+impl<C: Clock> CollectEvents for shin::client::Client<C> {
+    fn start(&mut self) -> Result<Vec<Event>, Error> {
+        collect(|events| self.start_into(events))
+    }
+
+    fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
+        collect(|events| self.read_into(epoch, data, events))
+    }
+}
+
+pub trait CollectServerEvents<G: EarlyDataGuard, V: ClientCertVerifier> {
+    fn read(
+        &mut self,
+        epoch: Epoch,
+        data: &[u8],
+        shard: &mut Shard<G, V>,
+    ) -> Result<Vec<Event>, Error>;
+}
+
+impl<C, G, V> CollectServerEvents<G, V> for Connection<C>
+where
+    C: Clock,
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    fn read(
+        &mut self,
+        epoch: Epoch,
+        data: &[u8],
+        shard: &mut Shard<G, V>,
+    ) -> Result<Vec<Event>, Error> {
+        collect(|events| self.read_into(epoch, data, shard, events))
+    }
+}
 
 pub struct FixedClock(pub u64);
 
@@ -78,7 +227,8 @@ trait Policy<C: Clock> {
         connection: &mut Connection<C>,
         epoch: Epoch,
         data: &[u8],
-    ) -> Result<Vec<Event>, Error>;
+        events: &mut Events,
+    ) -> Result<(), DriveError<Infallible>>;
 }
 
 struct OwnedShard<G: EarlyDataGuard, V: ClientCertVerifier>(Shard<G, V>);
@@ -94,8 +244,9 @@ where
         connection: &mut Connection<C>,
         epoch: Epoch,
         data: &[u8],
-    ) -> Result<Vec<Event>, Error> {
-        connection.read(epoch, data, &mut self.0)
+        events: &mut Events,
+    ) -> Result<(), DriveError<Infallible>> {
+        connection.read_into(epoch, data, &mut self.0, events)
     }
 }
 
@@ -168,7 +319,7 @@ impl<C: Clock, G, V> Server<C, G, V> {
     }
 
     pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
-        self.policy.read(&mut self.connection, epoch, data)
+        collect(|events| self.policy.read(&mut self.connection, epoch, data, events))
     }
 }
 

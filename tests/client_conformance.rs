@@ -2,15 +2,19 @@
 //! unsolicited ServerHello extensions, CertificateVerify scheme strictness, and
 //! KeyUpdate flooding bounds.
 
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::codec::Reader;
-use shin::extension::{Extension, ExtensionType};
-use shin::handshake::{Handshake, KeyUpdate, RANDOM_LEN, ServerHello, TLS_1_2};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Error};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::{Epoch, Error};
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
+use shin::wire::codec::Reader;
+use shin::wire::extension::{Extension, ExtensionType};
+use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::messages::{KeyUpdate, ServerHello};
+use shin::wire::handshake::{RANDOM_LEN, TLS_1_2};
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, send};
 
 const HRR_RANDOM: [u8; RANDOM_LEN] = [
@@ -104,13 +108,13 @@ fn server_hello(
         extensions,
     };
     let mut out = Vec::new();
-    Handshake::ServerHello(sh).encode(&mut out).unwrap();
+    Frame::ServerHello(sh).encode(&mut out).unwrap();
     out
 }
 
 fn ch_session_id(ch_bytes: &[u8]) -> Vec<u8> {
     let mut r = Reader::new(ch_bytes);
-    let Handshake::ClientHello(ch) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(ch) = Frame::decode(&mut r).unwrap() else {
         panic!("expected ClientHello");
     };
     ch.legacy_session_id
@@ -148,9 +152,10 @@ fn client_answers_hello_retry_request_echoing_cookie() {
         .read(Epoch::Plaintext, &sh)
         .expect("HRR is answered, not aborted");
     let retry = send(&evs, Epoch::Plaintext);
-    use shin::handshake::{Handshake, HandshakeType};
+    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::messages::HandshakeType;
     let mut r = Reader::new(&retry);
-    let Handshake::ClientHello(ch2) = Handshake::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(ch2) = Frame::decode(&mut r).unwrap() else {
         panic!("retry must be a ClientHello");
     };
     let _ = HandshakeType::ClientHello;
@@ -235,12 +240,10 @@ fn client_rejects_certificate_verify_with_unoffered_scheme() {
     let mut tampered = Vec::new();
     let mut r = Reader::new(&s_hs);
     while !r.is_empty() {
-        match Handshake::decode(&mut r).unwrap() {
-            Handshake::CertificateVerify(mut cv) => {
+        match Frame::decode(&mut r).unwrap() {
+            Frame::CertificateVerify(mut cv) => {
                 cv.algorithm = 0x0403;
-                Handshake::CertificateVerify(cv)
-                    .encode(&mut tampered)
-                    .unwrap();
+                Frame::CertificateVerify(cv).encode(&mut tampered).unwrap();
             }
             other => other.encode(&mut tampered).unwrap(),
         }
@@ -256,10 +259,10 @@ fn tamper_ee<F: FnMut(&mut Vec<Extension>)>(flight: &[u8], mut f: F) -> Vec<u8> 
     let mut out = Vec::new();
     let mut r = Reader::new(flight);
     while !r.is_empty() {
-        match Handshake::decode(&mut r).unwrap() {
-            Handshake::EncryptedExtensions(mut ee) => {
+        match Frame::decode(&mut r).unwrap() {
+            Frame::EncryptedExtensions(mut ee) => {
                 f(&mut ee.extensions);
-                Handshake::EncryptedExtensions(ee).encode(&mut out).unwrap();
+                Frame::EncryptedExtensions(ee).encode(&mut out).unwrap();
             }
             other => other.encode(&mut out).unwrap(),
         }
@@ -321,7 +324,7 @@ fn client_bounds_key_update_flood() {
     let key_updates = |n: usize| {
         let mut blob = Vec::new();
         for _ in 0..n {
-            Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+            Frame::KeyUpdate(KeyUpdate { request_update: 0 })
                 .encode(&mut blob)
                 .unwrap();
         }
@@ -340,7 +343,7 @@ fn client_bounds_key_update_flood() {
 fn client_bounds_key_update_flood_across_records() {
     let one_key_update = || {
         let mut blob = Vec::new();
-        Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+        Frame::KeyUpdate(KeyUpdate { request_update: 0 })
             .encode(&mut blob)
             .unwrap();
         blob
@@ -360,7 +363,7 @@ fn client_bounds_key_update_flood_across_records() {
 fn client_accepts_key_updates_interleaved_with_app_data() {
     let one_key_update = || {
         let mut blob = Vec::new();
-        Handshake::KeyUpdate(KeyUpdate { request_update: 0 })
+        Frame::KeyUpdate(KeyUpdate { request_update: 0 })
             .encode(&mut blob)
             .unwrap();
         blob

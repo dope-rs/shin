@@ -3,7 +3,7 @@ use rsa::RsaPrivateKey;
 use rsa::pkcs8::EncodePrivateKey;
 use rustls_pki_types::PrivatePkcs8KeyDer;
 
-use shin::cert::{Cert, VerifyError};
+use shin::identity::cert::{Cert, VerifyError};
 
 const SHA256_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 const SHA1_OID: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];

@@ -1,5 +1,5 @@
-use shin::asn1::Tag;
-use shin::cert::Cert;
+use shin::identity::asn1::Tag;
+use shin::identity::cert::Cert;
 
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
@@ -30,7 +30,7 @@ fn parses_rcgen_self_signed_cert() {
 fn tbs_der_slice_round_trips_when_re_parsed() {
     let der = gen_self_signed("rt.local");
     let cert = Cert::parse(&der).expect("parse cert");
-    let (tlv, rest) = shin::asn1::Tlv::parse_one(cert.tbs_der).unwrap();
+    let (tlv, rest) = shin::identity::asn1::Tlv::parse_one(cert.tbs_der).unwrap();
     assert_eq!(tlv.tag, Tag::SEQUENCE);
     assert!(rest.is_empty(), "tbs_der is exactly one TLV");
 }
@@ -54,7 +54,7 @@ fn parse_rejects_trailing_garbage() {
     assert!(
         matches!(
             err,
-            shin::cert::CertError::Der(shin::asn1::DerError::Trailing)
+            shin::identity::cert::CertError::Der(shin::identity::asn1::DerError::Trailing)
         ),
         "got {err:?}"
     );
@@ -66,7 +66,7 @@ fn parse_rejects_truncated_cert() {
     let err = Cert::parse(&der[..der.len() - 5]).unwrap_err();
     assert!(matches!(
         err,
-        shin::cert::CertError::Der(shin::asn1::DerError::Underflow)
+        shin::identity::cert::CertError::Der(shin::identity::asn1::DerError::Underflow)
     ));
 }
 
@@ -93,7 +93,7 @@ fn rejects_signature_algorithm_substitution() {
     tampered[last] = 0x03; // turns ...0403_02 into ...0403_03 (ECDSA-SHA384)
     assert_eq!(
         Cert::parse(&tampered).unwrap_err(),
-        shin::cert::CertError::BadAlgorithm
+        shin::identity::cert::CertError::BadAlgorithm
     );
 }
 
@@ -116,6 +116,6 @@ fn rejects_explicit_default_version() {
     tampered[pos + 4] = 0x00; // INTEGER value 2 -> 0 (explicit v1)
     assert_eq!(
         Cert::parse(&tampered).unwrap_err(),
-        shin::cert::CertError::BadVersion
+        shin::identity::cert::CertError::BadVersion
     );
 }

@@ -1,9 +1,11 @@
-use shin::Epoch;
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, send};
 
 type TestClient = Client<fn() -> u64>;
@@ -114,7 +116,7 @@ fn exporter_unavailable_before_handshake() {
         client
             .export_keying_material("EXPORTER-test", b"", &mut out)
             .unwrap_err(),
-        shin::Error::NotReady,
+        shin::connection::Error::NotReady,
         "exporter must not be available before the handshake completes",
     );
 }

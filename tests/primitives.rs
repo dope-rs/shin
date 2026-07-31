@@ -1,9 +1,9 @@
 use ring::rand::SystemRandom;
 
-use shin::hash::{Digest, HashAlg, Transcript};
-use shin::kdf::{Hkdf, HkdfError};
-use shin::kx::{EphemeralKey, KexGroup, KxError};
-use shin::record::{CipherSuite, ContentType, Opener, Sealer};
+use shin::crypto::hash::{Digest, HashAlg, Transcript};
+use shin::crypto::kdf::{Hkdf, HkdfError};
+use shin::crypto::kx::{EphemeralKey, KexGroup, KxError};
+use shin::wire::record::{CipherSuite, ContentType, Opener, Sealer};
 
 const MLKEM768_EK_LEN: usize = 1184;
 const MLKEM768_CT_LEN: usize = 1088;
@@ -86,7 +86,7 @@ fn each_cipher_suite_round_trips() {
 #[test]
 fn cipher_suite_u16_round_trips() {
     for s in CipherSuite::SUPPORTED {
-        assert_eq!(CipherSuite::from_u16(s.to_u16()), Some(s));
+        assert_eq!(CipherSuite::from_u16(s.wire_id()), Some(s));
     }
     assert_eq!(CipherSuite::from_u16(0x0000), None);
 }
@@ -94,7 +94,7 @@ fn cipher_suite_u16_round_trips() {
 #[test]
 fn kex_group_u16_round_trips() {
     for group in KexGroup::SUPPORTED {
-        assert_eq!(KexGroup::from_u16(group.to_u16()), Some(group));
+        assert_eq!(KexGroup::from_u16(group.wire_id()), Some(group));
     }
     assert_eq!(KexGroup::from_u16(0xffff), None);
 }

@@ -1,9 +1,11 @@
-use shin::codec::Reader;
-use shin::extension::{Extension, ExtensionType};
-use shin::handshake::{
+use shin::wire::codec::Reader;
+use shin::wire::extension::{Extension, ExtensionType};
+use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::messages::{
     Certificate, CertificateEntry, CertificateVerify, ClientHello, EncryptedExtensions, Finished,
-    Handshake, HandshakeType, RANDOM_LEN, ServerHello, TLS_1_2, TLS_1_3,
+    HandshakeType, ServerHello,
 };
+use shin::wire::handshake::{RANDOM_LEN, TLS_1_2, TLS_1_3};
 
 fn sample_extensions() -> Vec<Extension> {
     vec![
@@ -119,7 +121,7 @@ fn finished_round_trip() {
 
 #[test]
 fn handshake_wraps_with_type_and_length() {
-    let hs = Handshake::ClientHello(ClientHello {
+    let hs = Frame::ClientHello(ClientHello {
         legacy_version: TLS_1_2,
         random: [0xAB; RANDOM_LEN],
         legacy_session_id: vec![],
@@ -135,7 +137,7 @@ fn handshake_wraps_with_type_and_length() {
     assert_eq!(body_len + 4, buf.len());
 
     let mut r = Reader::new(&buf);
-    let decoded = Handshake::decode(&mut r).unwrap();
+    let decoded = Frame::decode(&mut r).unwrap();
     r.finish().unwrap();
     assert_eq!(decoded, hs);
 }
@@ -143,7 +145,7 @@ fn handshake_wraps_with_type_and_length() {
 #[test]
 fn handshake_round_trip_each_variant() {
     let variants = vec![
-        Handshake::ServerHello(ServerHello {
+        Frame::ServerHello(ServerHello {
             legacy_version: TLS_1_2,
             random: [0x11; RANDOM_LEN],
             legacy_session_id_echo: vec![1, 2, 3],
@@ -151,21 +153,21 @@ fn handshake_round_trip_each_variant() {
             legacy_compression_method: 0,
             extensions: sample_extensions(),
         }),
-        Handshake::EncryptedExtensions(EncryptedExtensions {
+        Frame::EncryptedExtensions(EncryptedExtensions {
             extensions: sample_extensions(),
         }),
-        Handshake::Certificate(Certificate {
+        Frame::Certificate(Certificate {
             certificate_request_context: vec![],
             certificate_list: vec![CertificateEntry {
                 cert_data: b"spki".to_vec(),
                 extensions: vec![],
             }],
         }),
-        Handshake::CertificateVerify(CertificateVerify {
+        Frame::CertificateVerify(CertificateVerify {
             algorithm: 0x0807,
             signature: b"sig".to_vec(),
         }),
-        Handshake::Finished(Finished {
+        Frame::Finished(Finished {
             verify_data: vec![0; 32],
         }),
     ];
@@ -173,7 +175,7 @@ fn handshake_round_trip_each_variant() {
         let mut buf = Vec::new();
         hs.encode(&mut buf).unwrap();
         let mut r = Reader::new(&buf);
-        let decoded = Handshake::decode(&mut r).unwrap();
+        let decoded = Frame::decode(&mut r).unwrap();
         r.finish().unwrap();
         assert_eq!(decoded, hs);
     }
@@ -182,7 +184,7 @@ fn handshake_round_trip_each_variant() {
 #[test]
 fn handshake_decode_rejects_trailing_bytes_in_body() {
     let mut buf = Vec::new();
-    Handshake::Finished(Finished {
+    Frame::Finished(Finished {
         verify_data: vec![0; 32],
     })
     .encode(&mut buf)
@@ -190,7 +192,7 @@ fn handshake_decode_rejects_trailing_bytes_in_body() {
     buf.extend_from_slice(b"trailing");
 
     let mut r = Reader::new(&buf);
-    let _ = Handshake::decode(&mut r).unwrap();
+    let _ = Frame::decode(&mut r).unwrap();
     assert!(r.finish().is_err());
 }
 
@@ -198,5 +200,5 @@ fn handshake_decode_rejects_trailing_bytes_in_body() {
 fn handshake_decode_rejects_unknown_type() {
     let buf = vec![99u8, 0, 0, 0];
     let mut r = Reader::new(&buf);
-    assert!(Handshake::decode(&mut r).is_err());
+    assert!(Frame::decode(&mut r).is_err());
 }

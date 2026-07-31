@@ -22,17 +22,20 @@
 
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 
-use shin::asn1::{Reader as Asn1Reader, Tag};
-use shin::cert::Cert;
-use shin::client::{Client, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::codec::Reader as CodecReader;
-use shin::extension::ExtensionType;
-use shin::handshake::Handshake;
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::identity::asn1::{Reader as Asn1Reader, Tag};
+use shin::identity::cert::Cert;
+use shin::server::config::CertSource;
+use shin::wire::codec::Reader as CodecReader;
+use shin::wire::extension::ExtensionType;
+use shin::wire::handshake::frame::Frame;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig, find_send};
 
 const HOSTNAME: &str = "host.local";
@@ -72,8 +75,8 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
 
 fn cert_validity_midpoint(cert_der: &[u8]) -> u64 {
     let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = shin::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
+    let na = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
     (nb.0 + na.0) / 2
 }
 
@@ -86,8 +89,8 @@ fn server_ee_extensions(server_events: &[Event]) -> Vec<(u16, Vec<u8>)> {
         .expect("server should emit a Handshake-epoch Send");
     let mut r = CodecReader::new(&blob);
     while !r.is_empty() {
-        let hs = Handshake::decode(&mut r).expect("decode handshake");
-        if let Handshake::EncryptedExtensions(ee) = hs {
+        let hs = Frame::decode(&mut r).expect("decode handshake");
+        if let Frame::EncryptedExtensions(ee) = hs {
             return ee
                 .extensions
                 .iter()
@@ -470,7 +473,7 @@ fn alpn_no_overlap_aborts() {
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     assert_eq!(
         server.read(Epoch::Plaintext, &ch).unwrap_err(),
-        shin::Error::NoApplicationProtocol,
+        shin::connection::Error::NoApplicationProtocol,
     );
 }
 

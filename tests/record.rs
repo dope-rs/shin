@@ -1,12 +1,12 @@
 use std::mem::MaybeUninit;
 
-use shin::aead::AeadKey;
-use shin::hash::HashAlg;
-use shin::record::{
+use shin::crypto::aead::AeadKey;
+use shin::crypto::hash::HashAlg;
+use shin::crypto::schedule::TrafficKeys;
+use shin::wire::record::{
     AEAD_TAG_LEN, ContentType, HEADER_LEN, MAX_PLAINTEXT_BODY, Opener, PROTOCOL_VERSION,
     PlaintextRecord, RecordError, Sealer,
 };
-use shin::schedule::TrafficKeys;
 
 const TEST_SECRET: [u8; 32] = [
     0xb6, 0x7b, 0x7d, 0x69, 0x0c, 0xc1, 0x6c, 0x4e, 0x75, 0xe5, 0x42, 0x13, 0xcb, 0x2d, 0x37, 0xb4,

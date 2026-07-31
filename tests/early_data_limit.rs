@@ -1,9 +1,12 @@
-use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::server::{CertSource, EarlyDataGuard};
-use shin::sig::SigningKey;
-use shin::{Clock, Epoch, Error, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::connection::{Clock, Epoch, Error};
+use shin::crypto::sig::SigningKey;
+use shin::server::{config::CertSource, config::EarlyDataGuard};
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
@@ -52,7 +55,7 @@ fn server(accept: bool) -> Server<TestGuard, TestGuard> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::TicketKeys::single(TICKET_SECRET)),
             accept_early_data: accept,
         },
         TestGuard::new(NOW_MS),
@@ -175,7 +178,7 @@ fn note_early_data_rejected_when_not_accepted() {
 
 #[test]
 fn overflow_error_maps_to_unexpected_message_alert() {
-    use shin::alert::AlertDescription;
+    use shin::wire::alert::AlertDescription;
     assert_eq!(
         Error::EarlyDataLimitExceeded.alert().description,
         AlertDescription::UnexpectedMessage

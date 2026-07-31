@@ -1,4 +1,4 @@
-use shin::codec::{Encode, EncodeError};
+use shin::wire::codec::{Encode, EncodeError};
 
 #[test]
 fn length_prefixed_vectors_enforce_wire_limits() {

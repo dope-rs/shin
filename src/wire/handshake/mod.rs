@@ -1,0 +1,19 @@
+pub mod frame;
+pub mod messages;
+pub(crate) mod reassemblers;
+pub(crate) mod views;
+pub mod workspace;
+
+pub const RANDOM_LEN: usize = 32;
+pub const TLS_1_3: u16 = 0x0304;
+pub const TLS_1_2: u16 = 0x0303;
+
+pub const HELLO_RETRY_REQUEST_RANDOM: [u8; RANDOM_LEN] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
+pub const MAX_CERTIFICATE_ENTRIES: usize = 16;
+pub const MAX_HANDSHAKE_SIZE: usize = 256 * 1024;
+pub const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
+pub const MAX_KEY_UPDATES_WITHOUT_APP_DATA: u32 = 8;

@@ -1,7 +1,11 @@
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::codec::{DecodeError, Reader};
-use shin::handshake::Handshake;
-use shin::{Epoch, Error, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::{Epoch, Error};
+use shin::wire::codec::{DecodeError, Reader};
+use shin::wire::handshake::frame::Frame;
+
+mod common;
+use common::{CollectEvents as _, Event};
 
 fn client() -> Client<fn() -> u64> {
     Client::new(
@@ -23,10 +27,7 @@ fn key_update_rejects_invalid_request_value() {
     // KeyUpdate (type 24) with body length 1 and request_update = 2.
     let bytes = [24u8, 0x00, 0x00, 0x01, 0x02];
     let mut r = Reader::new(&bytes);
-    assert_eq!(
-        Handshake::decode(&mut r).unwrap_err(),
-        DecodeError::InvalidEnum
-    );
+    assert_eq!(Frame::decode(&mut r).unwrap_err(), DecodeError::InvalidEnum);
 }
 
 #[test]
@@ -34,7 +35,7 @@ fn key_update_accepts_zero_and_one() {
     for v in [0u8, 1u8] {
         let bytes = [24u8, 0x00, 0x00, 0x01, v];
         let mut r = Reader::new(&bytes);
-        Handshake::decode(&mut r).expect("valid KeyUpdate");
+        Frame::decode(&mut r).expect("valid KeyUpdate");
     }
 }
 

@@ -1,14 +1,16 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::Error;
-use crate::cert::{Cert, CertError, SubjectPublicKeyInfo};
-use crate::chain::TrustAnchor;
-use crate::handshake::Certificate;
-use crate::marker::ThreadBound;
-use crate::proto::{CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509};
-use crate::sig::{self, SigningKey};
+use crate::connection::Error;
+use crate::crypto::sig::{self, SigningKey};
+use crate::identity::cert::{Cert, CertError, SubjectPublicKeyInfo};
+use crate::identity::chain::TrustAnchor;
+use crate::memory::bound::ThreadBound;
+use crate::wire::handshake::messages::Certificate;
+use crate::wire::proto::{CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509};
 use zeroize::Zeroize;
+
+pub const MAX_TRUST_ANCHORS: usize = 64;
 
 pub struct Config {
     pub verifier: Verifier,
@@ -19,7 +21,7 @@ pub struct Config {
 }
 
 /// ```compile_fail
-/// use shin::client::Resumption;
+/// use shin::client::config::Resumption;
 /// fn assert_send<T: Send>() {}
 /// assert_send::<Resumption>();
 /// ```
@@ -40,15 +42,6 @@ impl Resumption {
             age_millis,
             _thread: ThreadBound::NEW,
         }
-    }
-
-    pub(super) fn duplicate(&self) -> Self {
-        Self::new(
-            self.psk,
-            self.ticket.clone(),
-            self.ticket_age_add,
-            self.age_millis,
-        )
     }
 }
 
@@ -86,6 +79,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), Error> {
         if let Verifier::X509 { anchors, hostname } = &self.verifier
             && (anchors.is_empty()
+                || anchors.len() > MAX_TRUST_ANCHORS
                 || hostname.is_empty()
                 || hostname.len() > u16::MAX as usize - 3
                 || anchors.iter().any(|anchor| anchor.view().is_err()))

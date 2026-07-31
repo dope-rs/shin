@@ -1,8 +1,11 @@
-use shin::client::{Client, Config as ClientConfig};
-use shin::hash::Digest;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::Config as ClientConfig;
+use shin::connection::Epoch;
+use shin::crypto::hash::Digest;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig, find_send, has_done, random_signing_key};
 
 const SERVER_TP: &[u8] = b"server-transport-params";
@@ -35,7 +38,7 @@ fn handshake_completes_in_process() {
 
     let mut server = Server::new(
         ServerConfig {
-            source: shin::server::CertSource::RawPublicKey {
+            source: shin::server::config::CertSource::RawPublicKey {
                 signing_key: server_key,
             },
             transport_params: SERVER_TP.to_vec(),
@@ -48,7 +51,7 @@ fn handshake_completes_in_process() {
 
     let mut client = Client::new(
         ClientConfig {
-            verifier: shin::client::Verifier::RawPublicKey {
+            verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
             transport_params: CLIENT_TP.to_vec(),
@@ -104,7 +107,7 @@ fn client_rejects_wrong_server_pubkey() {
     let server_key = random_signing_key();
     let mut server = Server::new(
         ServerConfig {
-            source: shin::server::CertSource::RawPublicKey {
+            source: shin::server::config::CertSource::RawPublicKey {
                 signing_key: server_key,
             },
             transport_params: SERVER_TP.to_vec(),
@@ -118,7 +121,7 @@ fn client_rejects_wrong_server_pubkey() {
     let bogus_pubkey = [0xAAu8; 32];
     let mut client = Client::new(
         ClientConfig {
-            verifier: shin::client::Verifier::RawPublicKey {
+            verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: bogus_pubkey,
             },
             transport_params: CLIENT_TP.to_vec(),
@@ -150,7 +153,7 @@ fn server_rejects_tampered_client_finished() {
 
     let mut server = Server::new(
         ServerConfig {
-            source: shin::server::CertSource::RawPublicKey {
+            source: shin::server::config::CertSource::RawPublicKey {
                 signing_key: server_key,
             },
             transport_params: SERVER_TP.to_vec(),
@@ -162,7 +165,7 @@ fn server_rejects_tampered_client_finished() {
     );
     let mut client = Client::new(
         ClientConfig {
-            verifier: shin::client::Verifier::RawPublicKey {
+            verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
             transport_params: CLIENT_TP.to_vec(),
@@ -190,14 +193,14 @@ fn server_rejects_tampered_client_finished() {
 #[test]
 fn keys_diverge_across_independent_handshakes() {
     let server_seed = [0x5au8; 32];
-    let server_key = shin::sig::SigningKey::from_seed(&server_seed).unwrap();
+    let server_key = shin::crypto::sig::SigningKey::from_seed(&server_seed).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
 
     let do_handshake = || -> (Digest, Digest) {
         let mut server = Server::new(
             ServerConfig {
-                source: shin::server::CertSource::RawPublicKey {
-                    signing_key: shin::sig::SigningKey::from_seed(&server_seed).unwrap(),
+                source: shin::server::config::CertSource::RawPublicKey {
+                    signing_key: shin::crypto::sig::SigningKey::from_seed(&server_seed).unwrap(),
                 },
                 transport_params: SERVER_TP.to_vec(),
                 alpn_protocols: Vec::new(),
@@ -208,7 +211,7 @@ fn keys_diverge_across_independent_handshakes() {
         );
         let mut client = Client::new(
             ClientConfig {
-                verifier: shin::client::Verifier::RawPublicKey {
+                verifier: shin::client::config::Verifier::RawPublicKey {
                     expected_pubkey: server_pubkey,
                 },
                 transport_params: CLIENT_TP.to_vec(),

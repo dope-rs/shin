@@ -1,24 +1,24 @@
 use alloc::vec::Vec;
-use core::slice::from_ref;
+use arrayvec::ArrayVec;
 
-use crate::Error;
-use crate::extension::{Extension, ExtensionType};
-use crate::proto::{Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertType};
+use crate::connection::Error;
+use crate::wire::extension::{ExtensionType, Extensions};
+use crate::wire::proto::{Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertificateTypes};
 
 use super::CertSource;
 
 /// Parsed peer offers that gate response extensions independently of server
 /// configuration.
-pub(super) struct ClientHelloOffers {
-    alpn: Option<Vec<u8>>,
-    server_cert_types: Option<Vec<u8>>,
-    client_cert_types: Option<Vec<u8>>,
-    quic_transport_parameters: Option<Vec<u8>>,
+pub(super) struct ClientHelloOffers<'a> {
+    alpn: Option<&'a [u8]>,
+    server_cert_types: Option<CertificateTypes<'a>>,
+    client_cert_types: Option<CertificateTypes<'a>>,
+    quic_transport_parameters: Option<&'a [u8]>,
     early_data: bool,
 }
 
-impl ClientHelloOffers {
-    pub(super) fn parse(extensions: &[Extension]) -> Result<Self, Error> {
+impl<'a> ClientHelloOffers<'a> {
+    pub(super) fn parse(extensions: Extensions<'a>) -> Result<Self, Error> {
         let mut offers = Self {
             alpn: None,
             server_cert_types: None,
@@ -27,21 +27,21 @@ impl ClientHelloOffers {
             early_data: false,
         };
 
-        for extension in extensions {
+        for extension in extensions.iter() {
             match extension.ty {
                 ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION => {
-                    offers.alpn = Some(extension.data.clone());
+                    offers.alpn = Some(extension.data);
                 }
                 ExtensionType::SERVER_CERTIFICATE_TYPE => {
                     offers.server_cert_types =
-                        Some(CertType::decode_list(&extension.data).map_err(|_| Error::Decode)?);
+                        Some(CertificateTypes::decode(extension.data).map_err(|_| Error::Decode)?);
                 }
                 ExtensionType::CLIENT_CERTIFICATE_TYPE => {
                     offers.client_cert_types =
-                        Some(CertType::decode_list(&extension.data).map_err(|_| Error::Decode)?);
+                        Some(CertificateTypes::decode(extension.data).map_err(|_| Error::Decode)?);
                 }
                 ExtensionType::QUIC_TRANSPORT_PARAMETERS => {
-                    offers.quic_transport_parameters = Some(extension.data.clone());
+                    offers.quic_transport_parameters = Some(extension.data);
                 }
                 ExtensionType::EARLY_DATA => offers.early_data = true,
                 _ => {}
@@ -51,22 +51,26 @@ impl ClientHelloOffers {
         Ok(offers)
     }
 
-    pub(super) fn select_alpn(&self, supported: &[Vec<u8>]) -> Result<Option<Vec<u8>>, Error> {
+    pub(super) fn select_alpn(
+        &self,
+        supported: &[Vec<u8>],
+    ) -> Result<Option<ArrayVec<u8, 255>>, Error> {
         if supported.is_empty() {
             return Ok(None);
         }
-        let Some(encoded) = &self.alpn else {
+        let Some(encoded) = self.alpn else {
             return Ok(None);
         };
         let offered = Alpn::decode(encoded).map_err(|_| Error::Decode)?;
         let selected = supported
             .iter()
-            .find(|candidate| offered.iter().any(|offer| offer == *candidate))
-            .cloned();
+            .find(|candidate| offered.iter().any(|offer| offer == candidate.as_slice()));
         if selected.is_none() && !offered.is_empty() {
             return Err(Error::NoApplicationProtocol);
         }
-        Ok(selected)
+        selected
+            .map(|protocol| ArrayVec::try_from(protocol.as_slice()).map_err(|_| Error::BadConfig))
+            .transpose()
     }
 
     pub(super) fn certificate_negotiation(
@@ -77,49 +81,23 @@ impl ClientHelloOffers {
     }
 
     pub(super) fn peer_quic_transport_parameters(&self) -> Option<&[u8]> {
-        self.quic_transport_parameters.as_deref()
+        self.quic_transport_parameters
     }
 
     pub(super) fn early_data(&self) -> bool {
         self.early_data
     }
 
-    pub(super) fn encrypted_extensions(
-        &self,
-        certificates: CertificateNegotiation,
-        transport_parameters: &[u8],
-        selected_alpn: Option<&Vec<u8>>,
-        early_data_accepted: bool,
-    ) -> Result<Vec<Extension>, Error> {
-        let mut extensions = Vec::new();
-        if self.server_cert_types.is_some() {
-            extensions.push(Extension::new(
-                ExtensionType::SERVER_CERTIFICATE_TYPE,
-                CertType::new(certificates.server_type).encode_single(),
-            ));
-        }
-        if self.client_cert_types.is_some() {
-            extensions.push(Extension::new(
-                ExtensionType::CLIENT_CERTIFICATE_TYPE,
-                CertType::new(certificates.client_type).encode_single(),
-            ));
-        }
-        if self.quic_transport_parameters.is_some() {
-            extensions.push(Extension::new(
-                ExtensionType::QUIC_TRANSPORT_PARAMETERS,
-                transport_parameters.to_vec(),
-            ));
-        }
-        if let Some(protocol) = selected_alpn {
-            extensions.push(Extension::new(
-                ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
-                Alpn::new(from_ref(protocol)).encode()?,
-            ));
-        }
-        if early_data_accepted {
-            extensions.push(Extension::new(ExtensionType::EARLY_DATA, Vec::new()));
-        }
-        Ok(extensions)
+    pub(super) fn offered_server_certificate_type(&self) -> bool {
+        self.server_cert_types.is_some()
+    }
+
+    pub(super) fn offered_client_certificate_type(&self) -> bool {
+        self.client_cert_types.is_some()
+    }
+
+    pub(super) fn offered_quic_transport_parameters(&self) -> bool {
+        self.quic_transport_parameters.is_some()
     }
 }
 
@@ -130,28 +108,20 @@ pub(super) struct CertificateNegotiation {
 }
 
 impl CertificateNegotiation {
-    fn new(offers: &ClientHelloOffers, source: &CertSource) -> Result<Self, Error> {
+    fn new(offers: &ClientHelloOffers<'_>, source: &CertSource) -> Result<Self, Error> {
         let server_type = match source {
             CertSource::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
             CertSource::X509 { .. } => CERT_TYPE_X509,
         };
-        if offers
-            .server_cert_types
-            .as_ref()
-            .is_some_and(|types| !types.contains(&server_type))
+        if let Some(types) = offers.server_cert_types
+            && !types.contains(server_type)
         {
             return Err(Error::UnexpectedMessage);
         }
 
         let client_type = offers
             .client_cert_types
-            .as_ref()
-            .and_then(|types| {
-                types
-                    .iter()
-                    .copied()
-                    .find(|ty| *ty == CERT_TYPE_X509 || *ty == CERT_TYPE_RAW_PUBLIC_KEY)
-            })
+            .and_then(CertificateTypes::select)
             .unwrap_or(CERT_TYPE_X509);
 
         Ok(Self {

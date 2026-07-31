@@ -5,14 +5,18 @@
 
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 
-use shin::cert::Cert;
-use shin::client::{Client, ClientCertSource, Config as ClientConfig, OwnedTrustAnchor, Verifier};
-use shin::server::{CertSource, ClientAuth, ClientCertVerifier, ClientIdentity};
-use shin::sig::SigningKey;
-use shin::spki::SubjectPublicKey;
-use shin::{Epoch, Error};
+use shin::client::Client;
+use shin::client::config::{ClientCertSource, Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::connection::{Epoch, Error};
+use shin::crypto::sig::SigningKey;
+use shin::identity::cert::Cert;
+use shin::identity::spki::SubjectPublicKey;
+use shin::server::{
+    config::CertSource, config::ClientAuth, config::ClientCertVerifier, config::ClientIdentity,
+};
 
 mod common;
+use common::CollectEvents as _;
 use common::{Server, ServerConfig, find_send, has_done};
 
 const SERVER_NAME: &str = "server.local";
@@ -37,8 +41,8 @@ fn self_signed_der(key: &KeyPair, name: &str) -> Vec<u8> {
 
 fn now_inside(cert_der: &[u8]) -> u64 {
     let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = shin::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
+    let na = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
     (nb.0 + na.0) / 2
 }
 

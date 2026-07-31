@@ -1,9 +1,12 @@
-use shin::client::{Client, Config as ClientConfig, Resumption, Verifier};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{FixedClock, Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x33u8; 32];
@@ -20,7 +23,7 @@ fn fresh_server() -> Server<FixedClock> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::ticket::TicketKeys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::TicketKeys::single(TICKET_SECRET)),
             accept_early_data: false,
         },
         FixedClock(1_000_000),
@@ -116,13 +119,14 @@ fn resumed_handshake_skips_certificate_and_certificate_verify() {
     let s1 = server2.read(Epoch::Plaintext, &ch).unwrap();
     let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
 
-    use shin::codec::Reader;
-    use shin::handshake::{Handshake, HandshakeType};
+    use shin::wire::codec::Reader;
+    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::messages::HandshakeType;
     let mut r = Reader::new(&s_hs_blob);
     let mut types = Vec::new();
     while !r.is_empty() {
         let snap = r.remaining();
-        let m = Handshake::decode(&mut r).unwrap();
+        let m = Frame::decode(&mut r).unwrap();
         let _ = snap;
         types.push(m.msg_type());
     }

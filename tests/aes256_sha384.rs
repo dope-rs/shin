@@ -1,10 +1,13 @@
-use shin::client::{Client, Config as ClientConfig, Verifier};
-use shin::record::{CipherSuite, ContentType, Opener, Sealer};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
-use shin::{Epoch, Event};
+use shin::client::Client;
+use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
+use shin::wire::record::{CipherSuite, ContentType, Opener, Sealer};
 
 mod common;
+use common::CollectEvents as _;
+use common::Event;
 use common::{Server, ServerConfig, send};
 
 type TestClient = Client<fn() -> u64>;
@@ -48,7 +51,9 @@ fn client() -> TestClient {
     )
 }
 
-fn app_secrets(events: &[Event]) -> Option<(shin::hash::Digest, shin::hash::Digest)> {
+fn app_secrets(
+    events: &[Event],
+) -> Option<(shin::crypto::hash::Digest, shin::crypto::hash::Digest)> {
     events.iter().find_map(|e| match e {
         Event::KeysReady {
             epoch: Epoch::Application,
