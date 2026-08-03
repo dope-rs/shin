@@ -41,8 +41,9 @@ fn rpk_client() -> Client<fn() -> u64> {
             resumption: None,
             enable_early_data: false,
         },
-        || 0,
+        (|| 0) as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn rpk_server() -> Server<fn() -> u64> {

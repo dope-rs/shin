@@ -35,8 +35,9 @@ fn make_pair() -> (Client<fn() -> u64>, Server<fn() -> u64>) {
             resumption: None,
             enable_early_data: false,
         },
-        || 0,
-    );
+        (|| 0) as fn() -> u64,
+    )
+    .unwrap();
     (client, server)
 }
 

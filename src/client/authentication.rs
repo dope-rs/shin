@@ -70,7 +70,7 @@ impl<C: Clock> Authentication for Client<C> {
                 Ok(())
             })?;
             certificate.put_vec_u24(|entries| {
-                match &self.client_cert {
+                match self.client_cert.as_deref() {
                     Some(ClientCertSource::RawPublicKey { signing_key }) => {
                         let pubkey = signing_key.pubkey().ok_or(EncodeError::Overflow)?;
                         let spki = SubjectPublicKey::encoded_ed25519(pubkey);
@@ -120,7 +120,7 @@ impl<C: Clock> Authentication for Client<C> {
         raw: &[u8],
         secrets: HandshakeSecrets,
     ) -> Result<(), Error> {
-        let server_leaf_key = match &self.config.verifier {
+        let server_leaf_key = match self.config.verifier() {
             Verifier::RawPublicKey { expected_pubkey } => {
                 if cert.certificate_list.len() != 1 {
                     return Err(Error::BadCertificate);
@@ -149,15 +149,19 @@ impl<C: Clock> Authentication for Client<C> {
                         .try_push(parsed_cert)
                         .map_err(|_| Error::BadCertificateChain(ChainError::ChainTooLong))?;
                 }
-                let mut anchor_views =
-                    ArrayVec::<TrustAnchor<'_>, { config::MAX_TRUST_ANCHORS }>::new();
-                for anchor in anchors {
-                    anchor_views
-                        .try_push(anchor.view()?)
-                        .map_err(|_| Error::BadConfig)?;
-                }
                 Chain::new(&parsed)
-                    .validate(&anchor_views, UnixTime(now_seconds), hostname)
+                    .validate_with_anchor_verifier(UnixTime(now_seconds), hostname, |subject| {
+                        for anchor in anchors {
+                            if anchor.subject_der != subject.issuer_der {
+                                continue;
+                            }
+                            let view = anchor.view().map_err(|_| ChainError::Parse)?;
+                            if subject.verify_signature(&view.spki).is_ok() {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
+                    })
                     .map_err(|e| match e {
                         ChainError::NoTrustAnchor => Error::NoTrustAnchorForIssuer,
                         _ => Error::BadCertificateChain(e),
@@ -188,7 +192,7 @@ impl<C: Clock> Authentication for Client<C> {
             SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_ED25519,
             SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512,
         };
-        match self.config.verifier {
+        match self.config.verifier() {
             Verifier::RawPublicKey { .. } => scheme == SIG_ED25519,
             Verifier::X509 { .. } => matches!(
                 scheme,

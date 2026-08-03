@@ -46,8 +46,9 @@ fn client() -> TestClient {
             resumption: None,
             enable_early_data: false,
         },
-        clock,
+        clock as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn drive_to_completion(client: &mut TestClient, server: &mut TestServer) {
@@ -65,7 +66,7 @@ fn drive_to_completion(client: &mut TestClient, server: &mut TestServer) {
 fn handshake_completes_over_x25519_mlkem768() {
     let mut server = server();
     let mut client = client();
-    client.set_kex_group(KexGroup::X25519Mlkem768);
+    client.set_kex_group(KexGroup::X25519Mlkem768).unwrap();
 
     drive_to_completion(&mut client, &mut server);
     assert!(client.is_done(), "client completes over X25519MLKEM768");
@@ -93,7 +94,7 @@ fn pq_client_hello_carries_hybrid_key_share() {
     use shin::wire::handshake::frame::Frame;
 
     let mut client = client();
-    client.set_kex_group(KexGroup::X25519Mlkem768);
+    client.set_kex_group(KexGroup::X25519Mlkem768).unwrap();
     let ch = send(&client.start().unwrap(), Epoch::Plaintext);
 
     let mut r = Reader::new(&ch);

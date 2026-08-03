@@ -72,7 +72,8 @@ fn handshake_with_ecdsa_p384_x509_chain() {
             enable_early_data: false,
         },
         move || now * 1000,
-    );
+    )
+    .unwrap();
 
     let (mut client, mut server) = (client, server);
 

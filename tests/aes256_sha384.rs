@@ -47,8 +47,9 @@ fn client() -> TestClient {
             resumption: None,
             enable_early_data: false,
         },
-        clock,
+        clock as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn app_secrets(
@@ -68,7 +69,9 @@ fn app_secrets(
 fn handshake_completes_over_aes256_sha384() {
     let mut server = server();
     let mut client = client();
-    client.set_cipher_suites(&[CipherSuite::Aes256GcmSha384]);
+    client
+        .set_cipher_suites(&[CipherSuite::Aes256GcmSha384])
+        .unwrap();
 
     let ch = send(&client.start().unwrap(), Epoch::Plaintext);
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();

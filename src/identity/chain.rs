@@ -130,6 +130,17 @@ impl<'a, 'der> Chain<'a, 'der> {
         now: UnixTime,
         hostname_dns_id: &[u8],
     ) -> Result<(), ChainError> {
+        self.validate_with_anchor_verifier(now, hostname_dns_id, |subject| {
+            Ok(Self::verifies_against_anchor(subject, trust_anchors))
+        })
+    }
+
+    pub(crate) fn validate_with_anchor_verifier(
+        &self,
+        now: UnixTime,
+        hostname_dns_id: &[u8],
+        mut verifies_against_anchor: impl FnMut(&Cert<'der>) -> Result<bool, ChainError>,
+    ) -> Result<(), ChainError> {
         let chain = self.certs;
         if chain.is_empty() {
             return Err(ChainError::Empty);
@@ -157,7 +168,7 @@ impl<'a, 'der> Chain<'a, 'der> {
 
         for (pos, &idx) in order.iter().enumerate() {
             let subject = &chain[idx];
-            if Self::verifies_against_anchor(subject, trust_anchors) {
+            if verifies_against_anchor(subject)? {
                 return Ok(());
             }
             if pos + 1 >= order.len() {

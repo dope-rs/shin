@@ -89,8 +89,9 @@ fn client(resumption: Option<Resumption>, enable_early_data: bool) -> Client<fn(
             resumption,
             enable_early_data,
         },
-        || 0,
+        (|| 0) as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn issue_ticket() -> Resumption {

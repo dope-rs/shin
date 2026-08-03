@@ -1,4 +1,4 @@
-use super::offer::ClientOffer as _;
+use super::offer::ClientOffer;
 use super::*;
 
 pub(super) trait Negotiation {
@@ -249,7 +249,7 @@ impl<C: Clock> Negotiation for Client<C> {
                     return Err(Error::IllegalParameter.into());
                 }
                 let pick = chosen.iter().next().ok_or(Error::IllegalParameter)?;
-                if !self.config.alpn_protocols.iter().any(|p| p == pick) {
+                if !self.config.alpn_protocols().iter().any(|p| p == pick) {
                     return Err(Error::IllegalParameter.into());
                 }
                 self.selected_alpn =

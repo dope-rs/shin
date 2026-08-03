@@ -235,11 +235,14 @@ fn rpk_handshake_has_no_allocations_after_construction() {
         },
         || 0,
         workspace(),
-    );
-    client.set_client_cert(ClientCertSource::RawPublicKey {
-        signing_key: client_signing_key,
-    });
-    client.set_kex_group(KexGroup::X25519Mlkem768);
+    )
+    .unwrap();
+    client
+        .set_client_cert(ClientCertSource::RawPublicKey {
+            signing_key: client_signing_key,
+        })
+        .unwrap();
+    client.set_kex_group(KexGroup::X25519Mlkem768).unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
 
@@ -332,11 +335,14 @@ fn x509_handshake_has_no_allocations_after_construction() {
         },
         move || now * 1000,
         workspace(),
-    );
-    client.set_client_cert(ClientCertSource::X509 {
-        chain_der: vec![client_cert_der],
-        signing_key: client_signing_key,
-    });
+    )
+    .unwrap();
+    client
+        .set_client_cert(ClientCertSource::X509 {
+            chain_der: vec![client_cert_der],
+            signing_key: client_signing_key,
+        })
+        .unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
 
@@ -414,7 +420,8 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
         },
         || 0,
         workspace(),
-    );
+    )
+    .unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
 
@@ -500,7 +507,8 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
         },
         || 0,
         workspace(),
-    );
+    )
+    .unwrap();
     client_wire.clear();
     server_wire.clear();
     let client_start = measured(|| resumed_client.start_into(&mut client_wire).unwrap());
@@ -565,7 +573,8 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
         },
         || 0,
         HandshakeWorkspace::new(0, 0, 0),
-    );
+    )
+    .unwrap();
     let mut wire = Wire::reserved();
     let mut result = None;
     let allocations = measured(|| result = Some(client.start_into(&mut wire)));
@@ -636,10 +645,13 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
         },
         || 0,
         workspace(),
-    );
-    client.set_client_cert(ClientCertSource::RawPublicKey {
-        signing_key: client_signing_key,
-    });
+    )
+    .unwrap();
+    client
+        .set_client_cert(ClientCertSource::RawPublicKey {
+            signing_key: client_signing_key,
+        })
+        .unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
     client.start_into(&mut client_wire).unwrap();
@@ -705,7 +717,8 @@ fn hello_retry_request_has_no_allocations() {
         },
         || 0,
         workspace(),
-    );
+    )
+    .unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
     client.start_into(&mut client_wire).unwrap();

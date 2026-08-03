@@ -101,9 +101,10 @@ fn drive<V: ClientCertVerifier + 'static>(
             enable_early_data: false,
         },
         move || clock,
-    );
+    )
+    .unwrap();
     if let Some(cc) = client_cert {
-        client.set_client_cert(cc);
+        client.set_client_cert(cc)?;
     }
 
     let c1 = client.start()?;

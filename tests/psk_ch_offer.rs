@@ -22,7 +22,8 @@ fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
     let evs = c.start().unwrap();
     let ch_bytes = evs
         .into_iter()
@@ -117,7 +118,8 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
     let ch_bytes = c
         .start()
         .unwrap()

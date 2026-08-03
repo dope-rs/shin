@@ -47,8 +47,9 @@ fn client(suites: &[CipherSuite]) -> Client<fn() -> u64> {
             enable_early_data: false,
         },
         (|| 0) as fn() -> u64,
-    );
-    c.set_cipher_suites(suites);
+    )
+    .unwrap();
+    c.set_cipher_suites(suites).unwrap();
     c
 }
 

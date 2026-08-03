@@ -91,7 +91,8 @@ fn handshake_with_x509_chain() {
             enable_early_data: false,
         },
         move || now * 1000,
-    );
+    )
+    .unwrap();
 
     let (mut client, mut server) = (client, server);
 
@@ -143,7 +144,8 @@ fn rejects_wrong_hostname() {
             enable_early_data: false,
         },
         move || now * 1000,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -194,7 +196,8 @@ fn rejects_unknown_anchor() {
             enable_early_data: false,
         },
         move || now * 1000,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -248,7 +251,8 @@ fn stale_clock_rejects_expired_certificate() {
             enable_early_data: false,
         },
         move || expired_at * 1000,
-    );
+    )
+    .unwrap();
     // Clock injected per-handshake reads a time past expiry.
 
     let c1 = client.start().unwrap();

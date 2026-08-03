@@ -46,8 +46,9 @@ fn client() -> TestClient {
             resumption: None,
             enable_early_data: false,
         },
-        clock,
+        clock as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn drive_to_completion(client: &mut TestClient, server: &mut TestServer) {
@@ -65,7 +66,7 @@ fn drive_to_completion(client: &mut TestClient, server: &mut TestServer) {
 fn handshake_completes_over_p256() {
     let mut server = server();
     let mut client = client();
-    client.set_kex_group(KexGroup::Secp256r1);
+    client.set_kex_group(KexGroup::Secp256r1).unwrap();
 
     drive_to_completion(&mut client, &mut server);
     assert!(client.is_done(), "client completes over P-256");

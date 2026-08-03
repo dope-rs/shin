@@ -67,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
             enable_early_data: false,
         },
         || 0,
-    );
+    ).unwrap();
     let mut events = IgnoreEvents;
     let _ = client.start_into(&mut events);
 

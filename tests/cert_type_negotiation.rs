@@ -156,7 +156,8 @@ fn x509_server_omits_cert_type_and_quic_tp_when_client_did_not_offer() {
             enable_early_data: false,
         },
         move || now * 1000,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -221,7 +222,8 @@ fn x509_server_with_transport_params_does_not_leak_to_tcp_tls_client() {
             enable_early_data: false,
         },
         move || now * 1000,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -266,7 +268,8 @@ fn quic_transport_params_round_trip_when_client_offers() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -310,7 +313,8 @@ fn rpk_handshake_echoes_cert_type_extensions() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -373,7 +377,8 @@ fn x509_server_rejects_rpk_only_client_offer() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -416,7 +421,8 @@ fn alpn_intersection_emits_extension() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -467,7 +473,8 @@ fn alpn_no_overlap_aborts() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -509,7 +516,8 @@ fn alpn_client_silent_omits_extension() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();

@@ -137,7 +137,8 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
     let client_start = client.start().unwrap();
     let client_hello = find_send(&client_start, Epoch::Plaintext).unwrap();
     let server_start = server.read(Epoch::Plaintext, &client_hello).unwrap();

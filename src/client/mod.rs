@@ -11,7 +11,7 @@ use crate::crypto::kdf::Hkdf;
 use crate::crypto::kx::{EphemeralKey, KexGroup};
 use crate::crypto::schedule::{KeySchedule, ResumptionMaster};
 use crate::identity::cert::{Cert, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION};
-use crate::identity::chain::{Chain, ChainError, MAX_CHAIN_LEN, TrustAnchor};
+use crate::identity::chain::{Chain, ChainError, MAX_CHAIN_LEN};
 use crate::identity::hostname::Hostname;
 use crate::identity::spki::SubjectPublicKey;
 use crate::identity::time::UnixTime;
@@ -50,12 +50,12 @@ mod updates;
 /// server MUST NOT send a larger lifetime.
 const MAX_TICKET_LIFETIME_SECS: u32 = 604_800;
 
-use authentication::Authentication as _;
-use config::{ClientCertSource, Config, Resumption, Verifier};
-use negotiation::Negotiation as _;
-use offer::ClientOffer as _;
+use authentication::Authentication;
+use config::{ClientCertSource, ClientCertTemplate, Config, ConfigTemplate, Resumption, Verifier};
+use negotiation::Negotiation;
+use offer::ClientOffer;
 use state::{HandshakeSecrets, State, StateKind};
-use updates::Updates as _;
+use updates::Updates;
 
 use crate::identity::peer::{LeafKey, LeafKeyKind};
 
@@ -65,7 +65,8 @@ use crate::identity::peer::{LeafKey, LeafKeyKind};
 /// assert_send::<Client<fn() -> u64>>();
 /// ```
 pub struct Client<C: Clock> {
-    config: Config,
+    config: ConfigTemplate,
+    resumption: Option<Resumption>,
     state: State,
     transcript: Transcript,
     rng: SystemRandom,
@@ -89,7 +90,7 @@ pub struct Client<C: Clock> {
     hrr_done: bool,
     reasm: HsReassembler,
     /// Identity to present if the server sends a CertificateRequest (mutual TLS).
-    client_cert: Option<ClientCertSource>,
+    client_cert: Option<ClientCertTemplate>,
     /// Set when the server requested client auth; carries the context to echo
     /// and the signature schemes it will accept in our CertificateVerify.
     cert_request: Option<CertRequest>,
@@ -122,11 +123,28 @@ impl<C: Clock> Drop for Client<C> {
 }
 
 impl<C: Clock> Client<C> {
-    pub fn new(config: Config, clock: C) -> Self {
+    pub fn new(config: Config, clock: C) -> Result<Self, Error> {
         Self::with_workspace(config, clock, HandshakeWorkspace::for_client())
     }
 
-    pub fn with_workspace(config: Config, clock: C, workspace: HandshakeWorkspace) -> Self {
+    pub fn with_workspace(
+        config: Config,
+        clock: C,
+        workspace: HandshakeWorkspace,
+    ) -> Result<Self, Error> {
+        let (config, resumption) = config.try_into_template()?;
+        Ok(Self::with_template_workspace(
+            config, resumption, None, clock, workspace,
+        ))
+    }
+
+    pub fn with_template_workspace(
+        config: ConfigTemplate,
+        resumption: Option<Resumption>,
+        client_cert: Option<ClientCertTemplate>,
+        clock: C,
+        workspace: HandshakeWorkspace,
+    ) -> Self {
         let HandshakeWorkspace {
             reassembly,
             flight,
@@ -134,6 +152,7 @@ impl<C: Clock> Client<C> {
         } = workspace;
         Self {
             config,
+            resumption,
             clock,
             state: State::Initial,
             transcript: Transcript::new(),
@@ -156,7 +175,7 @@ impl<C: Clock> Client<C> {
             session_id: [0; 32],
             hrr_done: false,
             reasm: HsReassembler::with_buffer(reassembly),
-            client_cert: None,
+            client_cert,
             cert_request: None,
             key_updates: KeyUpdateBudget::default(),
             flight,
@@ -176,26 +195,51 @@ impl<C: Clock> Client<C> {
 
     /// Choose the (EC)DHE group to offer (default X25519). Must be set before
     /// `start`.
-    pub fn set_kex_group(&mut self, group: KexGroup) {
+    pub fn set_kex_group(&mut self, group: KexGroup) -> Result<(), Error> {
+        self.require_initial()?;
         self.kex_group = group;
+        Ok(())
     }
 
     /// Restrict the cipher suites offered (default: all supported, AES-128
     /// first). Must be set before `start`.
-    pub fn set_cipher_suites(&mut self, suites: &[CipherSuite]) {
-        self.offered_suites.clear();
-        self.offered_suites.extend(
-            CipherSuite::SUPPORTED
-                .into_iter()
-                .filter(|suite| suites.contains(suite)),
-        );
+    pub fn set_cipher_suites(&mut self, suites: &[CipherSuite]) -> Result<(), Error> {
+        self.require_initial()?;
+        let offered_suites: ArrayVec<_, 3> = CipherSuite::SUPPORTED
+            .into_iter()
+            .filter(|suite| suites.contains(suite))
+            .collect();
+        if offered_suites.is_empty() {
+            return Err(Error::BadConfig);
+        }
+        self.offered_suites = offered_suites;
+        Ok(())
     }
 
     /// Present this identity if the server requests client authentication
     /// (mutual TLS). Must be set before `start`. Without it, a server that only
     /// *requests* (not requires) client auth gets an empty Certificate.
-    pub fn set_client_cert(&mut self, source: ClientCertSource) {
+    pub fn set_client_cert(&mut self, source: ClientCertSource) -> Result<(), Error> {
+        self.require_initial()?;
+        let source = source.try_into_template()?;
         self.client_cert = Some(source);
+        Ok(())
+    }
+
+    /// Reuse a validated, immutable client identity across connections from
+    /// the same mTLS endpoint.
+    pub fn set_client_cert_template(&mut self, source: ClientCertTemplate) -> Result<(), Error> {
+        self.require_initial()?;
+        self.client_cert = Some(source);
+        Ok(())
+    }
+
+    fn require_initial(&self) -> Result<(), Error> {
+        if self.state.kind() == StateKind::Initial {
+            Ok(())
+        } else {
+            Err(Error::UnexpectedMessage)
+        }
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
@@ -232,13 +276,7 @@ impl<C: Clock> Client<C> {
         &mut self,
         events: &mut S,
     ) -> Result<(), DriveError<S::Error>> {
-        if self.state.kind() != StateKind::Initial {
-            return Err(Error::UnexpectedMessage.into());
-        }
-        self.config.validate()?;
-        if let Some(identity) = &self.client_cert {
-            identity.validate()?;
-        }
+        self.require_initial()?;
         let eph = EphemeralKey::generate(self.kex_group, &self.rng).map_err(|_| Error::Kx)?;
 
         let mut client_random = [0u8; RANDOM_LEN];
@@ -248,8 +286,8 @@ impl<C: Clock> Client<C> {
         self.client_random = client_random;
         self.session_id = session_id;
 
-        let resumption = self.config.resumption.take();
-        let early_data_offered = self.config.enable_early_data && resumption.is_some();
+        let resumption = self.resumption.take();
+        let early_data_offered = self.config.enable_early_data() && resumption.is_some();
         self.early_data_offered = early_data_offered;
         self.encode_client_hello(
             eph.client_share(),

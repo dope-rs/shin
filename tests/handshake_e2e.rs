@@ -60,7 +60,8 @@ fn handshake_completes_in_process() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch_bytes = find_send(&c1, Epoch::Plaintext).expect("ClientHello");
@@ -130,7 +131,8 @@ fn client_rejects_wrong_server_pubkey() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch_bytes = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -174,7 +176,8 @@ fn server_rejects_tampered_client_finished() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let c1 = client.start().unwrap();
     let ch_bytes = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -220,7 +223,8 @@ fn keys_diverge_across_independent_handshakes() {
                 enable_early_data: false,
             },
             || 0,
-        );
+        )
+        .unwrap();
 
         let c1 = client.start().unwrap();
         let ch_bytes = find_send(&c1, Epoch::Plaintext).unwrap();

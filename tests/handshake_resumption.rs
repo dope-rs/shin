@@ -41,8 +41,9 @@ fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
             resumption,
             enable_early_data: false,
         },
-        || 0,
+        (|| 0) as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn drive(

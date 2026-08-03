@@ -1,16 +1,26 @@
-use alloc::vec::Vec;
-use core::fmt;
+use alloc::{rc::Rc, vec::Vec};
+use core::{fmt, mem::size_of, ops::Deref};
 
 use crate::connection::Error;
+use crate::crypto::kx::MAX_CLIENT_SHARE_LEN;
 use crate::crypto::sig::{self, SigningKey};
 use crate::identity::cert::{Cert, CertError, SubjectPublicKeyInfo};
 use crate::identity::chain::TrustAnchor;
 use crate::memory::bound::ThreadBound;
 use crate::wire::handshake::messages::Certificate;
 use crate::wire::proto::{CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509};
+use crate::wire::record::MAX_PLAINTEXT_BODY;
 use zeroize::Zeroize;
 
-pub const MAX_TRUST_ANCHORS: usize = 64;
+pub const MAX_TRUST_ANCHORS: usize = 256;
+
+// Exact upper bound for every non-configurable byte in an initial ClientHello:
+// fixed fields, all supported suites/groups/signatures, the largest supported
+// key share, and every optional extension header. Keeping the variable portion
+// below the remainder proves that the initial flight fits one TLSPlaintext.
+const MAX_CLIENT_HELLO_FIXED_BYTES: usize =
+    83 + 7 + 12 + 18 + (10 + MAX_CLIENT_SHARE_LEN) + 6 + 6 + 4 + 9 + 6 + 4 + 6 + 47;
+const MAX_CLIENT_HELLO_CONFIG_BYTES: usize = MAX_PLAINTEXT_BODY - MAX_CLIENT_HELLO_FIXED_BYTES;
 
 pub struct Config {
     pub verifier: Verifier,
@@ -19,6 +29,23 @@ pub struct Config {
     pub resumption: Option<Resumption>,
     pub enable_early_data: bool,
 }
+
+/// Immutable, cheaply cloned client configuration shared by connections that
+/// use the same endpoint policy. Resumption remains connection-local and is
+/// deliberately split out when a [`Config`] becomes a template.
+#[derive(Clone)]
+pub struct ConfigTemplate {
+    inner: Rc<StaticConfig>,
+}
+
+struct StaticConfig {
+    verifier: Verifier,
+    transport_params: Vec<u8>,
+    alpn_protocols: Vec<Vec<u8>>,
+    enable_early_data: bool,
+}
+
+const _: () = assert!(size_of::<ConfigTemplate>() == size_of::<usize>());
 
 /// ```compile_fail
 /// use shin::client::config::Resumption;
@@ -104,7 +131,66 @@ impl Config {
         }) {
             return Err(Error::BadConfig);
         }
+        let hostname_len = match &self.verifier {
+            Verifier::RawPublicKey { .. } => 0,
+            Verifier::X509 { hostname, .. } => hostname.len(),
+        };
+        let ticket_len = self
+            .resumption
+            .as_ref()
+            .map_or(0, |resumption| resumption.ticket.len());
+        let client_hello_config_bytes = self
+            .transport_params
+            .len()
+            .checked_add(alpn_total)
+            .and_then(|bytes| bytes.checked_add(hostname_len))
+            .and_then(|bytes| bytes.checked_add(ticket_len))
+            .ok_or(Error::BadConfig)?;
+        if client_hello_config_bytes > MAX_CLIENT_HELLO_CONFIG_BYTES {
+            return Err(Error::BadConfig);
+        }
         Ok(())
+    }
+
+    /// Validates reusable endpoint policy once, then splits it from the
+    /// single-use resumption ticket.
+    pub fn try_into_template(self) -> Result<(ConfigTemplate, Option<Resumption>), Error> {
+        self.validate()?;
+        Ok(self.split_template())
+    }
+
+    fn split_template(mut self) -> (ConfigTemplate, Option<Resumption>) {
+        let resumption = self.resumption.take();
+        let inner = StaticConfig {
+            verifier: self.verifier,
+            transport_params: self.transport_params,
+            alpn_protocols: self.alpn_protocols,
+            enable_early_data: self.enable_early_data,
+        };
+        (
+            ConfigTemplate {
+                inner: Rc::new(inner),
+            },
+            resumption,
+        )
+    }
+}
+
+impl ConfigTemplate {
+    pub(crate) fn verifier(&self) -> &Verifier {
+        &self.inner.verifier
+    }
+
+    pub(crate) fn transport_params(&self) -> &[u8] {
+        &self.inner.transport_params
+    }
+
+    pub(crate) fn alpn_protocols(&self) -> &[Vec<u8>] {
+        &self.inner.alpn_protocols
+    }
+
+    pub(crate) fn enable_early_data(&self) -> bool {
+        self.inner.enable_early_data
     }
 }
 
@@ -146,6 +232,16 @@ pub enum ClientCertSource {
     },
 }
 
+/// A validated client identity shared by every connection from an mTLS
+/// endpoint. The signing key is immutable, so sharing avoids reparsing or
+/// duplicating private-key material on each dial.
+#[derive(Clone)]
+pub struct ClientCertTemplate {
+    source: Rc<ClientCertSource>,
+}
+
+const _: () = assert!(size_of::<ClientCertTemplate>() == size_of::<usize>());
+
 impl ClientCertSource {
     pub(super) fn validate(&self) -> Result<(), Error> {
         let valid = match self {
@@ -170,5 +266,26 @@ impl ClientCertSource {
             Self::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
             Self::X509 { .. } => CERT_TYPE_X509,
         }
+    }
+
+    pub fn try_into_template(self) -> Result<ClientCertTemplate, Error> {
+        self.validate()?;
+        Ok(ClientCertTemplate {
+            source: Rc::new(self),
+        })
+    }
+}
+
+impl ClientCertTemplate {
+    pub(crate) fn cert_type(&self) -> u8 {
+        self.source.cert_type()
+    }
+}
+
+impl Deref for ClientCertTemplate {
+    type Target = ClientCertSource;
+
+    fn deref(&self) -> &Self::Target {
+        &self.source
     }
 }

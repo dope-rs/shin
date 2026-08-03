@@ -80,7 +80,8 @@ fn handshake_with_rsa_pss_x509_chain() {
             enable_early_data: false,
         },
         move || now * 1000,
-    );
+    )
+    .unwrap();
 
     let (mut client, mut server) = (client, server);
 

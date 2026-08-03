@@ -297,8 +297,9 @@ fn shin_client(suite: CipherSuite, cert: &TestCert) -> Client<impl Fn() -> u64> 
             enable_early_data: false,
         },
         move || now_ms,
-    );
-    client.set_cipher_suites(&[suite]);
+    )
+    .unwrap();
+    client.set_cipher_suites(&[suite]).unwrap();
     client
 }
 

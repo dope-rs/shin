@@ -22,24 +22,24 @@ impl<C: Clock> ClientOffer for Client<C> {
         resumption: Option<&Resumption>,
         offer_early_data: bool,
     ) -> Result<(), Error> {
-        let server_cert_type = match self.config.verifier {
+        let server_cert_type = match self.config.verifier() {
             Verifier::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
             Verifier::X509 { .. } => CERT_TYPE_X509,
         };
         let client_cert_type_offer = match &self.client_cert {
             Some(source) => Some(source.cert_type()),
-            None if matches!(self.config.verifier, Verifier::RawPublicKey { .. }) => {
+            None if matches!(self.config.verifier(), Verifier::RawPublicKey { .. }) => {
                 Some(CERT_TYPE_RAW_PUBLIC_KEY)
             }
             None => None,
         };
-        let hostname = match &self.config.verifier {
+        let hostname = match self.config.verifier() {
             Verifier::X509 { hostname, .. } if !Hostname::new(hostname).is_ip_literal() => {
                 Some(hostname.as_slice())
             }
             Verifier::RawPublicKey { .. } | Verifier::X509 { .. } => None,
         };
-        let signature_algorithms = match self.config.verifier {
+        let signature_algorithms = match self.config.verifier() {
             Verifier::RawPublicKey { .. } => SignatureAlgorithms::rpk().as_slice(),
             Verifier::X509 { .. } => SignatureAlgorithms::x509().as_slice(),
         };
@@ -48,7 +48,7 @@ impl<C: Clock> ClientOffer for Client<C> {
         self.ee_offered
             .try_push(ExtensionType::SUPPORTED_GROUPS)
             .map_err(|_| Error::Encode)?;
-        if matches!(self.config.verifier, Verifier::RawPublicKey { .. }) {
+        if matches!(self.config.verifier(), Verifier::RawPublicKey { .. }) {
             self.ee_offered
                 .try_push(ExtensionType::SERVER_CERTIFICATE_TYPE)
                 .map_err(|_| Error::Encode)?;
@@ -58,7 +58,7 @@ impl<C: Clock> ClientOffer for Client<C> {
                 .try_push(ExtensionType::CLIENT_CERTIFICATE_TYPE)
                 .map_err(|_| Error::Encode)?;
         }
-        if !self.config.transport_params.is_empty() {
+        if !self.config.transport_params().is_empty() {
             self.ee_offered
                 .try_push(ExtensionType::QUIC_TRANSPORT_PARAMETERS)
                 .map_err(|_| Error::Encode)?;
@@ -68,7 +68,7 @@ impl<C: Clock> ClientOffer for Client<C> {
                 .try_push(ExtensionType::SERVER_NAME)
                 .map_err(|_| Error::Encode)?;
         }
-        if !self.config.alpn_protocols.is_empty() {
+        if !self.config.alpn_protocols().is_empty() {
             self.ee_offered
                 .try_push(ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION)
                 .map_err(|_| Error::Encode)?;
@@ -140,7 +140,7 @@ impl<C: Clock> ClientOffer for Client<C> {
                         })
                     })
                 })?;
-                if matches!(config.verifier, Verifier::RawPublicKey { .. }) {
+                if matches!(config.verifier(), Verifier::RawPublicKey { .. }) {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::SERVER_CERTIFICATE_TYPE,
@@ -164,12 +164,12 @@ impl<C: Clock> ClientOffer for Client<C> {
                         },
                     )?;
                 }
-                if !config.transport_params.is_empty() {
+                if !config.transport_params().is_empty() {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::QUIC_TRANSPORT_PARAMETERS,
                         |parameters| {
-                            parameters.put_slice(&config.transport_params);
+                            parameters.put_slice(config.transport_params());
                             Ok(())
                         },
                     )?;
@@ -185,13 +185,13 @@ impl<C: Clock> ClientOffer for Client<C> {
                         })
                     })?;
                 }
-                if !config.alpn_protocols.is_empty() {
+                if !config.alpn_protocols().is_empty() {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
                         |protocols| {
                             protocols.put_vec_u16(|list| {
-                                for protocol in &config.alpn_protocols {
+                                for protocol in config.alpn_protocols() {
                                     list.put_vec_u8(|encoded| {
                                         encoded.put_slice(protocol);
                                         Ok(())

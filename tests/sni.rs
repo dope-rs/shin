@@ -20,7 +20,8 @@ fn drive_client_hello(verifier: Verifier) -> ClientHello {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
     let evs = c.start().unwrap();
     let ch_bytes = evs
         .into_iter()

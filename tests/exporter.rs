@@ -45,8 +45,9 @@ fn client() -> TestClient {
             resumption: None,
             enable_early_data: false,
         },
-        clock,
+        clock as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn complete_handshake(client: &mut TestClient, server: &mut TestServer) {

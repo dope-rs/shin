@@ -56,7 +56,8 @@ fn client_finished_and_server() -> (TestServer, Vec<u8>) {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     let ch = collect_send(&client.start().unwrap(), Epoch::Plaintext);
     let server_flight = server.read(Epoch::Plaintext, &ch).unwrap();

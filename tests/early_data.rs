@@ -111,8 +111,9 @@ fn client_alpn(
             resumption,
             enable_early_data,
         },
-        || 0,
+        (|| 0) as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn first_handshake_ticket() -> Resumption {

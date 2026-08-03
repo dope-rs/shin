@@ -25,7 +25,8 @@ fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
     let evs = c.start().unwrap();
     let ch_bytes = evs
         .into_iter()
@@ -114,7 +115,8 @@ fn server_picks_first_overlap_and_client_observes() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     drive_handshake(&mut client, &mut server);
 
@@ -150,7 +152,8 @@ fn no_overlap_aborts_with_no_application_protocol() {
             enable_early_data: false,
         },
         || 0,
-    );
+    )
+    .unwrap();
 
     // RFC 7301 §3.2: empty intersection MUST abort, not complete ALPN-less.
     let evs = client.start().unwrap();

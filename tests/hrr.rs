@@ -43,8 +43,9 @@ fn client() -> Client<fn() -> u64> {
             resumption: None,
             enable_early_data: false,
         },
-        || 0,
+        (|| 0) as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn strip_key_share(ch_bytes: &[u8]) -> Vec<u8> {

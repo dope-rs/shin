@@ -48,8 +48,9 @@ fn client() -> TestClient {
             resumption: None,
             enable_early_data: false,
         },
-        clock,
+        clock as fn() -> u64,
     )
+    .unwrap()
 }
 
 fn ch_with_suites(ch_bytes: &[u8], suites: Vec<u16>) -> Vec<u8> {
