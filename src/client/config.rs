@@ -1,11 +1,11 @@
 use alloc::{rc::Rc, vec::Vec};
 use core::{fmt, mem::size_of, ops::Deref};
 
-use crate::connection::Error;
-use crate::crypto::kx::MAX_CLIENT_SHARE_LEN;
+use crate::connection;
 use crate::crypto::sig::{self, SigningKey};
 use crate::identity::cert::{Cert, CertError, SubjectPublicKeyInfo};
 use crate::identity::chain::TrustAnchor;
+use crate::identity::hostname::Hostname;
 use crate::memory::bound::ThreadBound;
 use crate::wire::handshake::messages::Certificate;
 use crate::wire::proto::{CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509};
@@ -14,13 +14,106 @@ use zeroize::Zeroize;
 
 pub const MAX_TRUST_ANCHORS: usize = 256;
 
-// Exact upper bound for every non-configurable byte in an initial ClientHello:
-// fixed fields, all supported suites/groups/signatures, the largest supported
-// key share, and every optional extension header. Keeping the variable portion
-// below the remainder proves that the initial flight fits one TLSPlaintext.
-const MAX_CLIENT_HELLO_FIXED_BYTES: usize =
-    83 + 7 + 12 + 18 + (10 + MAX_CLIENT_SHARE_LEN) + 6 + 6 + 4 + 9 + 6 + 4 + 6 + 47;
-const MAX_CLIENT_HELLO_CONFIG_BYTES: usize = MAX_PLAINTEXT_BODY - MAX_CLIENT_HELLO_FIXED_BYTES;
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigError {
+    MissingTrustAnchors,
+    TooManyTrustAnchors {
+        count: usize,
+        maximum: usize,
+    },
+    MalformedTrustAnchor {
+        index: usize,
+    },
+    MissingServerName,
+    InvalidServerName,
+    TransportParametersTooLong {
+        len: usize,
+        maximum: usize,
+    },
+    EmptyAlpnProtocol {
+        index: usize,
+    },
+    AlpnProtocolTooLong {
+        index: usize,
+        len: usize,
+        maximum: usize,
+    },
+    AlpnListTooLong {
+        len: usize,
+        maximum: usize,
+    },
+    EmptyResumptionTicket,
+    ResumptionTicketTooLong {
+        len: usize,
+        maximum: usize,
+    },
+    ClientHelloEncodingOverflow,
+    ClientHelloTooLarge {
+        len: usize,
+        maximum: usize,
+    },
+    InvalidClientIdentity,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTrustAnchors => formatter.write_str("X.509 trust anchor set is empty"),
+            Self::TooManyTrustAnchors { count, maximum } => write!(
+                formatter,
+                "X.509 trust anchor count {count} exceeds maximum {maximum}"
+            ),
+            Self::MalformedTrustAnchor { index } => {
+                write!(formatter, "X.509 trust anchor {index} is malformed")
+            }
+            Self::MissingServerName => formatter.write_str("X.509 server name is empty"),
+            Self::InvalidServerName => formatter.write_str("X.509 server name is invalid"),
+            Self::TransportParametersTooLong { len, maximum } => write!(
+                formatter,
+                "transport parameters length {len} exceeds maximum {maximum}"
+            ),
+            Self::EmptyAlpnProtocol { index } => {
+                write!(formatter, "ALPN protocol {index} is empty")
+            }
+            Self::AlpnProtocolTooLong {
+                index,
+                len,
+                maximum,
+            } => write!(
+                formatter,
+                "ALPN protocol {index} length {len} exceeds maximum {maximum}"
+            ),
+            Self::AlpnListTooLong { len, maximum } => {
+                write!(
+                    formatter,
+                    "ALPN list length {len} exceeds maximum {maximum}"
+                )
+            }
+            Self::EmptyResumptionTicket => formatter.write_str("resumption ticket is empty"),
+            Self::ResumptionTicketTooLong { len, maximum } => write!(
+                formatter,
+                "resumption ticket length {len} exceeds maximum {maximum}"
+            ),
+            Self::ClientHelloEncodingOverflow => {
+                formatter.write_str("initial ClientHello length field overflow")
+            }
+            Self::ClientHelloTooLarge { len, maximum } => write!(
+                formatter,
+                "initial ClientHello length {len} exceeds TLSPlaintext maximum {maximum}"
+            ),
+            Self::InvalidClientIdentity => formatter.write_str("client identity is invalid"),
+        }
+    }
+}
+
+impl core::error::Error for ConfigError {}
+
+impl From<ConfigError> for connection::Error {
+    fn from(_: ConfigError) -> Self {
+        Self::BadConfig
+    }
+}
 
 pub struct Config {
     pub verifier: Verifier,
@@ -36,6 +129,16 @@ pub struct Config {
 #[derive(Clone)]
 pub struct ConfigTemplate {
     inner: Rc<StaticConfig>,
+}
+
+/// A validated endpoint template and connection-local resumption state.
+///
+/// Its private fields prove that the exact pair fits the initial TLS record;
+/// runtime client construction therefore cannot combine a valid template with
+/// an incompatible ticket.
+pub struct PreparedConfig {
+    pub(super) template: ConfigTemplate,
+    pub(super) resumption: Option<Resumption>,
 }
 
 struct StaticConfig {
@@ -103,60 +206,82 @@ pub enum Verifier {
 impl Config {
     /// Reject unusable trust, identity, or wire-length settings before the
     /// handshake starts.
-    pub fn validate(&self) -> Result<(), Error> {
-        if let Verifier::X509 { anchors, hostname } = &self.verifier
-            && (anchors.is_empty()
-                || anchors.len() > MAX_TRUST_ANCHORS
-                || hostname.is_empty()
-                || hostname.len() > u16::MAX as usize - 3
-                || anchors.iter().any(|anchor| anchor.view().is_err()))
-        {
-            return Err(Error::BadConfig);
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Verifier::X509 { anchors, hostname } = &self.verifier {
+            if anchors.is_empty() {
+                return Err(ConfigError::MissingTrustAnchors);
+            }
+            if anchors.len() > MAX_TRUST_ANCHORS {
+                return Err(ConfigError::TooManyTrustAnchors {
+                    count: anchors.len(),
+                    maximum: MAX_TRUST_ANCHORS,
+                });
+            }
+            for (index, anchor) in anchors.iter().enumerate() {
+                if anchor.view().is_err() {
+                    return Err(ConfigError::MalformedTrustAnchor { index });
+                }
+            }
+            if hostname.is_empty() {
+                return Err(ConfigError::MissingServerName);
+            }
+            if !Hostname::new(hostname).is_valid_reference() {
+                return Err(ConfigError::InvalidServerName);
+            }
         }
         if self.transport_params.len() > u16::MAX as usize {
-            return Err(Error::BadConfig);
+            return Err(ConfigError::TransportParametersTooLong {
+                len: self.transport_params.len(),
+                maximum: u16::MAX as usize,
+            });
         }
         let mut alpn_total = 0usize;
-        for p in &self.alpn_protocols {
-            if p.is_empty() || p.len() > u8::MAX as usize {
-                return Err(Error::BadConfig);
+        for (index, protocol) in self.alpn_protocols.iter().enumerate() {
+            if protocol.is_empty() {
+                return Err(ConfigError::EmptyAlpnProtocol { index });
             }
-            alpn_total += 1 + p.len();
+            if protocol.len() > u8::MAX as usize {
+                return Err(ConfigError::AlpnProtocolTooLong {
+                    index,
+                    len: protocol.len(),
+                    maximum: u8::MAX as usize,
+                });
+            }
+            alpn_total = alpn_total
+                .checked_add(1 + protocol.len())
+                .ok_or(ConfigError::ClientHelloEncodingOverflow)?;
         }
         if alpn_total > u16::MAX as usize {
-            return Err(Error::BadConfig);
+            return Err(ConfigError::AlpnListTooLong {
+                len: alpn_total,
+                maximum: u16::MAX as usize,
+            });
         }
-        if self.resumption.as_ref().is_some_and(|resumption| {
-            resumption.ticket.is_empty() || resumption.ticket.len() > u16::MAX as usize
-        }) {
-            return Err(Error::BadConfig);
-        }
-        let hostname_len = match &self.verifier {
-            Verifier::RawPublicKey { .. } => 0,
-            Verifier::X509 { hostname, .. } => hostname.len(),
-        };
-        let ticket_len = self
-            .resumption
-            .as_ref()
-            .map_or(0, |resumption| resumption.ticket.len());
-        let client_hello_config_bytes = self
-            .transport_params
-            .len()
-            .checked_add(alpn_total)
-            .and_then(|bytes| bytes.checked_add(hostname_len))
-            .and_then(|bytes| bytes.checked_add(ticket_len))
-            .ok_or(Error::BadConfig)?;
-        if client_hello_config_bytes > MAX_CLIENT_HELLO_CONFIG_BYTES {
-            return Err(Error::BadConfig);
-        }
+        validate_resumption(self.resumption.as_ref())?;
+        validate_client_hello(
+            &self.verifier,
+            &self.transport_params,
+            &self.alpn_protocols,
+            self.resumption.as_ref(),
+        )?;
         Ok(())
     }
 
     /// Validates reusable endpoint policy once, then splits it from the
     /// single-use resumption ticket.
-    pub fn try_into_template(self) -> Result<(ConfigTemplate, Option<Resumption>), Error> {
+    pub fn try_into_template(self) -> Result<(ConfigTemplate, Option<Resumption>), ConfigError> {
         self.validate()?;
         Ok(self.split_template())
+    }
+
+    /// Validates the exact first-connection configuration once.
+    pub fn try_into_prepared(self) -> Result<PreparedConfig, ConfigError> {
+        self.validate()?;
+        let (template, resumption) = self.split_template();
+        Ok(PreparedConfig {
+            template,
+            resumption,
+        })
     }
 
     fn split_template(mut self) -> (ConfigTemplate, Option<Resumption>) {
@@ -177,6 +302,32 @@ impl Config {
 }
 
 impl ConfigTemplate {
+    /// Attaches connection-local state while preserving the encoded-size proof.
+    pub fn with_resumption(
+        self,
+        resumption: Option<Resumption>,
+    ) -> Result<PreparedConfig, ConfigError> {
+        validate_resumption(resumption.as_ref())?;
+        validate_client_hello(
+            &self.inner.verifier,
+            &self.inner.transport_params,
+            &self.inner.alpn_protocols,
+            resumption.as_ref(),
+        )?;
+        Ok(PreparedConfig {
+            template: self,
+            resumption,
+        })
+    }
+
+    /// Removing resumption can only reduce a previously validated ClientHello.
+    pub fn without_resumption(self) -> PreparedConfig {
+        PreparedConfig {
+            template: self,
+            resumption: None,
+        }
+    }
+
     pub(crate) fn verifier(&self) -> &Verifier {
         &self.inner.verifier
     }
@@ -194,6 +345,51 @@ impl ConfigTemplate {
     }
 }
 
+impl PreparedConfig {
+    /// Returns the validated reusable policy without exposing resumption state.
+    pub fn template(&self) -> ConfigTemplate {
+        self.template.clone()
+    }
+}
+
+fn validate_resumption(resumption: Option<&Resumption>) -> Result<(), ConfigError> {
+    let Some(resumption) = resumption else {
+        return Ok(());
+    };
+    if resumption.ticket.is_empty() {
+        return Err(ConfigError::EmptyResumptionTicket);
+    }
+    if resumption.ticket.len() > u16::MAX as usize {
+        return Err(ConfigError::ResumptionTicketTooLong {
+            len: resumption.ticket.len(),
+            maximum: u16::MAX as usize,
+        });
+    }
+    Ok(())
+}
+
+fn validate_client_hello(
+    verifier: &Verifier,
+    transport_params: &[u8],
+    alpn_protocols: &[Vec<u8>],
+    resumption: Option<&Resumption>,
+) -> Result<(), ConfigError> {
+    let len = super::offer::ClientHelloConfig::maximum_initial_len(
+        verifier,
+        transport_params,
+        alpn_protocols,
+        resumption,
+    )
+    .map_err(|_| ConfigError::ClientHelloEncodingOverflow)?;
+    if len > MAX_PLAINTEXT_BODY {
+        return Err(ConfigError::ClientHelloTooLarge {
+            len,
+            maximum: MAX_PLAINTEXT_BODY,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct OwnedTrustAnchor {
     pub subject_der: Vec<u8>,
@@ -209,9 +405,9 @@ impl OwnedTrustAnchor {
         })
     }
 
-    pub(super) fn view(&self) -> Result<TrustAnchor<'_>, Error> {
+    pub(super) fn view(&self) -> Result<TrustAnchor<'_>, connection::Error> {
         let spki = SubjectPublicKeyInfo::parse_standalone(&self.spki_der)
-            .map_err(|_| Error::BadCertificate)?;
+            .map_err(|_| connection::Error::BadCertificate)?;
         Ok(TrustAnchor {
             subject_der: &self.subject_der,
             spki,
@@ -243,7 +439,7 @@ pub struct ClientCertTemplate {
 const _: () = assert!(size_of::<ClientCertTemplate>() == size_of::<usize>());
 
 impl ClientCertSource {
-    pub(super) fn validate(&self) -> Result<(), Error> {
+    pub(super) fn validate(&self) -> Result<(), ConfigError> {
         let valid = match self {
             Self::RawPublicKey { signing_key } => signing_key.is_ed25519(),
             Self::X509 {
@@ -251,7 +447,11 @@ impl ClientCertSource {
                 signing_key,
             } => Certificate::chain_fits(chain_der) && signing_key.matches_x509_chain(chain_der),
         };
-        if valid { Ok(()) } else { Err(Error::BadConfig) }
+        if valid {
+            Ok(())
+        } else {
+            Err(ConfigError::InvalidClientIdentity)
+        }
     }
 
     pub(super) fn signing_key(&self) -> &SigningKey {
@@ -268,7 +468,7 @@ impl ClientCertSource {
         }
     }
 
-    pub fn try_into_template(self) -> Result<ClientCertTemplate, Error> {
+    pub fn try_into_template(self) -> Result<ClientCertTemplate, ConfigError> {
         self.validate()?;
         Ok(ClientCertTemplate {
             source: Rc::new(self),

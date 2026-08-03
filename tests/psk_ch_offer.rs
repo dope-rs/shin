@@ -8,7 +8,7 @@ use shin::wire::handshake::messages::ClientHello;
 use shin::wire::psk::{KX_MODE_PSK_DHE, KxModes, Offer};
 
 mod common;
-use common::{CollectEvents as _, Event};
+use common::{CollectEvents, Event};
 
 fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
     let mut c = Client::new(

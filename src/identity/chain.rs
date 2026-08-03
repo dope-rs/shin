@@ -8,7 +8,6 @@ use crate::identity::cert::ext::{
 use crate::identity::cert::{Cert, CertError, SubjectPublicKeyInfo, VerifyError};
 use crate::identity::hostname::Hostname;
 use crate::identity::time::UnixTime;
-use core::str;
 
 pub const MAX_CHAIN_LEN: usize = 10;
 
@@ -368,7 +367,7 @@ impl<'a, 'der> Chain<'a, 'der> {
             return Err(ChainError::HostnameMismatch);
         };
         let names = GeneralName::parse_alt_names(san_der)?;
-        match Self::parse_ip(host) {
+        match Hostname::new(host).parse_ip() {
             Some(target) => {
                 if names.iter().any(|name| {
                     matches!(
@@ -423,89 +422,5 @@ impl<'a, 'der> Chain<'a, 'der> {
             && a.iter()
                 .zip(b)
                 .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    }
-
-    fn parse_ip(host: &[u8]) -> Option<ArrayVec<u8, 16>> {
-        let s = str::from_utf8(host).ok()?;
-        if s.contains(':') {
-            Self::parse_ipv6(s)
-        } else {
-            Self::parse_ipv4(s)
-        }
-    }
-
-    fn parse_ipv4(s: &str) -> Option<ArrayVec<u8, 16>> {
-        let mut parts = s.split('.');
-        let mut out = ArrayVec::new();
-        for _ in 0..4 {
-            let p = parts.next()?;
-            if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            out.try_push(p.parse::<u8>().ok()?).ok()?;
-        }
-        if parts.next().is_some() {
-            return None;
-        }
-        Some(out)
-    }
-
-    fn parse_ipv6(s: &str) -> Option<ArrayVec<u8, 16>> {
-        let (head, tail, compressed) = match s.find("::") {
-            Some(i) => {
-                if s[i + 2..].contains("::") {
-                    return None;
-                }
-                (&s[..i], &s[i + 2..], true)
-            }
-            None => (s, "", false),
-        };
-
-        let (head_bytes, head_groups) = Self::parse_v6_part(head)?;
-        let (tail_bytes, tail_groups) = Self::parse_v6_part(tail)?;
-
-        if compressed {
-            let total = head_groups + tail_groups;
-            if total >= 8 {
-                return None;
-            }
-            let mut out = ArrayVec::new();
-            out.try_extend_from_slice(&head_bytes).ok()?;
-            for _ in 0..(8 - total) * 2 {
-                out.try_push(0).ok()?;
-            }
-            out.try_extend_from_slice(&tail_bytes).ok()?;
-            Some(out)
-        } else if head_groups == 8 && tail.is_empty() {
-            Some(head_bytes)
-        } else {
-            None
-        }
-    }
-
-    fn parse_v6_part(part: &str) -> Option<(ArrayVec<u8, 16>, usize)> {
-        if part.is_empty() {
-            return Some((ArrayVec::new(), 0));
-        }
-        let mut tokens = part.split(':').peekable();
-        let mut out = ArrayVec::new();
-        let mut groups = 0;
-        while let Some(tok) = tokens.next() {
-            if tok.contains('.') {
-                if tokens.peek().is_some() {
-                    return None;
-                }
-                out.try_extend_from_slice(&Self::parse_ipv4(tok)?).ok()?;
-                groups += 2;
-            } else {
-                if tok.is_empty() || tok.len() > 4 || !tok.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return None;
-                }
-                out.try_extend_from_slice(&u16::from_str_radix(tok, 16).ok()?.to_be_bytes())
-                    .ok()?;
-                groups += 1;
-            }
-        }
-        Some((out, groups))
     }
 }

@@ -23,18 +23,18 @@
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
-use shin::identity::asn1::{Reader as Asn1Reader, Tag};
+use shin::identity::asn1::{self, Tag};
 use shin::identity::cert::Cert;
 use shin::server::config::CertSource;
-use shin::wire::codec::Reader as CodecReader;
+use shin::wire::codec;
 use shin::wire::extension::ExtensionType;
 use shin::wire::handshake::frame::Frame;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{Server, ServerConfig, find_send};
 
@@ -57,13 +57,13 @@ fn ed25519_self_signed() -> (Vec<u8>, SigningKey) {
 }
 
 fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
-    let mut r = Asn1Reader::new(pkcs8);
+    let mut r = asn1::Reader::new(pkcs8);
     let inner = r.read_tagged(Tag::SEQUENCE).ok()?;
-    let mut ir = Asn1Reader::new(inner);
+    let mut ir = asn1::Reader::new(inner);
     let _version = ir.read_tagged(Tag::INTEGER).ok()?;
     let _alg = ir.read_tagged(Tag::SEQUENCE).ok()?;
     let outer_oct = ir.read_tagged(Tag::OCTET_STRING).ok()?;
-    let mut or = Asn1Reader::new(outer_oct);
+    let mut or = asn1::Reader::new(outer_oct);
     let inner_oct = or.read_tagged(Tag::OCTET_STRING).ok()?;
     if inner_oct.len() != 32 {
         return None;
@@ -87,7 +87,7 @@ fn cert_validity_midpoint(cert_der: &[u8]) -> u64 {
 fn server_ee_extensions(server_events: &[Event]) -> Vec<(u16, Vec<u8>)> {
     let blob = find_send(server_events, Epoch::Handshake)
         .expect("server should emit a Handshake-epoch Send");
-    let mut r = CodecReader::new(&blob);
+    let mut r = codec::Reader::new(&blob);
     while !r.is_empty() {
         let hs = Frame::decode(&mut r).expect("decode handshake");
         if let Frame::EncryptedExtensions(ee) = hs {
@@ -145,7 +145,7 @@ fn x509_server_omits_cert_type_and_quic_tp_when_client_did_not_offer() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::X509 {
                 anchors: vec![x509_anchor(&cert_der)],
                 hostname: HOSTNAME.as_bytes().to_vec(),
@@ -211,7 +211,7 @@ fn x509_server_with_transport_params_does_not_leak_to_tcp_tls_client() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::X509 {
                 anchors: vec![x509_anchor(&cert_der)],
                 hostname: HOSTNAME.as_bytes().to_vec(),
@@ -258,7 +258,7 @@ fn quic_transport_params_round_trip_when_client_offers() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -303,7 +303,7 @@ fn rpk_handshake_echoes_cert_type_extensions() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -367,7 +367,7 @@ fn x509_server_rejects_rpk_only_client_offer() {
     );
     // RPK verifier on the client → CH carries cert_type=[RPK] only.
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: [0xAA; 32], // wrong, but we won't get that far
             },
@@ -411,7 +411,7 @@ fn alpn_intersection_emits_extension() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -463,7 +463,7 @@ fn alpn_no_overlap_aborts() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -506,7 +506,7 @@ fn alpn_client_silent_omits_extension() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },

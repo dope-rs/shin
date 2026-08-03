@@ -2,8 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
-use shin::server::{config::CertSource, config::Config as ShardConfig, config::ConnectionConfig, Server, Shard};
+use shin::client::config::{Config, Verifier};
+use shin::server::{config, config::CertSource, config::ConnectionConfig, Server, Shard};
 use shin::crypto::sig::SigningKey;
 use shin::connection::{Epoch, Event, EventContext, EventSink};
 
@@ -49,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         },
         || 0,
     );
-    let mut shard = Shard::new(ShardConfig {
+    let mut shard = Shard::new(config::Config {
         source: CertSource::RawPublicKey {
             signing_key: signing,
         },
@@ -57,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
         ticket_keys: None,
     });
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: pubkey,
             },

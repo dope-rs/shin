@@ -6,7 +6,7 @@
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use shin::client::Client;
-use shin::client::config::{ClientCertSource, Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::client::config::{ClientCertSource, Config, OwnedTrustAnchor, Verifier};
 use shin::connection::{Epoch, Error};
 use shin::crypto::sig::SigningKey;
 use shin::identity::cert::Cert;
@@ -16,7 +16,7 @@ use shin::server::{
 };
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::{Server, ServerConfig, find_send, has_done};
 
 const SERVER_NAME: &str = "server.local";
@@ -93,7 +93,7 @@ fn drive<V: ClientCertVerifier + 'static>(
         verifier,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: client_verifier,
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),

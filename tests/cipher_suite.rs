@@ -1,5 +1,5 @@
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::client::config::{Config, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
@@ -8,7 +8,7 @@ use shin::wire::handshake::frame::Frame;
 use shin::wire::record::CipherSuite;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::{Server, ServerConfig, send};
 
 type TestClient = Client<fn() -> u64>;
@@ -39,7 +39,7 @@ fn server() -> TestServer {
 
 fn client() -> TestClient {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },

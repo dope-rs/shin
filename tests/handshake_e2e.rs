@@ -1,10 +1,10 @@
 use shin::client::Client;
-use shin::client::config::Config as ClientConfig;
+use shin::client::config::Config;
 use shin::connection::Epoch;
 use shin::crypto::hash::Digest;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{Server, ServerConfig, find_send, has_done, random_signing_key};
 
@@ -50,7 +50,7 @@ fn handshake_completes_in_process() {
     );
 
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -121,7 +121,7 @@ fn client_rejects_wrong_server_pubkey() {
 
     let bogus_pubkey = [0xAAu8; 32];
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: bogus_pubkey,
             },
@@ -166,7 +166,7 @@ fn server_rejects_tampered_client_finished() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -213,7 +213,7 @@ fn keys_diverge_across_independent_handshakes() {
             || 0,
         );
         let mut client = Client::new(
-            ClientConfig {
+            Config {
                 verifier: shin::client::config::Verifier::RawPublicKey {
                     expected_pubkey: server_pubkey,
                 },

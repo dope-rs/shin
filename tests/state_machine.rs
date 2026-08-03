@@ -1,15 +1,15 @@
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::client::config::{Config, Verifier};
 use shin::connection::{Epoch, Error};
 use shin::wire::codec::{DecodeError, Reader};
 use shin::wire::handshake::frame::Frame;
 
 mod common;
-use common::{CollectEvents as _, Event};
+use common::{CollectEvents, Event};
 
 fn client() -> Client<fn() -> u64> {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: [0u8; 32],
             },

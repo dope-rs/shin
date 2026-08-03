@@ -1,6 +1,6 @@
 use rcgen::{
-    BasicConstraints as RcgenBasicConstraints, CertificateParams, CustomExtension,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    CertificateParams, CustomExtension, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 
 use shin::identity::cert::Cert;
@@ -314,7 +314,7 @@ fn ca(cn: &str) -> (CertificateParams, KeyPair, Vec<u8>) {
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);
-    params.is_ca = IsCa::Ca(RcgenBasicConstraints::Unconstrained);
+    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
     let der = params.clone().self_signed(&key).unwrap().der().to_vec();
     (params, key, der)

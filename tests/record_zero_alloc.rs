@@ -4,12 +4,12 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use shin::client::Client;
-use shin::client::config::Config as ClientConfig;
+use shin::client::config::Config;
 use shin::connection::{Epoch, Event, EventContext, EventSink};
 use shin::wire::record::{CipherSuite, ContentType, Opener, Sealer};
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::{Server, ServerConfig, find_send, has_done, random_signing_key};
 
 const TEST_SECRET: [u8; 32] = [
@@ -127,7 +127,7 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: shin::client::config::Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },

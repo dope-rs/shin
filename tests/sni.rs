@@ -8,7 +8,7 @@ use shin::wire::handshake::frame::Frame;
 use shin::wire::handshake::messages::ClientHello;
 
 mod common;
-use common::{CollectEvents as _, Event};
+use common::{CollectEvents, Event};
 
 fn drive_client_hello(verifier: Verifier) -> ClientHello {
     let mut c = Client::new(

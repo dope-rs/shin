@@ -1,101 +1,60 @@
-use super::*;
+use alloc::vec::Vec;
 
-pub(super) trait ClientOffer {
-    fn encode_client_hello(
-        &mut self,
-        kx_pubkey: &[u8],
-        cookie: Option<&[u8]>,
-        resumption: Option<&Resumption>,
-        offer_early_data: bool,
-    ) -> Result<(), Error>;
-    fn splice_psk_binder(
-        transcript: &Transcript,
-        ch_bytes: &mut [u8],
-        psk: &[u8; 32],
-    ) -> Result<(), Error>;
+use super::*;
+use crate::crypto::kx::MAX_CLIENT_SHARE_LEN;
+use crate::wire::codec::EncodedSize;
+
+#[derive(Clone, Copy)]
+pub(super) struct ClientHelloConfig<'a> {
+    verifier: &'a Verifier,
+    transport_params: &'a [u8],
+    alpn_protocols: &'a [Vec<u8>],
 }
-impl<C: Clock> ClientOffer for Client<C> {
-    fn encode_client_hello(
-        &mut self,
-        kx_pubkey: &[u8],
-        cookie: Option<&[u8]>,
-        resumption: Option<&Resumption>,
-        offer_early_data: bool,
-    ) -> Result<(), Error> {
-        let server_cert_type = match self.config.verifier() {
+
+#[derive(Clone, Copy)]
+struct ClientHelloFields<'a> {
+    suites: &'a [CipherSuite],
+    group: KexGroup,
+    random: &'a [u8; RANDOM_LEN],
+    session_id: &'a [u8; 32],
+    kx_pubkey: &'a [u8],
+    cookie: Option<&'a [u8]>,
+    resumption: Option<&'a Resumption>,
+    offer_early_data: bool,
+    client_cert_type_offer: Option<u8>,
+}
+
+impl ClientHelloConfig<'_> {
+    fn encode(
+        self,
+        out: &mut impl Encode,
+        fields: ClientHelloFields<'_>,
+    ) -> Result<(), EncodeError> {
+        let server_cert_type = match self.verifier {
             Verifier::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
             Verifier::X509 { .. } => CERT_TYPE_X509,
         };
-        let client_cert_type_offer = match &self.client_cert {
-            Some(source) => Some(source.cert_type()),
-            None if matches!(self.config.verifier(), Verifier::RawPublicKey { .. }) => {
-                Some(CERT_TYPE_RAW_PUBLIC_KEY)
-            }
-            None => None,
-        };
-        let hostname = match self.config.verifier() {
+        let hostname = match self.verifier {
             Verifier::X509 { hostname, .. } if !Hostname::new(hostname).is_ip_literal() => {
                 Some(hostname.as_slice())
             }
             Verifier::RawPublicKey { .. } | Verifier::X509 { .. } => None,
         };
-        let signature_algorithms = match self.config.verifier() {
+        let signature_algorithms = match self.verifier {
             Verifier::RawPublicKey { .. } => SignatureAlgorithms::rpk().as_slice(),
             Verifier::X509 { .. } => SignatureAlgorithms::x509().as_slice(),
         };
 
-        self.ee_offered.clear();
-        self.ee_offered
-            .try_push(ExtensionType::SUPPORTED_GROUPS)
-            .map_err(|_| Error::Encode)?;
-        if matches!(self.config.verifier(), Verifier::RawPublicKey { .. }) {
-            self.ee_offered
-                .try_push(ExtensionType::SERVER_CERTIFICATE_TYPE)
-                .map_err(|_| Error::Encode)?;
-        }
-        if client_cert_type_offer.is_some() {
-            self.ee_offered
-                .try_push(ExtensionType::CLIENT_CERTIFICATE_TYPE)
-                .map_err(|_| Error::Encode)?;
-        }
-        if !self.config.transport_params().is_empty() {
-            self.ee_offered
-                .try_push(ExtensionType::QUIC_TRANSPORT_PARAMETERS)
-                .map_err(|_| Error::Encode)?;
-        }
-        if hostname.is_some() {
-            self.ee_offered
-                .try_push(ExtensionType::SERVER_NAME)
-                .map_err(|_| Error::Encode)?;
-        }
-        if !self.config.alpn_protocols().is_empty() {
-            self.ee_offered
-                .try_push(ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION)
-                .map_err(|_| Error::Encode)?;
-        }
-        if offer_early_data {
-            self.ee_offered
-                .try_push(ExtensionType::EARLY_DATA)
-                .map_err(|_| Error::Encode)?;
-        }
-
-        let config = &self.config;
-        let suites = &self.offered_suites;
-        let group = self.kex_group;
-        let random = self.client_random;
-        let session_id = self.session_id;
-        let flight = &mut self.flight;
-        flight.clear();
-        flight.put_u8(HandshakeType::ClientHello as u8);
-        flight.put_vec_u24(|hello| {
+        out.put_u8(HandshakeType::ClientHello as u8);
+        out.put_vec_u24(|hello| {
             hello.put_u16(TLS_1_2);
-            hello.put_slice(&random);
+            hello.put_slice(fields.random);
             hello.put_vec_u8(|session| {
-                session.put_slice(&session_id);
+                session.put_slice(fields.session_id);
                 Ok(())
             })?;
             hello.put_vec_u16(|encoded_suites| {
-                for suite in suites {
+                for suite in fields.suites {
                     encoded_suites.put_u16(suite.wire_id());
                 }
                 Ok(())
@@ -133,14 +92,14 @@ impl<C: Clock> ClientOffer for Client<C> {
                 )?;
                 Extension::encode_with(extensions, ExtensionType::KEY_SHARE, |shares| {
                     shares.put_vec_u16(|entries| {
-                        entries.put_u16(group.wire_id());
+                        entries.put_u16(fields.group.wire_id());
                         entries.put_vec_u16(|key| {
-                            key.put_slice(kx_pubkey);
+                            key.put_slice(fields.kx_pubkey);
                             Ok(())
                         })
                     })
                 })?;
-                if matches!(config.verifier(), Verifier::RawPublicKey { .. }) {
+                if matches!(self.verifier, Verifier::RawPublicKey { .. }) {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::SERVER_CERTIFICATE_TYPE,
@@ -152,7 +111,7 @@ impl<C: Clock> ClientOffer for Client<C> {
                         },
                     )?;
                 }
-                if let Some(cert_type) = client_cert_type_offer {
+                if let Some(cert_type) = fields.client_cert_type_offer {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::CLIENT_CERTIFICATE_TYPE,
@@ -164,12 +123,12 @@ impl<C: Clock> ClientOffer for Client<C> {
                         },
                     )?;
                 }
-                if !config.transport_params().is_empty() {
+                if !self.transport_params.is_empty() {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::QUIC_TRANSPORT_PARAMETERS,
                         |parameters| {
-                            parameters.put_slice(config.transport_params());
+                            parameters.put_slice(self.transport_params);
                             Ok(())
                         },
                     )?;
@@ -185,13 +144,13 @@ impl<C: Clock> ClientOffer for Client<C> {
                         })
                     })?;
                 }
-                if !config.alpn_protocols().is_empty() {
+                if !self.alpn_protocols.is_empty() {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
                         |protocols| {
                             protocols.put_vec_u16(|list| {
-                                for protocol in config.alpn_protocols() {
+                                for protocol in self.alpn_protocols {
                                     list.put_vec_u8(|encoded| {
                                         encoded.put_slice(protocol);
                                         Ok(())
@@ -202,16 +161,16 @@ impl<C: Clock> ClientOffer for Client<C> {
                         },
                     )?;
                 }
-                if let Some(cookie) = cookie {
+                if let Some(cookie) = fields.cookie {
                     Extension::encode_with(extensions, ExtensionType::COOKIE, |encoded| {
                         encoded.put_slice(cookie);
                         Ok(())
                     })?;
                 }
-                if offer_early_data {
+                if fields.offer_early_data {
                     Extension::encode_with(extensions, ExtensionType::EARLY_DATA, |_| Ok(()))?;
                 }
-                if let Some(resumption) = resumption {
+                if let Some(resumption) = fields.resumption {
                     Extension::encode_with(
                         extensions,
                         ExtensionType::PSK_KEY_EXCHANGE_MODES,
@@ -245,7 +204,133 @@ impl<C: Clock> ClientOffer for Client<C> {
                 }
                 Ok(())
             })
-        })?;
+        })
+    }
+
+    pub(super) fn maximum_initial_len(
+        verifier: &Verifier,
+        transport_params: &[u8],
+        alpn_protocols: &[Vec<u8>],
+        resumption: Option<&Resumption>,
+    ) -> Result<usize, EncodeError> {
+        const MAX_CLIENT_SHARE: [u8; MAX_CLIENT_SHARE_LEN] = [0; MAX_CLIENT_SHARE_LEN];
+        const RANDOM: [u8; RANDOM_LEN] = [0; RANDOM_LEN];
+        const SESSION_ID: [u8; 32] = [0; 32];
+
+        let mut size = EncodedSize::default();
+        ClientHelloConfig {
+            verifier,
+            transport_params,
+            alpn_protocols,
+        }
+        .encode(
+            &mut size,
+            ClientHelloFields {
+                suites: &CipherSuite::SUPPORTED,
+                group: KexGroup::X25519,
+                random: &RANDOM,
+                session_id: &SESSION_ID,
+                kx_pubkey: &MAX_CLIENT_SHARE,
+                cookie: None,
+                resumption,
+                offer_early_data: true,
+                client_cert_type_offer: Some(CERT_TYPE_X509),
+            },
+        )?;
+        size.finish()
+    }
+}
+
+pub(super) trait ClientOffer {
+    fn encode_client_hello(
+        &mut self,
+        kx_pubkey: &[u8],
+        cookie: Option<&[u8]>,
+        resumption: Option<&Resumption>,
+        offer_early_data: bool,
+    ) -> Result<(), Error>;
+    fn splice_psk_binder(
+        transcript: &Transcript,
+        ch_bytes: &mut [u8],
+        psk: &[u8; 32],
+    ) -> Result<(), Error>;
+}
+impl<C: Clock> ClientOffer for Client<C> {
+    fn encode_client_hello(
+        &mut self,
+        kx_pubkey: &[u8],
+        cookie: Option<&[u8]>,
+        resumption: Option<&Resumption>,
+        offer_early_data: bool,
+    ) -> Result<(), Error> {
+        let client_cert_type_offer = match &self.client_cert {
+            Some(source) => Some(source.cert_type()),
+            None if matches!(self.config.verifier(), Verifier::RawPublicKey { .. }) => {
+                Some(CERT_TYPE_RAW_PUBLIC_KEY)
+            }
+            None => None,
+        };
+        let sends_server_name = matches!(
+            self.config.verifier(),
+            Verifier::X509 { hostname, .. } if !Hostname::new(hostname).is_ip_literal()
+        );
+
+        self.ee_offered.clear();
+        self.ee_offered
+            .try_push(ExtensionType::SUPPORTED_GROUPS)
+            .map_err(|_| Error::Encode)?;
+        if matches!(self.config.verifier(), Verifier::RawPublicKey { .. }) {
+            self.ee_offered
+                .try_push(ExtensionType::SERVER_CERTIFICATE_TYPE)
+                .map_err(|_| Error::Encode)?;
+        }
+        if client_cert_type_offer.is_some() {
+            self.ee_offered
+                .try_push(ExtensionType::CLIENT_CERTIFICATE_TYPE)
+                .map_err(|_| Error::Encode)?;
+        }
+        if !self.config.transport_params().is_empty() {
+            self.ee_offered
+                .try_push(ExtensionType::QUIC_TRANSPORT_PARAMETERS)
+                .map_err(|_| Error::Encode)?;
+        }
+        if sends_server_name {
+            self.ee_offered
+                .try_push(ExtensionType::SERVER_NAME)
+                .map_err(|_| Error::Encode)?;
+        }
+        if !self.config.alpn_protocols().is_empty() {
+            self.ee_offered
+                .try_push(ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION)
+                .map_err(|_| Error::Encode)?;
+        }
+        if offer_early_data {
+            self.ee_offered
+                .try_push(ExtensionType::EARLY_DATA)
+                .map_err(|_| Error::Encode)?;
+        }
+
+        let flight = &mut self.flight;
+        flight.clear();
+        ClientHelloConfig {
+            verifier: self.config.verifier(),
+            transport_params: self.config.transport_params(),
+            alpn_protocols: self.config.alpn_protocols(),
+        }
+        .encode(
+            flight,
+            ClientHelloFields {
+                suites: &self.offered_suites,
+                group: self.kex_group,
+                random: &self.client_random,
+                session_id: &self.session_id,
+                kx_pubkey,
+                cookie,
+                resumption,
+                offer_early_data,
+                client_cert_type_offer,
+            },
+        )?;
         Ok(())
     }
 

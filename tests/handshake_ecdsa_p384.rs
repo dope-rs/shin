@@ -1,14 +1,14 @@
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ECDSA_P384_SHA384};
 
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::identity::cert::Cert;
 use shin::server::config::CertSource;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::{Server, ServerConfig, find_send, has_done};
 
 const HOSTNAME: &str = "p384.local";
@@ -61,7 +61,7 @@ fn handshake_with_ecdsa_p384_x509_chain() {
         || 0,
     );
     let client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),

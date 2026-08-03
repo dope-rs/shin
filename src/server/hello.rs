@@ -1,4 +1,4 @@
-use super::resumption::Resumption as _;
+use super::resumption::Resumption;
 use super::*;
 
 pub(super) trait Hello {

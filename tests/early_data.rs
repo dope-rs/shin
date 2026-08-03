@@ -1,17 +1,17 @@
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::client::config::{Config, Resumption, Verifier};
 use shin::connection::{Clock, Epoch};
 use shin::crypto::hash::Digest;
 use shin::crypto::sig::SigningKey;
 use shin::server::{
-    Server as Connection, Shard, config::CertSource, config::Config as ShardConfig,
-    config::ConnectionConfig, config::EarlyDataGuard, config::NoGuard,
+    self, Shard, config, config::CertSource, config::ConnectionConfig, config::EarlyDataGuard,
+    config::NoGuard,
 };
 use shin::wire::extension::ExtensionType;
 
 mod common;
 use common::Event;
-use common::{CollectEvents as _, CollectServerEvents as _};
+use common::{CollectEvents, CollectServerEvents};
 use common::{Server, ServerConfig, find_send};
 
 const TICKET_SECRET: [u8; 32] = [0x55u8; 32];
@@ -102,7 +102,7 @@ fn client_alpn(
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Client<fn() -> u64> {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },
@@ -255,7 +255,7 @@ fn replayed_early_data_is_rejected() {
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
 
     let mut shard = Shard::with_early_data_guard(
-        ShardConfig {
+        config::Config {
             source: CertSource::RawPublicKey {
                 signing_key: signing_key(),
             },
@@ -268,11 +268,11 @@ fn replayed_early_data_is_rejected() {
         transport_params: Vec::new(),
     };
 
-    let mut s1 = Connection::new(connection_config(), TestGuard::new(NOW_MS));
+    let mut s1 = server::Server::new(connection_config(), TestGuard::new(NOW_MS));
     let out1 = s1.read(Epoch::Plaintext, &ch, &mut shard).unwrap();
     assert!(cets(&out1).is_some(), "first use accepts early data");
 
-    let mut s2 = Connection::new(connection_config(), TestGuard::new(NOW_MS));
+    let mut s2 = server::Server::new(connection_config(), TestGuard::new(NOW_MS));
     let out2 = s2.read(Epoch::Plaintext, &ch, &mut shard).unwrap();
     assert!(
         cets(&out2).is_none(),

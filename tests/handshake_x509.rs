@@ -1,7 +1,8 @@
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::client::config;
+use shin::client::config::{ConfigError, OwnedTrustAnchor, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::identity::asn1::{Reader, Tag};
@@ -9,8 +10,7 @@ use shin::identity::cert::Cert;
 use shin::server::config::CertSource;
 
 mod common;
-use common::CollectEvents as _;
-use common::{Server, ServerConfig, find_send, has_done};
+use common::{CollectEvents, Server, ServerConfig, find_send, has_done};
 
 const HOSTNAME: &str = "host.local";
 
@@ -80,7 +80,7 @@ fn handshake_with_x509_chain() {
         || 0,
     );
     let client = Client::new(
-        ClientConfig {
+        config::Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
@@ -133,7 +133,7 @@ fn rejects_wrong_hostname() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        config::Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: b"other.local".to_vec(),
@@ -185,7 +185,7 @@ fn rejects_unknown_anchor() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        config::Config {
             verifier: Verifier::X509 {
                 anchors: vec![bogus_anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
@@ -240,7 +240,7 @@ fn stale_clock_rejects_expired_certificate() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        config::Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
@@ -269,7 +269,7 @@ fn stale_clock_rejects_expired_certificate() {
 
 #[test]
 fn config_validate_rejects_empty_anchors_and_hostname() {
-    let empty_anchors = ClientConfig {
+    let empty_anchors = config::Config {
         verifier: Verifier::X509 {
             anchors: Vec::new(),
             hostname: HOSTNAME.as_bytes().to_vec(),
@@ -281,7 +281,7 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
     };
     assert_eq!(
         empty_anchors.validate().unwrap_err(),
-        shin::connection::Error::BadConfig
+        ConfigError::MissingTrustAnchors
     );
 
     let (cert_der, _) = ed25519_self_signed();
@@ -290,7 +290,7 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
         subject_der: cert_view.subject_der.to_vec(),
         spki_der: cert_view.spki.raw_der.to_vec(),
     };
-    let empty_host = ClientConfig {
+    let empty_host = config::Config {
         verifier: Verifier::X509 {
             anchors: vec![anchor],
             hostname: Vec::new(),
@@ -302,13 +302,13 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
     };
     assert_eq!(
         empty_host.validate().unwrap_err(),
-        shin::connection::Error::BadConfig
+        ConfigError::MissingServerName
     );
 }
 
 #[test]
 fn config_validate_rejects_oversized_alpn_and_transport_params() {
-    let base = || ClientConfig {
+    let base = || config::Config {
         verifier: Verifier::RawPublicKey {
             expected_pubkey: [0u8; 32],
         },
@@ -322,21 +322,28 @@ fn config_validate_rejects_oversized_alpn_and_transport_params() {
     over_protocol.alpn_protocols = vec![vec![b'x'; 256]];
     assert_eq!(
         over_protocol.validate().unwrap_err(),
-        shin::connection::Error::BadConfig
+        ConfigError::AlpnProtocolTooLong {
+            index: 0,
+            len: 256,
+            maximum: 255,
+        }
     );
 
     let mut empty_protocol = base();
     empty_protocol.alpn_protocols = vec![Vec::new()];
     assert_eq!(
         empty_protocol.validate().unwrap_err(),
-        shin::connection::Error::BadConfig
+        ConfigError::EmptyAlpnProtocol { index: 0 }
     );
 
     let mut over_tp = base();
     over_tp.transport_params = vec![0u8; 65536];
     assert_eq!(
         over_tp.validate().unwrap_err(),
-        shin::connection::Error::BadConfig
+        ConfigError::TransportParametersTooLong {
+            len: 65_536,
+            maximum: 65_535,
+        }
     );
 
     base().validate().unwrap();

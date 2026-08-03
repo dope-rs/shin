@@ -1,5 +1,5 @@
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::client::config::{Config, Verifier};
 use shin::connection::{Clock, Epoch};
 use shin::crypto::sig::SigningKey;
 use shin::server::{config::CertSource, config::EarlyDataGuard};
@@ -9,13 +9,13 @@ use shin::wire::handshake::frame::Frame;
 use shin::wire::handshake::messages::ClientHello;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{Server, ServerConfig};
 
 fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
     let mut c = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: [0x42u8; 32],
             },
@@ -105,7 +105,7 @@ fn server_picks_first_overlap_and_client_observes() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -142,7 +142,7 @@ fn no_overlap_aborts_with_no_application_protocol() {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },

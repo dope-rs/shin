@@ -43,17 +43,17 @@ mod resumption;
 mod state;
 mod updates;
 
-use authentication::ClientAuthentication as _;
+use authentication::ClientAuthentication;
 use config::{
     CertSource, ClientAuth, ClientCertVerifier, ClientCertificateChain, ClientIdentity, Config,
     ConnectionConfig, EarlyDataGuard, NoClientAuth, NoGuard,
 };
 use early::{AcceptedPsk, EarlyDataAdmission, TICKET_LIFETIME_SECS};
-use hello::Hello as _;
+use hello::Hello;
 use negotiation::ClientHelloOffers;
-use resumption::Resumption as _;
+use resumption::Resumption;
 use state::State;
-use updates::Updates as _;
+use updates::Updates;
 
 /// ```compile_fail
 /// use shin::server::Shard;

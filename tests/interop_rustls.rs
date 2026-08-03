@@ -5,10 +5,10 @@ use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme, SupportedCipherSuite};
+use rustls::{DigitallySignedStruct, SignatureScheme, SupportedCipherSuite};
 
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::hash::Digest;
 use shin::crypto::sig::SigningKey;
@@ -18,7 +18,7 @@ use shin::server::config::CertSource;
 use shin::wire::record::{CipherSuite, ContentType, Opener, PlaintextRecord, Sealer};
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{Server, ServerConfig};
 
@@ -110,11 +110,13 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
-    ) -> Result<ServerCertVerified, RustlsError> {
+    ) -> Result<ServerCertVerified, rustls::Error> {
         if end_entity.as_ref() == self.cert.as_slice() {
             Ok(ServerCertVerified::assertion())
         } else {
-            Err(RustlsError::General("unexpected server certificate".into()))
+            Err(rustls::Error::General(
+                "unexpected server certificate".into(),
+            ))
         }
     }
 
@@ -123,7 +125,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -137,7 +139,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -198,7 +200,7 @@ fn split_records(buf: &[u8]) -> Vec<Vec<u8>> {
 
 trait RustlsConn {
     fn rx_tls(&mut self, rd: &mut dyn std::io::Read) -> std::io::Result<usize>;
-    fn process(&mut self) -> Result<rustls::IoState, RustlsError>;
+    fn process(&mut self) -> Result<rustls::IoState, rustls::Error>;
     fn tx_tls(&mut self, wr: &mut dyn std::io::Write) -> std::io::Result<usize>;
     fn pending_write(&self) -> bool;
     fn app_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
@@ -211,7 +213,7 @@ macro_rules! impl_rustls_conn {
             fn rx_tls(&mut self, rd: &mut dyn std::io::Read) -> std::io::Result<usize> {
                 self.read_tls(rd)
             }
-            fn process(&mut self) -> Result<rustls::IoState, RustlsError> {
+            fn process(&mut self) -> Result<rustls::IoState, rustls::Error> {
                 self.process_new_packets()
             }
             fn tx_tls(&mut self, wr: &mut dyn std::io::Write) -> std::io::Result<usize> {
@@ -286,7 +288,7 @@ fn shin_client(suite: CipherSuite, cert: &TestCert) -> Client<impl Fn() -> u64> 
     let anchor = anchor_for(&cert.cert_der);
     let now_ms = cert.now_ms;
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),

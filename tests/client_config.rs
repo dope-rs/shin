@@ -3,7 +3,7 @@ use std::mem::size_of;
 
 use shin::client::Client;
 use shin::client::config::{
-    ClientCertSource, ClientCertTemplate, Config, ConfigTemplate, MAX_TRUST_ANCHORS,
+    ClientCertSource, ClientCertTemplate, Config, ConfigError, ConfigTemplate, MAX_TRUST_ANCHORS,
     OwnedTrustAnchor, Verifier,
 };
 use shin::connection::{Error, Event, EventContext, EventSink};
@@ -30,10 +30,13 @@ fn x509_config(anchor_count: usize) -> Config {
 
 #[test]
 fn x509_trust_anchor_limit_is_inclusive() {
-    assert!(x509_config(MAX_TRUST_ANCHORS).try_into_template().is_ok());
+    assert_eq!(x509_config(MAX_TRUST_ANCHORS).validate(), Ok(()));
     assert!(matches!(
-        x509_config(MAX_TRUST_ANCHORS + 1).try_into_template(),
-        Err(Error::BadConfig)
+        x509_config(MAX_TRUST_ANCHORS + 1).validate(),
+        Err(ConfigError::TooManyTrustAnchors {
+            count,
+            maximum: MAX_TRUST_ANCHORS,
+        }) if count == MAX_TRUST_ANCHORS + 1
     ));
 }
 
@@ -62,7 +65,7 @@ fn invalid_identity_cannot_become_a_template() {
     };
     assert!(matches!(
         identity.try_into_template(),
-        Err(Error::BadConfig)
+        Err(ConfigError::InvalidClientIdentity)
     ));
 }
 
@@ -80,7 +83,7 @@ impl EventSink for IgnoreEvents {
 fn invalid_config_never_becomes_a_runtime_client() {
     assert!(matches!(
         Client::new(x509_config(MAX_TRUST_ANCHORS + 1), || 0),
-        Err(Error::BadConfig)
+        Err(ConfigError::TooManyTrustAnchors { .. })
     ));
 }
 
@@ -88,7 +91,36 @@ fn invalid_config_never_becomes_a_runtime_client() {
 fn deterministic_oversized_client_hello_is_rejected_during_validation() {
     let mut config = x509_config(1);
     config.alpn_protocols = vec![vec![b'a'; u8::MAX as usize]; 200];
-    assert!(matches!(config.validate(), Err(Error::BadConfig)));
+    assert!(matches!(
+        config.validate(),
+        Err(ConfigError::ClientHelloTooLarge { .. })
+    ));
+}
+
+#[test]
+fn validated_template_rejects_an_incompatible_resumption_ticket() {
+    let mut config = x509_config(1);
+    config.alpn_protocols = vec![vec![b'a'; u8::MAX as usize]; 50];
+    let (template, _) = config.try_into_template().expect("static template fits");
+    let resumption = shin::client::config::Resumption::new([7; 32], vec![9; 4096], 0, 0);
+
+    assert!(matches!(
+        template.with_resumption(Some(resumption)),
+        Err(ConfigError::ClientHelloTooLarge { .. })
+    ));
+}
+
+#[test]
+fn invalid_server_name_is_rejected_before_client_construction() {
+    let mut config = x509_config(1);
+    config.verifier = Verifier::X509 {
+        anchors: match config.verifier {
+            Verifier::X509 { anchors, .. } => anchors,
+            Verifier::RawPublicKey { .. } => unreachable!(),
+        },
+        hostname: b"bad\0host.example".to_vec(),
+    };
+    assert_eq!(config.validate(), Err(ConfigError::InvalidServerName));
 }
 
 #[test]

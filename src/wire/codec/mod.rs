@@ -121,6 +121,94 @@ pub trait Encode {
         F: FnOnce(&mut Self) -> Result<(), EncodeError>;
 }
 
+/// Runs a wire encoder without materializing bytes.
+///
+/// Length-prefixed fields use the same overflow rules as real encoders, so a
+/// sizing pass cannot silently approve a message that serialization rejects.
+#[derive(Default)]
+pub(crate) struct EncodedSize {
+    len: usize,
+    overflowed: bool,
+}
+
+impl EncodedSize {
+    pub(crate) fn finish(self) -> Result<usize, EncodeError> {
+        if self.overflowed {
+            Err(EncodeError::Overflow)
+        } else {
+            Ok(self.len)
+        }
+    }
+
+    fn extend(&mut self, len: usize) {
+        match self.len.checked_add(len) {
+            Some(total) => self.len = total,
+            None => self.overflowed = true,
+        }
+    }
+
+    fn encode_length<F>(&mut self, width: usize, maximum: usize, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
+    {
+        let start = self.len;
+        self.extend(width);
+        let body_start = self.len;
+        if let Err(error) = body(self) {
+            self.len = start;
+            return Err(error);
+        }
+        if self.overflowed || self.len - body_start > maximum {
+            self.len = start;
+            return Err(EncodeError::Overflow);
+        }
+        Ok(())
+    }
+}
+
+impl Encode for EncodedSize {
+    fn put_u8(&mut self, _: u8) {
+        self.extend(1);
+    }
+
+    fn put_u16(&mut self, _: u16) {
+        self.extend(2);
+    }
+
+    fn put_u24(&mut self, _: u32) {
+        self.extend(3);
+    }
+
+    fn put_u32(&mut self, _: u32) {
+        self.extend(4);
+    }
+
+    fn put_slice(&mut self, bytes: &[u8]) {
+        self.extend(bytes.len());
+    }
+
+    fn put_vec_u8<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
+    {
+        self.encode_length(1, u8::MAX as usize, body)
+    }
+
+    fn put_vec_u16<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
+    {
+        self.encode_length(2, u16::MAX as usize, body)
+    }
+
+    fn put_vec_u24<F>(&mut self, body: F) -> Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
+    {
+        self.encode_length(3, (1 << 24) - 1, body)
+    }
+}
+
 impl Encode for Vec<u8> {
     fn put_u8(&mut self, v: u8) {
         self.push(v);

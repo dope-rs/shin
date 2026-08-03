@@ -1,13 +1,13 @@
 use ring::rand::SystemRandom;
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::client::config::{Config, Resumption, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::{TicketKeys, TicketRotator};
 use shin::server::config::CertSource;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{FixedClock, Server, ServerConfig, find_send};
 
@@ -34,7 +34,7 @@ fn server_with(keys: Option<TicketKeys>, now_ms: u64) -> Server<FixedClock> {
 
 fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },

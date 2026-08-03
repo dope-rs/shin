@@ -51,7 +51,10 @@ mod updates;
 const MAX_TICKET_LIFETIME_SECS: u32 = 604_800;
 
 use authentication::Authentication;
-use config::{ClientCertSource, ClientCertTemplate, Config, ConfigTemplate, Resumption, Verifier};
+use config::{
+    ClientCertSource, ClientCertTemplate, Config, ConfigError, ConfigTemplate, PreparedConfig,
+    Resumption, Verifier,
+};
 use negotiation::Negotiation;
 use offer::ClientOffer;
 use state::{HandshakeSecrets, State, StateKind};
@@ -123,7 +126,7 @@ impl<C: Clock> Drop for Client<C> {
 }
 
 impl<C: Clock> Client<C> {
-    pub fn new(config: Config, clock: C) -> Result<Self, Error> {
+    pub fn new(config: Config, clock: C) -> Result<Self, ConfigError> {
         Self::with_workspace(config, clock, HandshakeWorkspace::for_client())
     }
 
@@ -131,20 +134,23 @@ impl<C: Clock> Client<C> {
         config: Config,
         clock: C,
         workspace: HandshakeWorkspace,
-    ) -> Result<Self, Error> {
-        let (config, resumption) = config.try_into_template()?;
+    ) -> Result<Self, ConfigError> {
+        let config = config.try_into_prepared()?;
         Ok(Self::with_template_workspace(
-            config, resumption, None, clock, workspace,
+            config, None, clock, workspace,
         ))
     }
 
     pub fn with_template_workspace(
-        config: ConfigTemplate,
-        resumption: Option<Resumption>,
+        config: PreparedConfig,
         client_cert: Option<ClientCertTemplate>,
         clock: C,
         workspace: HandshakeWorkspace,
     ) -> Self {
+        let PreparedConfig {
+            template: config,
+            resumption,
+        } = config;
         let HandshakeWorkspace {
             reassembly,
             flight,

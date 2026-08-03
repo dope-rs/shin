@@ -3,7 +3,7 @@
 //! KeyUpdate flooding bounds.
 
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::client::config::{Config, Verifier};
 use shin::connection::{Epoch, Error};
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
@@ -14,7 +14,7 @@ use shin::wire::handshake::messages::{KeyUpdate, ServerHello};
 use shin::wire::handshake::{RANDOM_LEN, TLS_1_2};
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::{Server, ServerConfig, send};
 
 const HRR_RANDOM: [u8; RANDOM_LEN] = [
@@ -32,7 +32,7 @@ fn signing_key() -> SigningKey {
 
 fn rpk_client() -> Client<fn() -> u64> {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },

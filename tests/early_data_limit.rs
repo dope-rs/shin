@@ -1,11 +1,11 @@
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::client::config::{Config, Resumption, Verifier};
 use shin::connection::{Clock, Epoch, Error};
 use shin::crypto::sig::SigningKey;
 use shin::server::{config::CertSource, config::EarlyDataGuard};
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{Server, ServerConfig, find_send};
 
@@ -65,7 +65,7 @@ fn server(accept: bool) -> Server<TestGuard, TestGuard> {
 
 fn client(resumption: Option<Resumption>, enable_early_data: bool) -> Client<fn() -> u64> {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },

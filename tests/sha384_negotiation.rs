@@ -1,5 +1,5 @@
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::client::config::{Config, Verifier};
 use shin::connection::{Epoch, Error};
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
@@ -10,7 +10,7 @@ use shin::wire::handshake::frame::Frame;
 use shin::wire::record::CipherSuite;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{FixedClock, Server, ServerConfig, send};
 
@@ -37,7 +37,7 @@ fn server() -> Server<FixedClock> {
 
 fn client(suites: &[CipherSuite]) -> Client<fn() -> u64> {
     let mut c = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },

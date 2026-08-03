@@ -5,7 +5,7 @@
 //! that both the real server and the real client agree on that transcript.
 
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Resumption, Verifier};
+use shin::client::config::{Config, Resumption, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::hash::{HashAlg, Transcript};
 use shin::crypto::sig::SigningKey;
@@ -18,7 +18,7 @@ use shin::wire::handshake::{HELLO_RETRY_REQUEST_RANDOM, RANDOM_LEN, TLS_1_2};
 use shin::wire::psk::ResumptionBinder;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{FixedClock, Server, ServerConfig, send};
 
@@ -49,7 +49,7 @@ fn fresh_server() -> Server<FixedClock> {
 
 fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },

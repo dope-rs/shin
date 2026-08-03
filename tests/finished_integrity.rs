@@ -5,13 +5,13 @@
 
 use ring::rand::{SecureRandom, SystemRandom};
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::client::config::{Config, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{Server, ServerConfig};
 
@@ -46,7 +46,7 @@ fn client_finished_and_server() -> (TestServer, Vec<u8>) {
         || 0,
     );
     let mut client = Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },

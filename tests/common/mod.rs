@@ -7,15 +7,14 @@ use std::ops::{Deref, DerefMut};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use shin::connection::{
-    Clock, DriveError, Epoch, Error, Event as BorrowedEvent, EventContext, EventSink, KeyDirection,
+    self, Clock, DriveError, Epoch, Error, EventContext, EventSink, KeyDirection,
 };
 use shin::crypto::hash::Digest;
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::TicketKeys;
 use shin::server::{
-    Server as Connection, Shard, config::CertSource, config::ClientAuth,
-    config::ClientCertVerifier, config::Config as ShardConfig, config::ConnectionConfig,
-    config::EarlyDataGuard, config::NoClientAuth, config::NoGuard,
+    self, Shard, config, config::CertSource, config::ClientAuth, config::ClientCertVerifier,
+    config::ConnectionConfig, config::EarlyDataGuard, config::NoClientAuth, config::NoGuard,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,15 +62,15 @@ impl EventSink for Events {
 
     fn event(
         &mut self,
-        event: BorrowedEvent<'_>,
+        event: connection::Event<'_>,
         _context: EventContext,
     ) -> Result<(), Self::Error> {
         let event = match event {
-            BorrowedEvent::Send { epoch, data } => Event::Send {
+            connection::Event::Send { epoch, data } => Event::Send {
                 epoch,
                 data: data.to_vec(),
             },
-            BorrowedEvent::KeysReady {
+            connection::Event::KeysReady {
                 epoch,
                 read_secret,
                 write_secret,
@@ -80,14 +79,14 @@ impl EventSink for Events {
                 read_secret,
                 write_secret,
             },
-            BorrowedEvent::PeerExtension { ty, data } => Event::PeerExtension {
+            connection::Event::PeerExtension { ty, data } => Event::PeerExtension {
                 ty,
                 data: data.to_vec(),
             },
-            BorrowedEvent::KeyUpdate { direction, secret } => {
+            connection::Event::KeyUpdate { direction, secret } => {
                 Event::KeyUpdate { direction, secret }
             }
-            BorrowedEvent::NewSessionTicket {
+            connection::Event::NewSessionTicket {
                 ticket_lifetime,
                 ticket_age_add,
                 ticket_nonce,
@@ -100,11 +99,11 @@ impl EventSink for Events {
                 ticket: ticket.to_vec(),
                 max_early_data,
             },
-            BorrowedEvent::ResumptionSecret { psk } => Event::ResumptionSecret { psk },
-            BorrowedEvent::ZeroRttKeysReady { secret } => Event::ZeroRttKeysReady { secret },
-            BorrowedEvent::EarlyDataAccepted => Event::EarlyDataAccepted,
-            BorrowedEvent::EarlyDataRejected => Event::EarlyDataRejected,
-            BorrowedEvent::Done => Event::Done,
+            connection::Event::ResumptionSecret { psk } => Event::ResumptionSecret { psk },
+            connection::Event::ZeroRttKeysReady { secret } => Event::ZeroRttKeysReady { secret },
+            connection::Event::EarlyDataAccepted => Event::EarlyDataAccepted,
+            connection::Event::EarlyDataRejected => Event::EarlyDataRejected,
+            connection::Event::Done => Event::Done,
         };
         self.0.push(event);
         Ok(())
@@ -146,7 +145,7 @@ pub trait CollectServerEvents<G: EarlyDataGuard, V: ClientCertVerifier> {
     ) -> Result<Vec<Event>, Error>;
 }
 
-impl<C, G, V> CollectServerEvents<G, V> for Connection<C>
+impl<C, G, V> CollectServerEvents<G, V> for server::Server<C>
 where
     C: Clock,
     G: EarlyDataGuard,
@@ -200,9 +199,9 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    fn split(self) -> (ShardConfig, ConnectionConfig, bool) {
+    fn split(self) -> (config::Config, ConnectionConfig, bool) {
         (
-            ShardConfig {
+            config::Config {
                 source: self.source,
                 alpn_protocols: self.alpn_protocols,
                 ticket_keys: self.ticket_keys,
@@ -224,7 +223,7 @@ impl ServerConfig {
 trait Policy<C: Clock> {
     fn read(
         &mut self,
-        connection: &mut Connection<C>,
+        connection: &mut server::Server<C>,
         epoch: Epoch,
         data: &[u8],
         events: &mut Events,
@@ -241,7 +240,7 @@ where
 {
     fn read(
         &mut self,
-        connection: &mut Connection<C>,
+        connection: &mut server::Server<C>,
         epoch: Epoch,
         data: &[u8],
         events: &mut Events,
@@ -251,7 +250,7 @@ where
 }
 
 pub struct Server<C: Clock, G = NoGuard, V = NoClientAuth> {
-    connection: Connection<C>,
+    connection: server::Server<C>,
     policy: Box<dyn Policy<C>>,
     _types: PhantomData<fn() -> (G, V)>,
 }
@@ -274,7 +273,7 @@ where
 {
     pub fn with_early_data_guard(config: ServerConfig, clock: C, guard: G) -> Self {
         let (shard_config, connection_config, accept_early_data) = config.split();
-        let connection = Connection::new(connection_config, clock);
+        let connection = server::Server::new(connection_config, clock);
         let policy: Box<dyn Policy<C>> = if accept_early_data {
             Box::new(OwnedShard(Shard::with_early_data_guard(
                 shard_config,
@@ -312,7 +311,7 @@ impl<C: Clock, G, V> Server<C, G, V> {
         P: Policy<C> + 'static,
     {
         Self {
-            connection: Connection::new(connection_config, clock),
+            connection: server::Server::new(connection_config, clock),
             policy: Box::new(policy),
             _types: PhantomData,
         }
@@ -324,7 +323,7 @@ impl<C: Clock, G, V> Server<C, G, V> {
 }
 
 impl<C: Clock, G, V> Deref for Server<C, G, V> {
-    type Target = Connection<C>;
+    type Target = server::Server<C>;
 
     fn deref(&self) -> &Self::Target {
         &self.connection

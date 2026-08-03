@@ -4,9 +4,7 @@ use std::convert::Infallible;
 
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use shin::client::Client;
-use shin::client::config::{
-    ClientCertSource, Config as ClientConfig, OwnedTrustAnchor, Resumption, Verifier,
-};
+use shin::client::config::{ClientCertSource, Config, OwnedTrustAnchor, Resumption, Verifier};
 use shin::connection::{DriveError, Epoch, Error, Event, EventContext, EventSink, WorkspaceRegion};
 use shin::crypto::kx::KexGroup;
 use shin::crypto::sig::SigningKey;
@@ -15,10 +13,10 @@ use shin::identity::asn1::{Reader, Tag};
 use shin::identity::cert::Cert;
 use shin::identity::spki::SubjectPublicKey;
 use shin::server::{
-    Server, Shard, config::CertSource, config::ClientAuth, config::ClientCertVerifier,
-    config::ClientIdentity, config::Config as ServerConfig, config::ConnectionConfig,
+    Server, Shard, config, config::CertSource, config::ClientAuth, config::ClientCertVerifier,
+    config::ClientIdentity, config::ConnectionConfig,
 };
-use shin::wire::codec::Reader as CodecReader;
+use shin::wire::codec;
 use shin::wire::extension::ExtensionType;
 use shin::wire::handshake::MAX_HANDSHAKE_SIZE;
 use shin::wire::handshake::frame::Frame;
@@ -208,7 +206,7 @@ fn rpk_handshake_has_no_allocations_after_construction() {
         .encode()
         .unwrap();
     let mut shard = Shard::with_client_auth(
-        ServerConfig {
+        config::Config {
             source: CertSource::RawPublicKey { signing_key },
             alpn_protocols: Vec::new(),
             ticket_keys: None,
@@ -224,7 +222,7 @@ fn rpk_handshake_has_no_allocations_after_construction() {
         workspace(),
     );
     let mut client = Client::with_workspace(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -304,7 +302,7 @@ fn x509_handshake_has_no_allocations_after_construction() {
         spki_der: cert.spki.raw_der.to_vec(),
     };
     let mut shard = Shard::with_client_auth(
-        ServerConfig {
+        config::Config {
             source: CertSource::X509 {
                 chain_der: vec![cert_der],
                 signing_key,
@@ -323,7 +321,7 @@ fn x509_handshake_has_no_allocations_after_construction() {
         workspace(),
     );
     let mut client = Client::with_workspace(
-        ClientConfig {
+        Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: b"host.local".to_vec(),
@@ -396,7 +394,7 @@ fn x509_handshake_has_no_allocations_after_construction() {
 fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
     let signing_key = SigningKey::from_seed(&[8; 32]).unwrap();
     let server_pubkey = *signing_key.pubkey().unwrap();
-    let mut shard = Shard::new(ServerConfig {
+    let mut shard = Shard::new(config::Config {
         source: CertSource::RawPublicKey { signing_key },
         alpn_protocols: vec![b"h3".to_vec()],
         ticket_keys: Some(TicketKeys::single([9; 32])),
@@ -409,7 +407,7 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
         workspace(),
     );
     let mut client = Client::with_workspace(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -496,7 +494,7 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
         workspace(),
     );
     let mut resumed_client = Client::with_workspace(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -562,7 +560,7 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
     let signing_key = SigningKey::from_seed(&[10; 32]).unwrap();
     let server_pubkey = *signing_key.pubkey().unwrap();
     let mut client = Client::with_workspace(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -586,7 +584,7 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
         )))
     );
 
-    let mut shard = Shard::new(ServerConfig {
+    let mut shard = Shard::new(config::Config {
         source: CertSource::RawPublicKey { signing_key },
         alpn_protocols: Vec::new(),
         ticket_keys: None,
@@ -616,7 +614,7 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
         .encode()
         .unwrap();
     let mut shard = Shard::with_client_auth(
-        ServerConfig {
+        config::Config {
             source: CertSource::RawPublicKey {
                 signing_key: server_signing_key,
             },
@@ -634,7 +632,7 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
         HandshakeWorkspace::new(16 * 1024, 16 * 1024, 0),
     );
     let mut client = Client::with_workspace(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -693,7 +691,7 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
 fn hello_retry_request_has_no_allocations() {
     let signing_key = SigningKey::from_seed(&[11; 32]).unwrap();
     let server_pubkey = *signing_key.pubkey().unwrap();
-    let mut shard = Shard::new(ServerConfig {
+    let mut shard = Shard::new(config::Config {
         source: CertSource::RawPublicKey { signing_key },
         alpn_protocols: Vec::new(),
         ticket_keys: None,
@@ -706,7 +704,7 @@ fn hello_retry_request_has_no_allocations() {
         workspace(),
     );
     let mut client = Client::with_workspace(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
@@ -723,7 +721,7 @@ fn hello_retry_request_has_no_allocations() {
     let mut server_wire = Wire::reserved();
     client.start_into(&mut client_wire).unwrap();
 
-    let mut reader = CodecReader::new(&client_wire.plaintext);
+    let mut reader = codec::Reader::new(&client_wire.plaintext);
     let Frame::ClientHello(mut hello) = Frame::decode(&mut reader).unwrap() else {
         panic!("client did not emit ClientHello");
     };

@@ -1,5 +1,5 @@
 use shin::client::Client;
-use shin::client::config::{Config as ClientConfig, Verifier};
+use shin::client::config::{Config, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
@@ -9,7 +9,7 @@ use shin::wire::handshake::HELLO_RETRY_REQUEST_RANDOM;
 use shin::wire::handshake::frame::Frame;
 
 mod common;
-use common::CollectEvents as _;
+use common::CollectEvents;
 use common::Event;
 use common::{Server, ServerConfig, send};
 
@@ -34,7 +34,7 @@ fn server() -> Server<fn() -> u64> {
 
 fn client() -> Client<fn() -> u64> {
     Client::new(
-        ClientConfig {
+        Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: *signing_key().pubkey().unwrap(),
             },
