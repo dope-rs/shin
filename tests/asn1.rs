@@ -24,13 +24,19 @@ fn long_form_length_two_bytes() {
 #[test]
 fn long_form_minimal_check_rejects_redundant_short() {
     let bytes = [0x04, 0x81, 0x7f];
-    assert_eq!(Reader::new(&bytes).next().unwrap_err(), DerError::BadLength);
+    assert_eq!(
+        Reader::new(&bytes).read_tlv().unwrap_err(),
+        DerError::BadLength
+    );
 }
 
 #[test]
 fn indefinite_length_rejected() {
     let bytes = [0x04, 0x80];
-    assert_eq!(Reader::new(&bytes).next().unwrap_err(), DerError::BadLength);
+    assert_eq!(
+        Reader::new(&bytes).read_tlv().unwrap_err(),
+        DerError::BadLength
+    );
 }
 
 #[test]
@@ -140,14 +146,20 @@ fn trailing_garbage_rejected_by_finish() {
 #[test]
 fn underflow_when_length_exceeds_buffer() {
     let bytes = [0x04, 0x05, 0x01, 0x02];
-    assert_eq!(Reader::new(&bytes).next().unwrap_err(), DerError::Underflow);
+    assert_eq!(
+        Reader::new(&bytes).read_tlv().unwrap_err(),
+        DerError::Underflow
+    );
 }
 
 #[test]
 fn long_form_leading_zero_length_rejected() {
     let mut bytes = vec![0x04, 0x82, 0x00, 0xff];
     bytes.extend(std::iter::repeat_n(0xaa, 0xff));
-    assert_eq!(Reader::new(&bytes).next().unwrap_err(), DerError::BadLength);
+    assert_eq!(
+        Reader::new(&bytes).read_tlv().unwrap_err(),
+        DerError::BadLength
+    );
 }
 
 #[test]

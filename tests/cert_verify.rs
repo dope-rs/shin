@@ -20,7 +20,7 @@ fn self_signed(alg: &'static SignatureAlgorithm, name: &str) -> Vec<u8> {
 fn verify_self_signed_ecdsa_p256() {
     let der = self_signed(&PKCS_ECDSA_P256_SHA256, "ec256.local");
     let cert = Cert::parse(&der).unwrap();
-    cert.verify_signature(&cert.spki)
+    cert.verify_signature(&cert.tbs.spki)
         .expect("self-sig verifies");
 }
 
@@ -28,7 +28,7 @@ fn verify_self_signed_ecdsa_p256() {
 fn verify_self_signed_ecdsa_p384() {
     let der = self_signed(&PKCS_ECDSA_P384_SHA384, "ec384.local");
     let cert = Cert::parse(&der).unwrap();
-    cert.verify_signature(&cert.spki)
+    cert.verify_signature(&cert.tbs.spki)
         .expect("self-sig verifies");
 }
 
@@ -36,7 +36,7 @@ fn verify_self_signed_ecdsa_p384() {
 fn verify_self_signed_ed25519() {
     let der = self_signed(&PKCS_ED25519, "ed25519.local");
     let cert = Cert::parse(&der).unwrap();
-    cert.verify_signature(&cert.spki)
+    cert.verify_signature(&cert.tbs.spki)
         .expect("self-sig verifies");
 }
 
@@ -49,7 +49,7 @@ fn tampered_signature_rejected() {
     hacked[last] ^= 0x01;
     let cert2 = Cert::parse(&hacked).unwrap();
     assert_eq!(
-        cert2.verify_signature(&cert2.spki).unwrap_err(),
+        cert2.verify_signature(&cert2.tbs.spki).unwrap_err(),
         VerifyError::Failed
     );
 }
@@ -61,7 +61,7 @@ fn issuer_with_wrong_key_family_rejected() {
     let ec = Cert::parse(&ec_der).unwrap();
     let ed = Cert::parse(&ed_der).unwrap();
     assert_eq!(
-        ec.verify_signature(&ed.spki).unwrap_err(),
+        ec.verify_signature(&ed.tbs.spki).unwrap_err(),
         VerifyError::AlgorithmMismatch
     );
 }

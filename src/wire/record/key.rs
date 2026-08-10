@@ -1,35 +1,36 @@
-use core::ops::Deref;
+use core::ops;
 
-use crate::crypto::aead::AeadKey;
-use crate::crypto::schedule::TrafficKeys;
+use crate::crypto::aead;
 
-use super::{CipherSuite, RecordKeyError};
-
-pub(super) struct Key(AeadKey);
+pub(super) struct Key(aead::Key);
 
 impl Key {
-    pub(super) fn derive(secret: &[u8], suite: CipherSuite) -> Result<Self, RecordKeyError> {
+    pub(super) fn derive(
+        secret: &[u8],
+        suite: super::CipherSuite,
+    ) -> Result<Self, super::KeyError> {
+        use crate::crypto::schedule::TrafficKeys;
         let alg = suite.hash_alg();
         let key = match suite {
-            CipherSuite::Aes128GcmSha256 => {
+            super::CipherSuite::Aes128GcmSha256 => {
                 let keys = TrafficKeys::<16>::derive(alg, secret)?;
-                AeadKey::aes_128_gcm(&keys.key, keys.iv)?
+                aead::Key::aes_128_gcm(&keys.key, keys.iv)?
             }
-            CipherSuite::ChaCha20Poly1305Sha256 => {
+            super::CipherSuite::ChaCha20Poly1305Sha256 => {
                 let keys = TrafficKeys::<32>::derive(alg, secret)?;
-                AeadKey::chacha20_poly1305(&keys.key, keys.iv)?
+                aead::Key::chacha20_poly1305(&keys.key, keys.iv)?
             }
-            CipherSuite::Aes256GcmSha384 => {
+            super::CipherSuite::Aes256GcmSha384 => {
                 let keys = TrafficKeys::<32>::derive(alg, secret)?;
-                AeadKey::aes_256_gcm(&keys.key, keys.iv)?
+                aead::Key::aes_256_gcm(&keys.key, keys.iv)?
             }
         };
         Ok(Self(key))
     }
 }
 
-impl Deref for Key {
-    type Target = AeadKey;
+impl ops::Deref for Key {
+    type Target = aead::Key;
 
     fn deref(&self) -> &Self::Target {
         &self.0

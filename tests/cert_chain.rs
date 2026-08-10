@@ -3,9 +3,9 @@ use rcgen::{
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 
+use shin::identity::UnixTime;
 use shin::identity::cert::Cert;
-use shin::identity::chain::{Chain, ChainError, TrustAnchor};
-use shin::identity::time::UnixTime;
+use shin::identity::chain::{Chain, Error, TrustAnchor};
 
 fn self_signed_leaf(dns: &[&str]) -> Vec<u8> {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -35,8 +35,8 @@ fn self_signed_ip_leaf(ip: &str) -> Vec<u8> {
 }
 
 fn now_for(leaf: &Cert<'_>) -> UnixTime {
-    let nb = UnixTime::from_time_value(&leaf.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&leaf.validity.not_after).unwrap();
+    let nb = UnixTime::from_time_value(&leaf.tbs.validity.not_before).unwrap();
+    let na = UnixTime::from_time_value(&leaf.tbs.validity.not_after).unwrap();
     UnixTime((nb.0 + na.0) / 2)
 }
 
@@ -54,7 +54,7 @@ fn validates_self_signed_leaf_with_ipv6_san() {
         Chain::new(&chain)
             .validate(&anchors, now, b"2001:db8::2")
             .unwrap_err(),
-        ChainError::HostnameMismatch,
+        Error::HostnameMismatch,
     );
 }
 
@@ -87,7 +87,7 @@ fn ipv6_san_rejects_dns_reference_and_vice_versa() {
         Chain::new(&ip_chain)
             .validate(&ip_anchors, ip_now, b"example.com")
             .unwrap_err(),
-        ChainError::HostnameMismatch
+        Error::HostnameMismatch
     );
 
     let dns_der = self_signed_leaf(&["host.local"]);
@@ -99,7 +99,7 @@ fn ipv6_san_rejects_dns_reference_and_vice_versa() {
         Chain::new(&dns_chain)
             .validate(&dns_anchors, dns_now, b"2001:db8::1")
             .unwrap_err(),
-        ChainError::HostnameMismatch
+        Error::HostnameMismatch
     );
 }
 
@@ -115,14 +115,14 @@ fn ipv4_mapped_and_distinct_ipv6_do_not_collide() {
         Chain::new(&chain)
             .validate(&anchors, now, b"2001:db8::1:0")
             .unwrap_err(),
-        ChainError::HostnameMismatch
+        Error::HostnameMismatch
     );
     // Garbage that is neither a valid IP nor a DNS label must not match.
     assert_eq!(
         Chain::new(&chain)
             .validate(&anchors, now, b"2001:db8::zz")
             .unwrap_err(),
-        ChainError::HostnameMismatch
+        Error::HostnameMismatch
     );
 }
 
@@ -151,7 +151,7 @@ fn rejects_unknown_anchor() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::NoTrustAnchor
+        Error::NoTrustAnchor
     );
 }
 
@@ -166,7 +166,7 @@ fn rejects_hostname_mismatch() {
         Chain::new(&chain)
             .validate(&anchors, now, b"other.local")
             .unwrap_err(),
-        ChainError::HostnameMismatch
+        Error::HostnameMismatch
     );
 }
 
@@ -174,7 +174,7 @@ fn rejects_hostname_mismatch() {
 fn rejects_expired_cert() {
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
-    let na = UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     let beyond = UnixTime(na.0 + 60);
@@ -182,7 +182,7 @@ fn rejects_expired_cert() {
         Chain::new(&chain)
             .validate(&anchors, beyond, b"host.local")
             .unwrap_err(),
-        ChainError::Expired
+        Error::Expired
     );
 }
 
@@ -191,8 +191,8 @@ fn validity_boundaries_are_inclusive() {
     // RFC 5280 §4.1.2.5: notBefore and notAfter are both inclusive.
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
-    let nb = UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
+    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     Chain::new(&chain)
@@ -205,13 +205,13 @@ fn validity_boundaries_are_inclusive() {
         Chain::new(&chain)
             .validate(&anchors, UnixTime(nb.0 - 1), b"host.local")
             .unwrap_err(),
-        ChainError::NotYetValid
+        Error::NotYetValid
     );
     assert_eq!(
         Chain::new(&chain)
             .validate(&anchors, UnixTime(na.0 + 1), b"host.local")
             .unwrap_err(),
-        ChainError::Expired
+        Error::Expired
     );
 }
 
@@ -219,7 +219,7 @@ fn validity_boundaries_are_inclusive() {
 fn rejects_not_yet_valid() {
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
-    let nb = UnixTime::from_time_value(&cert.validity.not_before).unwrap();
+    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
     let chain = [cert.clone()];
     let anchors = [TrustAnchor::from_cert(&cert)];
     let earlier = UnixTime(nb.0.saturating_sub(60));
@@ -227,7 +227,7 @@ fn rejects_not_yet_valid() {
         Chain::new(&chain)
             .validate(&anchors, earlier, b"host.local")
             .unwrap_err(),
-        ChainError::NotYetValid
+        Error::NotYetValid
     );
 }
 
@@ -245,7 +245,7 @@ fn rejects_ca_marked_cert_as_leaf() {
         Chain::new(&chain)
             .validate(&anchors, now, b"ca.local")
             .unwrap_err(),
-        ChainError::NotEndEntity
+        Error::NotEndEntity
     );
 }
 
@@ -264,7 +264,7 @@ fn rejects_missing_server_auth_eku() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::NoServerAuth
+        Error::NoServerAuth
     );
 }
 
@@ -291,7 +291,7 @@ fn rejects_unknown_critical_extension() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::UnhandledCriticalExtension
+        Error::UnhandledCriticalExtension
     );
 }
 
@@ -355,7 +355,7 @@ fn rejects_issuer_subject_dn_mismatch() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::IssuerSubjectMismatch
+        Error::IssuerSubjectMismatch
     );
 }
 

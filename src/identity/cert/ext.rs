@@ -1,13 +1,11 @@
-use arrayvec::ArrayVec;
+use crate::identity::asn1;
+use crate::identity::cert;
 
-use crate::identity::asn1::{DerError, Reader, Tag, Tlv};
-use crate::identity::cert::CertError;
-
-pub const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
-pub const OID_EXT_SAN: &[u8] = &[0x55, 0x1d, 0x11];
-pub const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
-pub const OID_EXT_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
-pub const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+pub const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+pub const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
+pub const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+pub const OID_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+pub const OID_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 
 pub const OID_EKU_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 pub const OID_EKU_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
@@ -25,30 +23,30 @@ impl ExtensionEntry<'_> {
     pub fn is_handled(oid: &[u8]) -> bool {
         matches!(
             oid,
-            OID_EXT_KEY_USAGE
-                | OID_EXT_SAN
-                | OID_EXT_BASIC_CONSTRAINTS
-                | OID_EXT_NAME_CONSTRAINTS
-                | OID_EXT_EXTENDED_KEY_USAGE
+            OID_KEY_USAGE
+                | OID_SUBJECT_ALT_NAME
+                | OID_BASIC_CONSTRAINTS
+                | OID_NAME_CONSTRAINTS
+                | OID_EXTENDED_KEY_USAGE
         )
     }
 }
 
 pub struct ExtensionIter<'a> {
-    reader: Reader<'a>,
+    reader: asn1::Reader<'a>,
 }
 
 impl<'a> ExtensionIter<'a> {
     pub fn new(extensions_der: &'a [u8]) -> Self {
         Self {
-            reader: Reader::new(extensions_der),
+            reader: asn1::Reader::new(extensions_der),
         }
     }
 
     pub fn find(
         extensions_der: &'a [u8],
         oid: &[u8],
-    ) -> Result<Option<(bool, &'a [u8])>, CertError> {
+    ) -> Result<Option<(bool, &'a [u8])>, cert::Error> {
         for ext in Self::new(extensions_der) {
             let ext = ext?;
             if ext.oid == oid {
@@ -58,16 +56,16 @@ impl<'a> ExtensionIter<'a> {
         Ok(None)
     }
 
-    fn parse_entry(&mut self) -> Result<ExtensionEntry<'a>, CertError> {
-        let inner = self.reader.read_tagged(Tag::SEQUENCE)?;
-        let mut r = Reader::new(inner);
-        let oid = r.read_tagged(Tag::OID)?;
-        let critical = if r.peek_tag() == Some(Tag::BOOLEAN) {
-            Tlv::boolean(r.read_tagged(Tag::BOOLEAN)?).map_err(CertError::Der)?
+    fn parse_entry(&mut self) -> Result<ExtensionEntry<'a>, cert::Error> {
+        let inner = self.reader.read_tagged(asn1::Tag::SEQUENCE)?;
+        let mut r = asn1::Reader::new(inner);
+        let oid = r.read_tagged(asn1::Tag::OID)?;
+        let critical = if r.peek_tag() == Some(asn1::Tag::BOOLEAN) {
+            asn1::Tlv::boolean(r.read_tagged(asn1::Tag::BOOLEAN)?).map_err(cert::Error::Der)?
         } else {
             false
         };
-        let value = r.read_tagged(Tag::OCTET_STRING)?;
+        let value = r.read_tagged(asn1::Tag::OCTET_STRING)?;
         r.finish()?;
         Ok(ExtensionEntry {
             oid,
@@ -78,7 +76,7 @@ impl<'a> ExtensionIter<'a> {
 }
 
 impl<'a> Iterator for ExtensionIter<'a> {
-    type Item = Result<ExtensionEntry<'a>, CertError>;
+    type Item = Result<ExtensionEntry<'a>, cert::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.reader.is_empty() {
@@ -95,24 +93,24 @@ pub struct BasicConstraints {
 }
 
 impl BasicConstraints {
-    pub fn parse(value: &[u8]) -> Result<Self, CertError> {
-        let mut r = Reader::new(value);
-        let inner = r.read_tagged(Tag::SEQUENCE)?;
+    pub fn parse(value: &[u8]) -> Result<Self, cert::Error> {
+        let mut r = asn1::Reader::new(value);
+        let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
         r.finish()?;
-        let mut ir = Reader::new(inner);
-        let ca = if ir.peek_tag() == Some(Tag::BOOLEAN) {
-            if !Tlv::boolean(ir.read_tagged(Tag::BOOLEAN)?).map_err(CertError::Der)? {
-                return Err(CertError::Der(DerError::BadBool));
+        let mut ir = asn1::Reader::new(inner);
+        let ca = if ir.peek_tag() == Some(asn1::Tag::BOOLEAN) {
+            if !asn1::Tlv::boolean(ir.read_tagged(asn1::Tag::BOOLEAN)?).map_err(cert::Error::Der)? {
+                return Err(cert::Error::Der(asn1::DerError::BadBool));
             }
             true
         } else {
             false
         };
-        let path_len_constraint = if ir.peek_tag() == Some(Tag::INTEGER) {
+        let path_len_constraint = if ir.peek_tag() == Some(asn1::Tag::INTEGER) {
             if !ca {
-                return Err(CertError::Der(DerError::Mismatch));
+                return Err(cert::Error::Der(asn1::DerError::Mismatch));
             }
-            Some(Tlv::integer_u64(ir.read_tagged(Tag::INTEGER)?)?)
+            Some(asn1::Tlv::integer_u64(ir.read_tagged(asn1::Tag::INTEGER)?)?)
         } else {
             None
         };
@@ -148,35 +146,35 @@ impl KeyUsage {
         self.bits
     }
 
-    pub fn parse(value: &[u8]) -> Result<Self, CertError> {
-        let mut r = Reader::new(value);
-        let bs = r.read_tagged(Tag::BIT_STRING)?;
+    pub fn parse(value: &[u8]) -> Result<Self, cert::Error> {
+        let mut r = asn1::Reader::new(value);
+        let bs = r.read_tagged(asn1::Tag::BIT_STRING)?;
         r.finish()?;
         if bs.is_empty() {
-            return Err(CertError::Der(DerError::BadBitString));
+            return Err(cert::Error::Der(asn1::DerError::BadBitString));
         }
         let unused = bs[0] as usize;
         if unused > 7 {
-            return Err(CertError::Der(DerError::BadBitString));
+            return Err(cert::Error::Der(asn1::DerError::BadBitString));
         }
         let content = &bs[1..];
         if content.is_empty() {
             if unused != 0 {
-                return Err(CertError::Der(DerError::BadBitString));
+                return Err(cert::Error::Der(asn1::DerError::BadBitString));
             }
             return Ok(Self { bits: 0 });
         }
         if content.len() > 2 {
-            return Err(CertError::Der(DerError::BadBitString));
+            return Err(cert::Error::Der(asn1::DerError::BadBitString));
         }
         let last = *content
             .last()
-            .ok_or(CertError::Der(DerError::BadBitString))?;
+            .ok_or(cert::Error::Der(asn1::DerError::BadBitString))?;
         if unused != 0 && last & ((1u16 << unused) - 1) as u8 != 0 {
-            return Err(CertError::Der(DerError::BadBitString));
+            return Err(cert::Error::Der(asn1::DerError::BadBitString));
         }
         if last == 0 {
-            return Err(CertError::Der(DerError::BadBitString));
+            return Err(cert::Error::Der(asn1::DerError::BadBitString));
         }
         let mut bits = 0u16;
         let b0 = content[0];
@@ -196,15 +194,15 @@ impl KeyUsage {
 
     pub fn parse_extended(
         value: &[u8],
-    ) -> Result<ArrayVec<&[u8], MAX_EXTENSION_VALUES>, CertError> {
-        let mut r = Reader::new(value);
-        let inner = r.read_tagged(Tag::SEQUENCE)?;
+    ) -> Result<arrayvec::ArrayVec<&[u8], MAX_EXTENSION_VALUES>, cert::Error> {
+        let mut r = asn1::Reader::new(value);
+        let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
         r.finish()?;
-        let mut out = ArrayVec::new();
-        let mut ir = Reader::new(inner);
+        let mut out = arrayvec::ArrayVec::new();
+        let mut ir = asn1::Reader::new(inner);
         while !ir.is_empty() {
-            out.try_push(ir.read_tagged(Tag::OID)?)
-                .map_err(|_| CertError::TooManyEntries)?;
+            out.try_push(ir.read_tagged(asn1::Tag::OID)?)
+                .map_err(|_| cert::Error::TooManyEntries)?;
         }
         Ok(out)
     }
@@ -220,17 +218,17 @@ pub enum GeneralName<'a> {
 impl<'a> GeneralName<'a> {
     pub fn parse_alt_names(
         value: &'a [u8],
-    ) -> Result<ArrayVec<Self, MAX_EXTENSION_VALUES>, CertError> {
-        let mut r = Reader::new(value);
-        let inner = r.read_tagged(Tag::SEQUENCE)?;
+    ) -> Result<arrayvec::ArrayVec<Self, MAX_EXTENSION_VALUES>, cert::Error> {
+        let mut r = asn1::Reader::new(value);
+        let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
         r.finish()?;
-        let mut ir = Reader::new(inner);
-        let mut out = ArrayVec::new();
+        let mut ir = asn1::Reader::new(inner);
+        let mut out = arrayvec::ArrayVec::new();
         while !ir.is_empty() {
-            let tlv = ir.next()?;
-            out.try_push(if tlv.tag == Tag::context(2, false) {
+            let tlv = ir.read_tlv()?;
+            out.try_push(if tlv.tag == asn1::Tag::context(2, false) {
                 Self::DnsName(tlv.contents)
-            } else if tlv.tag == Tag::context(7, false) {
+            } else if tlv.tag == asn1::Tag::context(7, false) {
                 Self::IpAddress(tlv.contents)
             } else {
                 Self::Other {
@@ -238,7 +236,7 @@ impl<'a> GeneralName<'a> {
                     value: tlv.contents,
                 }
             })
-            .map_err(|_| CertError::TooManyEntries)?;
+            .map_err(|_| cert::Error::TooManyEntries)?;
         }
         Ok(out)
     }
@@ -246,8 +244,8 @@ impl<'a> GeneralName<'a> {
 
 #[derive(Debug, Clone, Default)]
 pub struct Subtrees<'a> {
-    pub dns: ArrayVec<&'a [u8], MAX_EXTENSION_VALUES>,
-    pub ip: ArrayVec<&'a [u8], MAX_EXTENSION_VALUES>,
+    pub dns: arrayvec::ArrayVec<&'a [u8], MAX_EXTENSION_VALUES>,
+    pub ip: arrayvec::ArrayVec<&'a [u8], MAX_EXTENSION_VALUES>,
     pub has_unsupported: bool,
 }
 
@@ -258,36 +256,36 @@ pub struct NameConstraints<'a> {
 }
 
 impl<'a> NameConstraints<'a> {
-    pub fn parse(value: &'a [u8]) -> Result<Self, CertError> {
-        let mut r = Reader::new(value);
-        let inner = r.read_tagged(Tag::SEQUENCE)?;
+    pub fn parse(value: &'a [u8]) -> Result<Self, cert::Error> {
+        let mut r = asn1::Reader::new(value);
+        let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
         r.finish()?;
-        let mut ir = Reader::new(inner);
+        let mut ir = asn1::Reader::new(inner);
         let mut nc = Self::default();
-        if ir.peek_tag() == Some(Tag::context(0, true)) {
-            nc.permitted = Self::parse_subtrees(ir.next()?.contents)?;
+        if ir.peek_tag() == Some(asn1::Tag::context(0, true)) {
+            nc.permitted = Self::parse_subtrees(ir.read_tlv()?.contents)?;
         }
-        if ir.peek_tag() == Some(Tag::context(1, true)) {
-            nc.excluded = Self::parse_subtrees(ir.next()?.contents)?;
+        if ir.peek_tag() == Some(asn1::Tag::context(1, true)) {
+            nc.excluded = Self::parse_subtrees(ir.read_tlv()?.contents)?;
         }
         ir.finish()?;
         Ok(nc)
     }
 
-    fn parse_subtrees(bytes: &'a [u8]) -> Result<Subtrees<'a>, CertError> {
-        let mut r = Reader::new(bytes);
+    fn parse_subtrees(bytes: &'a [u8]) -> Result<Subtrees<'a>, cert::Error> {
+        let mut r = asn1::Reader::new(bytes);
         let mut out = Subtrees::default();
         while !r.is_empty() {
-            let subtree = r.read_tagged(Tag::SEQUENCE)?;
-            let base = Reader::new(subtree).next()?;
-            if base.tag == Tag::context(2, false) {
+            let subtree = r.read_tagged(asn1::Tag::SEQUENCE)?;
+            let base = asn1::Reader::new(subtree).read_tlv()?;
+            if base.tag == asn1::Tag::context(2, false) {
                 out.dns
                     .try_push(base.contents)
-                    .map_err(|_| CertError::TooManyEntries)?;
-            } else if base.tag == Tag::context(7, false) {
+                    .map_err(|_| cert::Error::TooManyEntries)?;
+            } else if base.tag == asn1::Tag::context(7, false) {
                 out.ip
                     .try_push(base.contents)
-                    .map_err(|_| CertError::TooManyEntries)?;
+                    .map_err(|_| cert::Error::TooManyEntries)?;
             } else {
                 out.has_unsupported = true;
             }

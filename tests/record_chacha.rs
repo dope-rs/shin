@@ -1,4 +1,4 @@
-use shin::wire::record::{CipherSuite, ContentType, Opener, RecordError, Sealer};
+use shin::wire::record::{CipherSuite, ContentType, Error, Opener, Sealer};
 
 const SECRET: [u8; 32] = [0x42u8; 32];
 
@@ -25,5 +25,5 @@ fn chacha_record_does_not_open_under_aes() {
 
     let mut wire = chacha.seal(ContentType::ApplicationData, b"data").unwrap();
     let mut wrong = Opener::with_suite(&SECRET, CipherSuite::Aes128GcmSha256).unwrap();
-    assert_eq!(wrong.open(&mut wire), Err(RecordError::OpenFailed));
+    assert_eq!(wrong.open(&mut wire), Err(Error::OpenFailed));
 }

@@ -1,49 +1,50 @@
-use crate::crypto::hash::{Digest, HASH_LEN, HashAlg, MAX_HASH_LEN, Secret, Transcript};
-use crate::crypto::kdf::{Hkdf, HkdfError};
-use crate::memory::bound::ThreadBound;
-use crate::wire::psk::RESUMPTION_HASH;
-use zeroize::Zeroize;
+use crate::crypto::hash;
+use crate::crypto::kdf;
+use crate::crypto::material;
+use crate::memory::threadbound;
+use crate::wire::psk;
+use zeroize::Zeroize as _;
 
-pub struct KeySchedule {
-    alg: HashAlg,
-    secret: Secret,
+pub struct Schedule {
+    alg: hash::Algorithm,
+    secret: hash::Secret,
 }
 
-impl Drop for KeySchedule {
+impl Drop for Schedule {
     fn drop(&mut self) {
         self.secret.as_mut_slice().zeroize();
     }
 }
 
-impl KeySchedule {
-    pub fn new(alg: HashAlg) -> Self {
-        let zero = [0u8; MAX_HASH_LEN];
+impl Schedule {
+    pub fn new(alg: hash::Algorithm) -> Self {
+        let zero = [0u8; hash::MAX_LEN];
         let z = &zero[..alg.output_len()];
         Self {
             alg,
-            secret: Hkdf::new(alg).extract(z, z),
+            secret: kdf::Hkdf::new(alg).extract(z, z),
         }
     }
 
-    pub fn new_psk(alg: HashAlg, psk: &[u8]) -> Self {
-        let zero = [0u8; MAX_HASH_LEN];
+    pub fn new_psk(alg: hash::Algorithm, psk: &[u8]) -> Self {
+        let zero = [0u8; hash::MAX_LEN];
         let z = &zero[..alg.output_len()];
         Self {
             alg,
-            secret: Hkdf::new(alg).extract(z, psk),
+            secret: kdf::Hkdf::new(alg).extract(z, psk),
         }
     }
 
-    pub fn hash_alg(&self) -> HashAlg {
+    pub fn hash_alg(&self) -> hash::Algorithm {
         self.alg
     }
 
-    pub fn into_handshake(self, dhe: &[u8]) -> Result<Self, HkdfError> {
-        let hkdf = Hkdf::new(self.alg);
+    pub fn into_handshake(self, dhe: &[u8]) -> Result<Self, kdf::HkdfError> {
+        let hkdf = kdf::Hkdf::new(self.alg);
         let derived = hkdf.derive_secret(
             self.secret.as_slice(),
             "derived",
-            Transcript::hash_empty(self.alg).as_slice(),
+            hash::Transcript::hash_empty(self.alg).as_slice(),
         )?;
         Ok(Self {
             alg: self.alg,
@@ -51,14 +52,14 @@ impl KeySchedule {
         })
     }
 
-    pub fn into_master(self) -> Result<Self, HkdfError> {
-        let hkdf = Hkdf::new(self.alg);
+    pub fn into_master(self) -> Result<Self, kdf::HkdfError> {
+        let hkdf = kdf::Hkdf::new(self.alg);
         let derived = hkdf.derive_secret(
             self.secret.as_slice(),
             "derived",
-            Transcript::hash_empty(self.alg).as_slice(),
+            hash::Transcript::hash_empty(self.alg).as_slice(),
         )?;
-        let zero = [0u8; MAX_HASH_LEN];
+        let zero = [0u8; hash::MAX_LEN];
         let z = &zero[..self.alg.output_len()];
         Ok(Self {
             alg: self.alg,
@@ -66,60 +67,78 @@ impl KeySchedule {
         })
     }
 
-    pub fn secret(&self) -> &Secret {
+    pub fn secret(&self) -> &hash::Secret {
         &self.secret
     }
 
     pub fn client_handshake_traffic_secret(
         &self,
         transcript_hash: &[u8],
-    ) -> Result<Secret, HkdfError> {
-        Hkdf::new(self.alg).derive_secret(self.secret.as_slice(), "c hs traffic", transcript_hash)
+    ) -> Result<material::TrafficSecret, kdf::HkdfError> {
+        kdf::Hkdf::new(self.alg)
+            .derive_secret(self.secret.as_slice(), "c hs traffic", transcript_hash)
+            .map(material::TrafficSecret::from_secret)
     }
 
     pub fn server_handshake_traffic_secret(
         &self,
         transcript_hash: &[u8],
-    ) -> Result<Secret, HkdfError> {
-        Hkdf::new(self.alg).derive_secret(self.secret.as_slice(), "s hs traffic", transcript_hash)
+    ) -> Result<material::TrafficSecret, kdf::HkdfError> {
+        kdf::Hkdf::new(self.alg)
+            .derive_secret(self.secret.as_slice(), "s hs traffic", transcript_hash)
+            .map(material::TrafficSecret::from_secret)
     }
 
     pub fn client_application_traffic_secret(
         &self,
         transcript_hash: &[u8],
-    ) -> Result<Secret, HkdfError> {
-        Hkdf::new(self.alg).derive_secret(self.secret.as_slice(), "c ap traffic", transcript_hash)
+    ) -> Result<material::TrafficSecret, kdf::HkdfError> {
+        kdf::Hkdf::new(self.alg)
+            .derive_secret(self.secret.as_slice(), "c ap traffic", transcript_hash)
+            .map(material::TrafficSecret::from_secret)
     }
 
     pub fn server_application_traffic_secret(
         &self,
         transcript_hash: &[u8],
-    ) -> Result<Secret, HkdfError> {
-        Hkdf::new(self.alg).derive_secret(self.secret.as_slice(), "s ap traffic", transcript_hash)
+    ) -> Result<material::TrafficSecret, kdf::HkdfError> {
+        kdf::Hkdf::new(self.alg)
+            .derive_secret(self.secret.as_slice(), "s ap traffic", transcript_hash)
+            .map(material::TrafficSecret::from_secret)
     }
 
-    pub fn resumption_master_secret(&self, transcript_hash: &[u8]) -> Result<Secret, HkdfError> {
-        Hkdf::new(self.alg).derive_secret(self.secret.as_slice(), "res master", transcript_hash)
+    pub fn resumption_master_secret(
+        &self,
+        transcript_hash: &[u8],
+    ) -> Result<material::ResumptionMasterSecret, kdf::HkdfError> {
+        kdf::Hkdf::new(self.alg)
+            .derive_secret(self.secret.as_slice(), "res master", transcript_hash)
+            .map(material::ResumptionMasterSecret::from_secret)
     }
 
     /// RFC 8446 §7.5: `exporter_master_secret`, derived from the master secret
     /// over the transcript through the server Finished.
-    pub fn exporter_master_secret(&self, transcript_hash: &[u8]) -> Result<Secret, HkdfError> {
-        Hkdf::new(self.alg).derive_secret(self.secret.as_slice(), "exp master", transcript_hash)
+    pub fn exporter_master_secret(
+        &self,
+        transcript_hash: &[u8],
+    ) -> Result<material::ExporterMasterSecret, kdf::HkdfError> {
+        kdf::Hkdf::new(self.alg)
+            .derive_secret(self.secret.as_slice(), "exp master", transcript_hash)
+            .map(material::ExporterMasterSecret::from_secret)
     }
 
     pub(crate) fn export_keying_material(
-        alg: HashAlg,
+        alg: hash::Algorithm,
         exporter_master: &[u8],
         label: &str,
         context: &[u8],
         out: &mut [u8],
-    ) -> Result<(), HkdfError> {
-        let hkdf = Hkdf::new(alg);
+    ) -> Result<(), kdf::HkdfError> {
+        let hkdf = kdf::Hkdf::new(alg);
         let secret = hkdf.derive_secret(
             exporter_master,
             label,
-            Transcript::hash_empty(alg).as_slice(),
+            hash::Transcript::hash_empty(alg).as_slice(),
         )?;
         let context_hash = alg.hash(context);
         hkdf.expand_label(secret.as_slice(), "exporter", context_hash.as_slice(), out)
@@ -128,38 +147,30 @@ impl KeySchedule {
     pub(crate) fn client_early_traffic_secret(
         psk: &[u8],
         transcript_hash: &[u8],
-    ) -> Result<Secret, HkdfError> {
-        let zero = [0u8; HASH_LEN];
-        let hkdf = Hkdf::new(RESUMPTION_HASH);
+    ) -> Result<material::TrafficSecret, kdf::HkdfError> {
+        let zero = [0u8; hash::SHA256_LEN];
+        let hkdf = kdf::Hkdf::new(psk::RESUMPTION_HASH);
         let early = hkdf.extract(&zero, psk);
         hkdf.derive_secret(early.as_slice(), "c e traffic", transcript_hash)
+            .map(material::TrafficSecret::from_secret)
     }
 }
 
-pub struct ResumptionMaster {
-    secret: [u8; HASH_LEN],
-    _thread: ThreadBound,
-}
+pub struct ResumptionMaster<'a>(&'a material::ResumptionMasterSecret);
 
-impl Drop for ResumptionMaster {
-    fn drop(&mut self) {
-        self.secret.zeroize();
-    }
-}
-
-impl ResumptionMaster {
-    pub fn from_secret(secret: &Digest) -> Self {
-        let mut bytes = [0u8; HASH_LEN];
-        bytes.copy_from_slice(secret.as_slice());
-        Self {
-            secret: bytes,
-            _thread: ThreadBound::NEW,
-        }
+impl<'a> ResumptionMaster<'a> {
+    pub fn from_secret(secret: &'a material::ResumptionMasterSecret) -> Self {
+        Self(secret)
     }
 
-    pub fn psk(&self, nonce: &[u8]) -> Result<[u8; HASH_LEN], HkdfError> {
-        let mut out = [0u8; HASH_LEN];
-        Hkdf::new(RESUMPTION_HASH).expand_label(&self.secret, "resumption", nonce, &mut out)?;
+    pub fn psk(&self, nonce: &[u8]) -> Result<material::ResumptionPsk, kdf::HkdfError> {
+        let mut out = material::ResumptionPsk::zeroed();
+        kdf::Hkdf::new(psk::RESUMPTION_HASH).expand_label(
+            self.0.as_slice(),
+            "resumption",
+            nonce,
+            out.as_mut_array(),
+        )?;
         Ok(out)
     }
 }
@@ -167,7 +178,7 @@ impl ResumptionMaster {
 pub struct TrafficKeys<const K: usize> {
     pub key: [u8; K],
     pub iv: [u8; 12],
-    _thread: ThreadBound,
+    _thread: threadbound::ThreadBound,
 }
 
 impl<const K: usize> Drop for TrafficKeys<K> {
@@ -178,16 +189,16 @@ impl<const K: usize> Drop for TrafficKeys<K> {
 }
 
 impl<const K: usize> TrafficKeys<K> {
-    pub fn derive(alg: HashAlg, secret: &[u8]) -> Result<Self, HkdfError> {
+    pub fn derive(alg: hash::Algorithm, secret: &[u8]) -> Result<Self, kdf::HkdfError> {
         let mut key = [0u8; K];
         let mut iv = [0u8; 12];
-        let hkdf = Hkdf::new(alg);
+        let hkdf = kdf::Hkdf::new(alg);
         hkdf.expand_label(secret, "key", &[], &mut key)?;
         hkdf.expand_label(secret, "iv", &[], &mut iv)?;
         Ok(Self {
             key,
             iv,
-            _thread: ThreadBound::NEW,
+            _thread: threadbound::ThreadBound::NEW,
         })
     }
 }

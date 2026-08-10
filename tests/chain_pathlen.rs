@@ -3,9 +3,9 @@ use rcgen::{
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 
+use shin::identity::UnixTime;
 use shin::identity::cert::Cert;
-use shin::identity::chain::{Chain, ChainError, TrustAnchor};
-use shin::identity::time::UnixTime;
+use shin::identity::chain::{Chain, Error, TrustAnchor};
 
 struct Ca {
     params: CertificateParams,
@@ -63,8 +63,8 @@ fn leaf(dns: &str, parent: &Ca) -> Vec<u8> {
 }
 
 fn mid_time(cert: &Cert<'_>) -> UnixTime {
-    let nb = UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
+    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
     UnixTime((nb.0 + na.0) / 2)
 }
 
@@ -74,7 +74,7 @@ fn chain_too_long_is_rejected() {
     let leaf_der = leaf("host.local", &r);
     let leaf_cert = Cert::parse(&leaf_der).unwrap();
     let anchor_cert = Cert::parse(&r.der).unwrap();
-    let chain: Vec<Cert<'_>> = (0..shin::identity::chain::MAX_CHAIN_LEN + 1)
+    let chain: Vec<Cert<'_>> = (0..shin::identity::chain::MAX_LEN + 1)
         .map(|_| leaf_cert.clone())
         .collect();
     let anchors = [TrustAnchor::from_cert(&anchor_cert)];
@@ -83,7 +83,7 @@ fn chain_too_long_is_rejected() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::ChainTooLong
+        Error::ChainTooLong
     );
 }
 
@@ -125,6 +125,6 @@ fn path_len_zero_intermediate_rejects_extra_intermediate() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::PathLenExceeded
+        Error::PathLenExceeded
     );
 }

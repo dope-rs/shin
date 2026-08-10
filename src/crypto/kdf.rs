@@ -1,7 +1,8 @@
-use crate::crypto::hash::{Digest, HashAlg, MAX_HASH_LEN, Secret};
-use zeroize::Zeroize;
+use crate::crypto::hash;
+use crate::crypto::material;
+use zeroize::Zeroize as _;
 
-use ring::hmac::{self, Context, Key};
+use ring::hmac;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HkdfError {
@@ -12,7 +13,7 @@ pub enum HkdfError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hkdf {
-    alg: HashAlg,
+    alg: hash::Algorithm,
 }
 
 const MAX_HKDF_LABEL_LEN: usize = 2 + 1 + u8::MAX as usize + 1 + u8::MAX as usize;
@@ -29,13 +30,13 @@ impl AsRef<[u8]> for HkdfLabel {
 }
 
 impl Hkdf {
-    pub fn new(alg: HashAlg) -> Self {
+    pub fn new(alg: hash::Algorithm) -> Self {
         Self { alg }
     }
 
-    pub fn extract(self, salt: &[u8], ikm: &[u8]) -> Secret {
-        let key = Key::new(self.alg.hmac(), salt);
-        Secret::from_slice(hmac::sign(&key, ikm).as_ref())
+    pub fn extract(self, salt: &[u8], ikm: &[u8]) -> hash::Secret {
+        let key = hmac::Key::new(self.alg.hmac(), salt);
+        hash::Secret::from_bounded_slice(hmac::sign(&key, ikm).as_ref())
     }
 
     pub fn expand(self, prk: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), HkdfError> {
@@ -45,11 +46,12 @@ impl Hkdf {
             return Err(HkdfError::OutputTooLong);
         }
 
-        let key = Key::new(self.alg.hmac(), prk);
-        let mut t_prev = [0u8; MAX_HASH_LEN];
+        let key = hmac::Key::new(self.alg.hmac(), prk);
+        let mut t_prev = [0u8; hash::MAX_LEN];
         let mut t_prev_len = 0;
         let mut written = 0;
         for counter in 1..=block_count {
+            use ring::hmac::Context;
             let mut ctx = Context::with_key(&key);
             ctx.update(&t_prev[..t_prev_len]);
             ctx.update(info);
@@ -82,17 +84,21 @@ impl Hkdf {
         prk: &[u8],
         label: &str,
         transcript_hash: &[u8],
-    ) -> Result<Secret, HkdfError> {
-        let mut buf = [0u8; MAX_HASH_LEN];
+    ) -> Result<hash::Secret, HkdfError> {
+        let mut buf = [0u8; hash::MAX_LEN];
         let out = &mut buf[..self.alg.output_len()];
         self.expand_label(prk, label, transcript_hash, out)?;
-        let secret = Secret::from_slice(out);
+        let secret = hash::Secret::from_bounded_slice(out);
         out.zeroize();
         Ok(secret)
     }
 
-    pub fn traffic_update(self, prev: &Digest) -> Result<Secret, HkdfError> {
+    pub fn traffic_update(
+        self,
+        prev: &material::TrafficSecret,
+    ) -> Result<material::TrafficSecret, HkdfError> {
         self.derive_secret(prev.as_slice(), "traffic upd", &[])
+            .map(material::TrafficSecret::from_secret)
     }
 
     fn hkdf_label(label: &str, context: &[u8], out_len: usize) -> Result<HkdfLabel, HkdfError> {

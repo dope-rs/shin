@@ -7,19 +7,16 @@ use shin::wire::handshake::messages::{Certificate, CertificateEntry};
 fn duplicate_extension_type_is_rejected() {
     // Two extensions with the same type (0x002b supported_versions).
     let mut body: Vec<u8> = Vec::new();
-    body.put_vec_u16(|o| {
-        o.put_u16(0x002b);
-        o.put_vec_u16(|d| {
-            d.put_u8(0);
-            Ok(())
-        })?;
-        o.put_u16(0x002b);
-        o.put_vec_u16(|d| {
-            d.put_u8(0);
-            Ok(())
-        })
-    })
-    .unwrap();
+    let mut extensions = body.begin_u16().unwrap();
+    extensions.put_u16(0x002b);
+    let mut data = extensions.begin_u16().unwrap();
+    data.put_u8(0);
+    data.finish().unwrap();
+    extensions.put_u16(0x002b);
+    let mut data = extensions.begin_u16().unwrap();
+    data.put_u8(0);
+    data.finish().unwrap();
+    extensions.finish().unwrap();
     let mut r = Reader::new(&body);
     assert_eq!(
         Extension::decode_list(&mut r).unwrap_err(),
@@ -30,19 +27,16 @@ fn duplicate_extension_type_is_rejected() {
 #[test]
 fn distinct_extensions_decode() {
     let mut body: Vec<u8> = Vec::new();
-    body.put_vec_u16(|o| {
-        o.put_u16(0x002b);
-        o.put_vec_u16(|d| {
-            d.put_u8(0);
-            Ok(())
-        })?;
-        o.put_u16(0x000a);
-        o.put_vec_u16(|d| {
-            d.put_u8(0);
-            Ok(())
-        })
-    })
-    .unwrap();
+    let mut extensions = body.begin_u16().unwrap();
+    extensions.put_u16(0x002b);
+    let mut data = extensions.begin_u16().unwrap();
+    data.put_u8(0);
+    data.finish().unwrap();
+    extensions.put_u16(0x000a);
+    let mut data = extensions.begin_u16().unwrap();
+    data.put_u8(0);
+    data.finish().unwrap();
+    extensions.finish().unwrap();
     let mut r = Reader::new(&body);
     let exts = Extension::decode_list(&mut r).unwrap();
     assert_eq!(exts.len(), 2);
@@ -52,17 +46,14 @@ fn distinct_extensions_decode() {
 fn too_many_extensions_rejected() {
     // Distinct extension types beyond the cap must be rejected.
     let mut body: Vec<u8> = Vec::new();
-    body.put_vec_u16(|o| {
-        for ty in 0..=(MAX_EXTENSIONS as u16) {
-            o.put_u16(0x8000 + ty);
-            o.put_vec_u16(|d| {
-                d.put_u8(0);
-                Ok(())
-            })?;
-        }
-        Ok(())
-    })
-    .unwrap();
+    let mut extensions = body.begin_u16().unwrap();
+    for ty in 0..=(MAX_EXTENSIONS as u16) {
+        extensions.put_u16(0x8000 + ty);
+        let mut data = extensions.begin_u16().unwrap();
+        data.put_u8(0);
+        data.finish().unwrap();
+    }
+    extensions.finish().unwrap();
     let mut r = Reader::new(&body);
     assert_eq!(
         Extension::decode_list(&mut r).unwrap_err(),
@@ -73,17 +64,14 @@ fn too_many_extensions_rejected() {
 #[test]
 fn max_extensions_accepted() {
     let mut body: Vec<u8> = Vec::new();
-    body.put_vec_u16(|o| {
-        for ty in 0..(MAX_EXTENSIONS as u16) {
-            o.put_u16(0x8000 + ty);
-            o.put_vec_u16(|d| {
-                d.put_u8(0);
-                Ok(())
-            })?;
-        }
-        Ok(())
-    })
-    .unwrap();
+    let mut extensions = body.begin_u16().unwrap();
+    for ty in 0..(MAX_EXTENSIONS as u16) {
+        extensions.put_u16(0x8000 + ty);
+        let mut data = extensions.begin_u16().unwrap();
+        data.put_u8(0);
+        data.finish().unwrap();
+    }
+    extensions.finish().unwrap();
     let mut r = Reader::new(&body);
     let exts = Extension::decode_list(&mut r).unwrap();
     assert_eq!(exts.len(), MAX_EXTENSIONS);

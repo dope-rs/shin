@@ -1,24 +1,21 @@
-use alloc::vec::Vec;
-use arrayvec::ArrayVec;
-
-use crate::connection::Error;
-use crate::wire::extension::{ExtensionType, Extensions};
-use crate::wire::proto::{Alpn, CERT_TYPE_RAW_PUBLIC_KEY, CERT_TYPE_X509, CertificateTypes};
-
-use super::CertSource;
+use crate::connection;
+use crate::server::config;
+use crate::wire::extension;
+use crate::wire::protocols;
+use alloc::vec;
 
 /// Parsed peer offers that gate response extensions independently of server
 /// configuration.
 pub(super) struct ClientHelloOffers<'a> {
     alpn: Option<&'a [u8]>,
-    server_cert_types: Option<CertificateTypes<'a>>,
-    client_cert_types: Option<CertificateTypes<'a>>,
+    server_cert_types: Option<protocols::CertificateTypes<'a>>,
+    client_cert_types: Option<protocols::CertificateTypes<'a>>,
     quic_transport_parameters: Option<&'a [u8]>,
     early_data: bool,
 }
 
 impl<'a> ClientHelloOffers<'a> {
-    pub(super) fn parse(extensions: Extensions<'a>) -> Result<Self, Error> {
+    pub(super) fn parse(extensions: extension::Extensions<'a>) -> Result<Self, connection::Error> {
         let mut offers = Self {
             alpn: None,
             server_cert_types: None,
@@ -28,22 +25,27 @@ impl<'a> ClientHelloOffers<'a> {
         };
 
         for extension in extensions.iter() {
+            use crate::wire::extension::Type;
             match extension.ty {
-                ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION => {
+                Type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION => {
                     offers.alpn = Some(extension.data);
                 }
-                ExtensionType::SERVER_CERTIFICATE_TYPE => {
-                    offers.server_cert_types =
-                        Some(CertificateTypes::decode(extension.data).map_err(|_| Error::Decode)?);
+                Type::SERVER_CERTIFICATE_TYPE => {
+                    offers.server_cert_types = Some(
+                        protocols::CertificateTypes::decode(extension.data)
+                            .map_err(|_| connection::Error::Decode)?,
+                    );
                 }
-                ExtensionType::CLIENT_CERTIFICATE_TYPE => {
-                    offers.client_cert_types =
-                        Some(CertificateTypes::decode(extension.data).map_err(|_| Error::Decode)?);
+                Type::CLIENT_CERTIFICATE_TYPE => {
+                    offers.client_cert_types = Some(
+                        protocols::CertificateTypes::decode(extension.data)
+                            .map_err(|_| connection::Error::Decode)?,
+                    );
                 }
-                ExtensionType::QUIC_TRANSPORT_PARAMETERS => {
+                Type::QUIC_TRANSPORT_PARAMETERS => {
                     offers.quic_transport_parameters = Some(extension.data);
                 }
-                ExtensionType::EARLY_DATA => offers.early_data = true,
+                Type::EARLY_DATA => offers.early_data = true,
                 _ => {}
             }
         }
@@ -53,31 +55,35 @@ impl<'a> ClientHelloOffers<'a> {
 
     pub(super) fn select_alpn(
         &self,
-        supported: &[Vec<u8>],
-    ) -> Result<Option<ArrayVec<u8, 255>>, Error> {
+        supported: &[vec::Vec<u8>],
+    ) -> Result<Option<arrayvec::ArrayVec<u8, 255>>, connection::Error> {
+        use crate::wire::protocols::Alpn;
         if supported.is_empty() {
             return Ok(None);
         }
         let Some(encoded) = self.alpn else {
             return Ok(None);
         };
-        let offered = Alpn::decode(encoded).map_err(|_| Error::Decode)?;
+        let offered = Alpn::decode(encoded).map_err(|_| connection::Error::Decode)?;
         let selected = supported
             .iter()
             .find(|candidate| offered.iter().any(|offer| offer == candidate.as_slice()));
         if selected.is_none() && !offered.is_empty() {
-            return Err(Error::NoApplicationProtocol);
+            return Err(connection::Error::NoApplicationProtocol);
         }
         selected
-            .map(|protocol| ArrayVec::try_from(protocol.as_slice()).map_err(|_| Error::BadConfig))
+            .map(|protocol| {
+                arrayvec::ArrayVec::try_from(protocol.as_slice())
+                    .map_err(|_| connection::Error::BadConfig)
+            })
             .transpose()
     }
 
     pub(super) fn certificate_negotiation(
         &self,
-        source: &CertSource,
-    ) -> Result<CertificateNegotiation, Error> {
-        CertificateNegotiation::new(self, source)
+        source: &config::CertSource,
+    ) -> Result<Negotiation, connection::Error> {
+        Negotiation::new(self, source)
     }
 
     pub(super) fn peer_quic_transport_parameters(&self) -> Option<&[u8]> {
@@ -95,33 +101,34 @@ impl<'a> ClientHelloOffers<'a> {
     pub(super) fn offered_client_certificate_type(&self) -> bool {
         self.client_cert_types.is_some()
     }
-
-    pub(super) fn offered_quic_transport_parameters(&self) -> bool {
-        self.quic_transport_parameters.is_some()
-    }
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CertificateNegotiation {
+pub(super) struct Negotiation {
     pub(super) server_type: u8,
     pub(super) client_type: u8,
 }
 
-impl CertificateNegotiation {
-    fn new(offers: &ClientHelloOffers<'_>, source: &CertSource) -> Result<Self, Error> {
+impl Negotiation {
+    fn new(
+        offers: &ClientHelloOffers<'_>,
+        source: &config::CertSource,
+    ) -> Result<Self, connection::Error> {
+        use crate::wire::protocols::CERT_TYPE_RAW_PUBLIC_KEY;
+        use crate::wire::protocols::CERT_TYPE_X509;
         let server_type = match source {
-            CertSource::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
-            CertSource::X509 { .. } => CERT_TYPE_X509,
+            config::CertSource::RawPublicKey { .. } => CERT_TYPE_RAW_PUBLIC_KEY,
+            config::CertSource::X509 { .. } => CERT_TYPE_X509,
         };
         if let Some(types) = offers.server_cert_types
             && !types.contains(server_type)
         {
-            return Err(Error::UnexpectedMessage);
+            return Err(connection::Error::UnexpectedMessage);
         }
 
         let client_type = offers
             .client_cert_types
-            .and_then(CertificateTypes::select)
+            .and_then(protocols::CertificateTypes::select)
             .unwrap_or(CERT_TYPE_X509);
 
         Ok(Self {

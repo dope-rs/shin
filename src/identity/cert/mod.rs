@@ -1,19 +1,20 @@
-use crate::identity::asn1::{DerError, Reader, Tag, Tlv};
-use ring::signature::{self, UnparsedPublicKey};
+use crate::identity::asn1;
+
+use ring::signature;
 
 pub mod ext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CertError {
-    Der(DerError),
+pub enum Error {
+    Der(asn1::DerError),
     BadVersion,
     BadValidity,
     BadAlgorithm,
     TooManyEntries,
 }
 
-impl From<DerError> for CertError {
-    fn from(e: DerError) -> Self {
+impl From<asn1::DerError> for Error {
+    fn from(e: asn1::DerError) -> Self {
         Self::Der(e)
     }
 }
@@ -21,16 +22,14 @@ impl From<DerError> for CertError {
 #[derive(Debug, Clone)]
 pub struct Cert<'a> {
     pub tbs_der: &'a [u8],
-    pub version: u8,
-    pub serial: &'a [u8],
-    pub signature_alg: AlgorithmIdentifier<'a>,
-    pub issuer_der: &'a [u8],
-    pub validity: Validity<'a>,
-    pub subject_der: &'a [u8],
-    pub spki: SubjectPublicKeyInfo<'a>,
-    pub extensions_der: Option<&'a [u8]>,
-    pub outer_signature_alg: AlgorithmIdentifier<'a>,
-    pub signature: &'a [u8],
+    pub tbs: Tbs<'a>,
+    pub signature: Signature<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Signature<'a> {
+    pub algorithm: AlgorithmIdentifier<'a>,
+    pub bytes: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,7 +46,7 @@ pub struct Validity<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TimeValue<'a> {
-    pub tag: Tag,
+    pub tag: asn1::Tag,
     pub bytes: &'a [u8],
 }
 
@@ -58,18 +57,30 @@ pub struct SubjectPublicKeyInfo<'a> {
     pub raw_der: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Tbs<'a> {
+    pub version: u8,
+    pub serial: &'a [u8],
+    pub signature_alg: AlgorithmIdentifier<'a>,
+    pub issuer_der: &'a [u8],
+    pub validity: Validity<'a>,
+    pub subject_der: &'a [u8],
+    pub spki: SubjectPublicKeyInfo<'a>,
+    pub extensions_der: Option<&'a [u8]>,
+}
+
 impl<'a> SubjectPublicKeyInfo<'a> {
-    pub fn parse_standalone(spki_der: &'a [u8]) -> Result<Self, CertError> {
-        let mut r = Reader::new(spki_der);
-        let inner = r.read_tagged(Tag::SEQUENCE)?;
+    pub fn parse_standalone(spki_der: &'a [u8]) -> Result<Self, Error> {
+        let mut r = asn1::Reader::new(spki_der);
+        let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
         r.finish()?;
-        let mut sr = Reader::new(inner);
-        let alg_inner = sr.read_tagged(Tag::SEQUENCE)?;
-        let mut ar = Reader::new(alg_inner);
-        let oid = ar.read_tagged(Tag::OID)?;
+        let mut sr = asn1::Reader::new(inner);
+        let alg_inner = sr.read_tagged(asn1::Tag::SEQUENCE)?;
+        let mut ar = asn1::Reader::new(alg_inner);
+        let oid = ar.read_tagged(asn1::Tag::OID)?;
         let parameters = ar.bytes_remaining();
-        let bit = sr.read_tagged(Tag::BIT_STRING)?;
-        let subject_public_key = Tlv::bit_string(bit)?;
+        let bit = sr.read_tagged(asn1::Tag::BIT_STRING)?;
+        let subject_public_key = asn1::Tlv::bit_string(bit)?;
         sr.finish()?;
         Ok(Self {
             algorithm: AlgorithmIdentifier { oid, parameters },
@@ -78,13 +89,13 @@ impl<'a> SubjectPublicKeyInfo<'a> {
         })
     }
 
-    fn parse_inline(r: &mut Reader<'a>) -> Result<Self, CertError> {
+    fn parse_inline(r: &mut asn1::Reader<'a>) -> Result<Self, Error> {
         let raw_der = Self::peek_full_tlv(r)?;
-        let inner = r.read_tagged(Tag::SEQUENCE)?;
-        let mut sr = Reader::new(inner);
+        let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
+        let mut sr = asn1::Reader::new(inner);
         let algorithm = AlgorithmIdentifier::parse(&mut sr)?;
-        let bit = sr.read_tagged(Tag::BIT_STRING)?;
-        let subject_public_key = Tlv::bit_string(bit)?;
+        let bit = sr.read_tagged(asn1::Tag::BIT_STRING)?;
+        let subject_public_key = asn1::Tlv::bit_string(bit)?;
         sr.finish()?;
         Ok(Self {
             algorithm,
@@ -93,9 +104,9 @@ impl<'a> SubjectPublicKeyInfo<'a> {
         })
     }
 
-    fn peek_full_tlv(r: &Reader<'a>) -> Result<&'a [u8], CertError> {
+    fn peek_full_tlv(r: &asn1::Reader<'a>) -> Result<&'a [u8], Error> {
         let bytes = r.bytes_remaining();
-        let (tlv, _) = Tlv::parse_one(bytes)?;
+        let (tlv, _) = asn1::Tlv::parse_one(bytes)?;
         let tlv_len =
             (tlv.contents.as_ptr() as usize - bytes.as_ptr() as usize) + tlv.contents.len();
         Ok(&bytes[..tlv_len])
@@ -103,129 +114,101 @@ impl<'a> SubjectPublicKeyInfo<'a> {
 }
 
 impl<'a> Cert<'a> {
-    pub fn parse(der: &'a [u8]) -> Result<Self, CertError> {
-        let (outer, rest) = Tlv::parse_one(der)?;
-        if outer.tag != Tag::SEQUENCE {
-            return Err(CertError::Der(DerError::Mismatch));
+    pub fn parse(der: &'a [u8]) -> Result<Self, Error> {
+        let (outer, rest) = asn1::Tlv::parse_one(der)?;
+        if outer.tag != asn1::Tag::SEQUENCE {
+            return Err(Error::Der(asn1::DerError::Mismatch));
         }
         if !rest.is_empty() {
-            return Err(CertError::Der(DerError::Trailing));
+            return Err(Error::Der(asn1::DerError::Trailing));
         }
 
-        let mut top = Reader::new(outer.contents);
+        let mut top = asn1::Reader::new(outer.contents);
 
         let start_ptr = outer.contents.as_ptr();
-        let tbs_tlv = top.next()?;
-        if tbs_tlv.tag != Tag::SEQUENCE {
-            return Err(CertError::Der(DerError::Mismatch));
+        let tbs_tlv = top.read_tlv()?;
+        if tbs_tlv.tag != asn1::Tag::SEQUENCE {
+            return Err(Error::Der(asn1::DerError::Mismatch));
         }
         let after_ptr = top.bytes_remaining().as_ptr();
         let consumed = (after_ptr as usize) - (start_ptr as usize);
         let tbs_der = &outer.contents[..consumed];
 
-        let (
-            version,
-            serial,
-            signature_alg,
-            issuer_der,
-            validity,
-            subject_der,
-            spki,
-            extensions_der,
-        ) = Self::parse_tbs(tbs_tlv.contents)?;
+        let tbs = Self::parse_tbs(tbs_tlv.contents)?;
 
         let outer_signature_alg = AlgorithmIdentifier::parse(&mut top)?;
 
-        if signature_alg.oid != outer_signature_alg.oid
-            || signature_alg.parameters != outer_signature_alg.parameters
+        if tbs.signature_alg.oid != outer_signature_alg.oid
+            || tbs.signature_alg.parameters != outer_signature_alg.parameters
         {
-            return Err(CertError::BadAlgorithm);
+            return Err(Error::BadAlgorithm);
         }
 
-        let sig_tlv = top.next()?;
-        if sig_tlv.tag != Tag::BIT_STRING {
-            return Err(CertError::Der(DerError::Mismatch));
+        let sig_tlv = top.read_tlv()?;
+        if sig_tlv.tag != asn1::Tag::BIT_STRING {
+            return Err(Error::Der(asn1::DerError::Mismatch));
         }
-        let signature = Tlv::bit_string(sig_tlv.contents)?;
+        let signature = asn1::Tlv::bit_string(sig_tlv.contents)?;
 
         top.finish()?;
 
         Ok(Self {
             tbs_der,
-            version,
-            serial,
-            signature_alg,
-            issuer_der,
-            validity,
-            subject_der,
-            spki,
-            extensions_der,
-            outer_signature_alg,
-            signature,
+            tbs,
+            signature: Signature {
+                algorithm: outer_signature_alg,
+                bytes: signature,
+            },
         })
     }
 
-    #[allow(clippy::type_complexity)]
-    fn parse_tbs(
-        tbs: &'a [u8],
-    ) -> Result<
-        (
-            u8,
-            &'a [u8],
-            AlgorithmIdentifier<'a>,
-            &'a [u8],
-            Validity<'a>,
-            &'a [u8],
-            SubjectPublicKeyInfo<'a>,
-            Option<&'a [u8]>,
-        ),
-        CertError,
-    > {
-        let mut r = Reader::new(tbs);
+    fn parse_tbs(tbs: &'a [u8]) -> Result<Tbs<'a>, Error> {
+        let mut r = asn1::Reader::new(tbs);
 
-        let version = if let Some(ver_inner) = r.read_optional(Tag::context(0, true))? {
-            let mut vr = Reader::new(ver_inner);
-            let v = Tlv::integer_u64(vr.read_tagged(Tag::INTEGER)?)?;
+        let version = if let Some(ver_inner) = r.read_optional(asn1::Tag::context(0, true))? {
+            let mut vr = asn1::Reader::new(ver_inner);
+            let v = asn1::Tlv::integer_u64(vr.read_tagged(asn1::Tag::INTEGER)?)?;
             vr.finish()?;
             if v > 2 {
-                return Err(CertError::BadVersion);
+                return Err(Error::BadVersion);
             }
             if v == 0 {
-                return Err(CertError::BadVersion);
+                return Err(Error::BadVersion);
             }
             v as u8 + 1
         } else {
             1
         };
 
-        let serial = r.read_tagged(Tag::INTEGER)?;
+        let serial = r.read_tagged(asn1::Tag::INTEGER)?;
         let signature_alg = AlgorithmIdentifier::parse(&mut r)?;
-        let issuer_der = r.read_tagged(Tag::SEQUENCE)?;
-        let validity = Validity::parse(r.read_tagged(Tag::SEQUENCE)?)?;
-        let subject_der = r.read_tagged(Tag::SEQUENCE)?;
+        let issuer_der = r.read_tagged(asn1::Tag::SEQUENCE)?;
+        let validity = Validity::parse(r.read_tagged(asn1::Tag::SEQUENCE)?)?;
+        let subject_der = r.read_tagged(asn1::Tag::SEQUENCE)?;
         let spki = SubjectPublicKeyInfo::parse_inline(&mut r)?;
 
-        let issuer_uid = r.read_optional(Tag::context(1, false))?.is_some();
-        let subject_uid = r.read_optional(Tag::context(2, false))?.is_some();
+        let issuer_uid = r.read_optional(asn1::Tag::context(1, false))?.is_some();
+        let subject_uid = r.read_optional(asn1::Tag::context(2, false))?.is_some();
 
-        let extensions_der = if let Some(ext_outer) = r.read_optional(Tag::context(3, true))? {
-            let mut er = Reader::new(ext_outer);
-            let ext_seq = er.read_tagged(Tag::SEQUENCE)?;
-            er.finish()?;
-            Some(ext_seq)
-        } else {
-            None
-        };
+        let extensions_der =
+            if let Some(ext_outer) = r.read_optional(asn1::Tag::context(3, true))? {
+                let mut er = asn1::Reader::new(ext_outer);
+                let ext_seq = er.read_tagged(asn1::Tag::SEQUENCE)?;
+                er.finish()?;
+                Some(ext_seq)
+            } else {
+                None
+            };
 
         if extensions_der.is_some() && version != 3 {
-            return Err(CertError::BadVersion);
+            return Err(Error::BadVersion);
         }
         if (issuer_uid || subject_uid) && version < 2 {
-            return Err(CertError::BadVersion);
+            return Err(Error::BadVersion);
         }
 
         r.finish()?;
-        Ok((
+        Ok(Tbs {
             version,
             serial,
             signature_alg,
@@ -234,15 +217,15 @@ impl<'a> Cert<'a> {
             subject_der,
             spki,
             extensions_der,
-        ))
+        })
     }
 }
 
 impl<'a> AlgorithmIdentifier<'a> {
-    fn parse(r: &mut Reader<'a>) -> Result<Self, CertError> {
-        let alg_inner = r.read_tagged(Tag::SEQUENCE)?;
-        let mut ar = Reader::new(alg_inner);
-        let oid = ar.read_tagged(Tag::OID)?;
+    fn parse(r: &mut asn1::Reader<'a>) -> Result<Self, Error> {
+        let alg_inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
+        let mut ar = asn1::Reader::new(alg_inner);
+        let oid = ar.read_tagged(asn1::Tag::OID)?;
         let parameters = ar.bytes_remaining();
         Ok(Self { oid, parameters })
     }
@@ -255,15 +238,15 @@ impl AlgorithmIdentifier<'_> {
 }
 
 impl<'a> Validity<'a> {
-    fn parse(inner: &'a [u8]) -> Result<Self, CertError> {
-        let mut r = Reader::new(inner);
-        let nb = r.next()?;
-        if nb.tag != Tag::UTC_TIME && nb.tag != Tag::GENERALIZED_TIME {
-            return Err(CertError::BadValidity);
+    fn parse(inner: &'a [u8]) -> Result<Self, Error> {
+        let mut r = asn1::Reader::new(inner);
+        let nb = r.read_tlv()?;
+        if nb.tag != asn1::Tag::UTC_TIME && nb.tag != asn1::Tag::GENERALIZED_TIME {
+            return Err(Error::BadValidity);
         }
-        let na = r.next()?;
-        if na.tag != Tag::UTC_TIME && na.tag != Tag::GENERALIZED_TIME {
-            return Err(CertError::BadValidity);
+        let na = r.read_tlv()?;
+        if na.tag != asn1::Tag::UTC_TIME && na.tag != asn1::Tag::GENERALIZED_TIME {
+            return Err(Error::BadValidity);
         }
         r.finish()?;
         Ok(Self {
@@ -319,7 +302,7 @@ impl Cert<'_> {
         &self,
         issuer_spki: &SubjectPublicKeyInfo<'_>,
     ) -> Result<(), VerifyError> {
-        let sig_oid = self.signature_alg.oid;
+        let sig_oid = self.tbs.signature_alg.oid;
         let pk_oid = issuer_spki.algorithm.oid;
 
         match (sig_oid, pk_oid) {
@@ -344,7 +327,7 @@ impl Cert<'_> {
                 self.verify_with(issuer_spki, &signature::ED25519)
             }
             (a, p) if a == OID_RSA_PSS && (p == OID_RSA_ENCRYPTION || p == OID_RSA_PSS) => {
-                match Self::pss_hash(self.signature_alg.parameters)? {
+                match Self::pss_hash(self.tbs.signature_alg.parameters)? {
                     PssHash::Sha256 => {
                         self.verify_with(issuer_spki, &signature::RSA_PSS_2048_8192_SHA256)
                     }
@@ -368,8 +351,9 @@ impl Cert<'_> {
         issuer_spki: &SubjectPublicKeyInfo<'_>,
         alg: &'static A,
     ) -> Result<(), VerifyError> {
+        use ring::signature::UnparsedPublicKey;
         UnparsedPublicKey::new(alg, issuer_spki.subject_public_key)
-            .verify(self.tbs_der, self.signature)
+            .verify(self.tbs_der, self.signature.bytes)
             .map_err(|_| VerifyError::Failed)
     }
 
@@ -399,21 +383,23 @@ impl Cert<'_> {
     /// Message digest from RSASSA-PSS-params (RFC 4055 §3.1). Only the standard
     /// MGF1-same-hash, salt = digest-length profile; SHA-1 default is rejected.
     fn pss_hash(params: &[u8]) -> Result<PssHash, VerifyError> {
-        let mut r = Reader::new(params);
+        let mut r = asn1::Reader::new(params);
         let inner = r
-            .read_tagged(Tag::SEQUENCE)
+            .read_tagged(asn1::Tag::SEQUENCE)
             .map_err(|_| VerifyError::Failed)?;
-        let mut sr = Reader::new(inner);
+        let mut sr = asn1::Reader::new(inner);
         let hash_field = sr
-            .read_optional(Tag::context(0, true))
+            .read_optional(asn1::Tag::context(0, true))
             .map_err(|_| VerifyError::Failed)?
             .ok_or(VerifyError::UnsupportedAlgorithm)?;
-        let mut hr = Reader::new(hash_field);
+        let mut hr = asn1::Reader::new(hash_field);
         let alg = hr
-            .read_tagged(Tag::SEQUENCE)
+            .read_tagged(asn1::Tag::SEQUENCE)
             .map_err(|_| VerifyError::Failed)?;
-        let mut ar = Reader::new(alg);
-        let oid = ar.read_tagged(Tag::OID).map_err(|_| VerifyError::Failed)?;
+        let mut ar = asn1::Reader::new(alg);
+        let oid = ar
+            .read_tagged(asn1::Tag::OID)
+            .map_err(|_| VerifyError::Failed)?;
         match oid {
             x if x == OID_SHA256 => Ok(PssHash::Sha256),
             x if x == OID_SHA384 => Ok(PssHash::Sha384),
@@ -426,9 +412,9 @@ impl Cert<'_> {
         spki: &SubjectPublicKeyInfo<'_>,
         expected_curve: &[u8],
     ) -> Result<(), VerifyError> {
-        let mut r = Reader::new(spki.algorithm.parameters);
+        let mut r = asn1::Reader::new(spki.algorithm.parameters);
         let oid = r
-            .read_tagged(Tag::OID)
+            .read_tagged(asn1::Tag::OID)
             .map_err(|_| VerifyError::BadCurveParam)?;
         if oid != expected_curve {
             return Err(VerifyError::UnsupportedCurve);

@@ -406,6 +406,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "o3"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92bb9d79341457d8fff577af46be3a03fc10a6807710f549a59d28e3f3e9b19a"
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -661,10 +667,11 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arrayvec",
  "ml-kem",
+ "o3",
  "rcgen",
  "ring",
  "rsa",

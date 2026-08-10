@@ -1,14 +1,13 @@
-use alloc::vec::Vec;
-use arrayvec::ArrayVec;
-
-use crate::wire::codec::{DecodeError, Encode, EncodeError, Reader};
+use crate::wire::codec;
+use crate::wire::codec::Encode as _;
+use alloc::vec;
 
 pub const MAX_EXTENSIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtensionType(pub u16);
+pub struct Type(pub u16);
 
-impl ExtensionType {
+impl Type {
     pub const SERVER_NAME: Self = Self(0);
     pub const SUPPORTED_GROUPS: Self = Self(10);
     pub const SIGNATURE_ALGORITHMS: Self = Self(13);
@@ -26,58 +25,58 @@ impl ExtensionType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extension {
-    pub ty: ExtensionType,
-    pub data: Vec<u8>,
+    pub ty: Type,
+    pub data: vec::Vec<u8>,
 }
 
 impl Extension {
-    pub fn new(ty: ExtensionType, data: Vec<u8>) -> Self {
+    pub fn new(ty: Type, data: vec::Vec<u8>) -> Self {
         Self { ty, data }
     }
 
-    pub fn encode(&self, out: &mut impl Encode) -> Result<(), EncodeError> {
+    pub fn encode(&self, out: &mut impl codec::Encode) -> Result<(), codec::EncodeError> {
         out.put_u16(self.ty.0);
-        out.put_vec_u16(|out| {
-            out.put_slice(&self.data);
-            Ok(())
-        })
+        let mut data = out.begin_u16()?;
+        data.put_slice(&self.data);
+        data.finish()
     }
 
-    pub(crate) fn encode_with<E: Encode>(
+    pub(crate) fn begin<E: codec::Encode>(
         out: &mut E,
-        ty: ExtensionType,
-        body: impl FnOnce(&mut E) -> Result<(), EncodeError>,
-    ) -> Result<(), EncodeError> {
+        ty: Type,
+    ) -> Result<codec::LengthFrame<'_, E>, codec::EncodeError> {
         out.put_u16(ty.0);
-        out.put_vec_u16(body)
+        out.begin_u16()
     }
 
-    pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        let ty = ExtensionType(r.u16()?);
+    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
+        let ty = Type(r.u16()?);
         let data = r.vec_u16()?.to_vec();
         Ok(Self { ty, data })
     }
 
-    pub fn encode_list(exts: &[Self], out: &mut impl Encode) -> Result<(), EncodeError> {
-        out.put_vec_u16(|o| {
-            for ext in exts {
-                ext.encode(o)?;
-            }
-            Ok(())
-        })
+    pub fn encode_list(
+        exts: &[Self],
+        out: &mut impl codec::Encode,
+    ) -> Result<(), codec::EncodeError> {
+        let mut list = out.begin_u16()?;
+        for ext in exts {
+            ext.encode(&mut list)?;
+        }
+        list.finish()
     }
 
-    pub fn decode_list(r: &mut Reader<'_>) -> Result<Vec<Self>, DecodeError> {
+    pub fn decode_list(r: &mut codec::Reader<'_>) -> Result<vec::Vec<Self>, codec::DecodeError> {
         let mut sub = r.sub_u16()?;
-        let mut out: Vec<Self> = Vec::new();
-        let mut seen: Vec<u16> = Vec::new();
+        let mut out: vec::Vec<Self> = vec::Vec::new();
+        let mut seen: vec::Vec<u16> = vec::Vec::new();
         while !sub.is_empty() {
             if out.len() >= MAX_EXTENSIONS {
-                return Err(DecodeError::InvalidEnum);
+                return Err(codec::DecodeError::InvalidEnum);
             }
             let ext = Self::decode(&mut sub)?;
             match seen.binary_search(&ext.ty.0) {
-                Ok(_) => return Err(DecodeError::DuplicateExtension),
+                Ok(_) => return Err(codec::DecodeError::DuplicateExtension),
                 Err(pos) => seen.insert(pos, ext.ty.0),
             }
             out.push(ext);
@@ -87,15 +86,15 @@ impl Extension {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExtensionRef<'a> {
-    pub(crate) ty: ExtensionType,
+pub(crate) struct Ref<'a> {
+    pub(crate) ty: Type,
     pub(crate) data: &'a [u8],
 }
 
-impl<'a> ExtensionRef<'a> {
-    fn decode(r: &mut Reader<'a>) -> Result<Self, DecodeError> {
+impl<'a> Ref<'a> {
+    fn decode(r: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
-            ty: ExtensionType(r.u16()?),
+            ty: Type(r.u16()?),
             data: r.vec_u16()?,
         })
     }
@@ -107,16 +106,17 @@ pub(crate) struct Extensions<'a> {
 }
 
 impl<'a> Extensions<'a> {
-    pub(crate) fn decode(r: &mut Reader<'a>) -> Result<Self, DecodeError> {
+    pub(crate) fn decode(r: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+        use arrayvec::ArrayVec;
         let encoded = r.vec_u16()?;
-        let mut reader = Reader::new(encoded);
+        let mut reader = codec::Reader::new(encoded);
         let mut seen = ArrayVec::<u16, MAX_EXTENSIONS>::new();
         while !reader.is_empty() {
-            let extension = ExtensionRef::decode(&mut reader)?;
+            let extension = Ref::decode(&mut reader)?;
             match seen.binary_search(&extension.ty.0) {
-                Ok(_) => return Err(DecodeError::DuplicateExtension),
+                Ok(_) => return Err(codec::DecodeError::DuplicateExtension),
                 Err(position) if seen.try_insert(position, extension.ty.0).is_err() => {
-                    return Err(DecodeError::InvalidEnum);
+                    return Err(codec::DecodeError::InvalidEnum);
                 }
                 Err(_) => {}
             }
@@ -124,28 +124,28 @@ impl<'a> Extensions<'a> {
         Ok(Self { encoded })
     }
 
-    pub(crate) fn iter(self) -> ExtensionRefs<'a> {
-        ExtensionRefs {
-            reader: Reader::new(self.encoded),
+    pub(crate) fn iter(self) -> Refs<'a> {
+        Refs {
+            reader: codec::Reader::new(self.encoded),
         }
     }
 
-    pub(crate) fn find(self, ty: ExtensionType) -> Option<ExtensionRef<'a>> {
+    pub(crate) fn find(self, ty: Type) -> Option<Ref<'a>> {
         self.iter().find(|extension| extension.ty == ty)
     }
 }
 
-pub(crate) struct ExtensionRefs<'a> {
-    reader: Reader<'a>,
+pub(crate) struct Refs<'a> {
+    reader: codec::Reader<'a>,
 }
 
-impl<'a> Iterator for ExtensionRefs<'a> {
-    type Item = ExtensionRef<'a>;
+impl<'a> Iterator for Refs<'a> {
+    type Item = Ref<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.reader.is_empty() {
             return None;
         }
-        ExtensionRef::decode(&mut self.reader).ok()
+        Ref::decode(&mut self.reader).ok()
     }
 }

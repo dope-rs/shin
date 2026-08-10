@@ -1,7 +1,7 @@
-use shin::crypto::aead::{AeadError, AeadKey};
-use shin::crypto::hash::{HashAlg, Transcript};
+use shin::crypto::aead::{Error, Key};
+use shin::crypto::hash::{Algorithm, Transcript};
 use shin::crypto::kdf::Hkdf;
-use shin::crypto::schedule::{KeySchedule, TrafficKeys};
+use shin::crypto::schedule::{Schedule, TrafficKeys};
 
 const EARLY_SECRET: [u8; 32] = [
     0x33, 0xad, 0x0a, 0x1c, 0x60, 0x7e, 0xc0, 0x3b, 0x09, 0xe6, 0xcd, 0x98, 0x93, 0x68, 0x0c, 0xe2,
@@ -69,7 +69,7 @@ fn sha256_empty_string_matches_known_value() {
         0xb8, 0x55,
     ];
     assert_eq!(
-        Transcript::hash_empty(HashAlg::Sha256).as_slice(),
+        Transcript::hash_empty(Algorithm::Sha256).as_slice(),
         &KNOWN[..]
     );
 }
@@ -77,17 +77,17 @@ fn sha256_empty_string_matches_known_value() {
 #[test]
 fn early_secret_matches_rfc8448() {
     let zero = [0u8; 32];
-    let early = Hkdf::new(HashAlg::Sha256).extract(&zero, &zero);
+    let early = Hkdf::new(Algorithm::Sha256).extract(&zero, &zero);
     assert_eq!(early.as_slice(), &EARLY_SECRET[..]);
 }
 
 #[test]
 fn derive_secret_for_handshake_matches_rfc8448() {
-    let derived = Hkdf::new(HashAlg::Sha256)
+    let derived = Hkdf::new(Algorithm::Sha256)
         .derive_secret(
             &EARLY_SECRET,
             "derived",
-            Transcript::hash_empty(HashAlg::Sha256).as_slice(),
+            Transcript::hash_empty(Algorithm::Sha256).as_slice(),
         )
         .unwrap();
     assert_eq!(derived.as_slice(), &DERIVED_FOR_HANDSHAKE[..]);
@@ -95,13 +95,13 @@ fn derive_secret_for_handshake_matches_rfc8448() {
 
 #[test]
 fn handshake_secret_matches_rfc8448() {
-    let hs_secret = Hkdf::new(HashAlg::Sha256).extract(&DERIVED_FOR_HANDSHAKE, &DHE_SHARED);
+    let hs_secret = Hkdf::new(Algorithm::Sha256).extract(&DERIVED_FOR_HANDSHAKE, &DHE_SHARED);
     assert_eq!(hs_secret.as_slice(), &HANDSHAKE_SECRET[..]);
 }
 
 #[test]
 fn key_schedule_walks_to_handshake_secret() {
-    let ks = KeySchedule::new(HashAlg::Sha256);
+    let ks = Schedule::new(Algorithm::Sha256);
     assert_eq!(ks.secret().as_slice(), &EARLY_SECRET[..]);
     let ks = ks.into_handshake(&DHE_SHARED).unwrap();
     assert_eq!(ks.secret().as_slice(), &HANDSHAKE_SECRET[..]);
@@ -109,29 +109,29 @@ fn key_schedule_walks_to_handshake_secret() {
 
 #[test]
 fn server_handshake_traffic_keys_match_rfc8448() {
-    let tk = TrafficKeys::<16>::derive(HashAlg::Sha256, &S_HS_TRAFFIC).unwrap();
+    let tk = TrafficKeys::<16>::derive(Algorithm::Sha256, &S_HS_TRAFFIC).unwrap();
     assert_eq!(tk.key, S_HS_KEY);
     assert_eq!(tk.iv, S_HS_IV);
 }
 
 #[test]
 fn master_secret_matches_rfc8448() {
-    let derived = Hkdf::new(HashAlg::Sha256)
+    let derived = Hkdf::new(Algorithm::Sha256)
         .derive_secret(
             &HANDSHAKE_SECRET,
             "derived",
-            Transcript::hash_empty(HashAlg::Sha256).as_slice(),
+            Transcript::hash_empty(Algorithm::Sha256).as_slice(),
         )
         .unwrap();
     assert_eq!(derived.as_slice(), &DERIVED_FOR_MASTER[..]);
     let zero = [0u8; 32];
-    let master = Hkdf::new(HashAlg::Sha256).extract(derived.as_slice(), &zero);
+    let master = Hkdf::new(Algorithm::Sha256).extract(derived.as_slice(), &zero);
     assert_eq!(master.as_slice(), &MASTER_SECRET[..]);
 }
 
 #[test]
 fn key_schedule_walks_to_master_secret() {
-    let ks = KeySchedule::new(HashAlg::Sha256)
+    let ks = Schedule::new(Algorithm::Sha256)
         .into_handshake(&DHE_SHARED)
         .unwrap()
         .into_master()
@@ -141,7 +141,7 @@ fn key_schedule_walks_to_master_secret() {
 
 #[test]
 fn application_traffic_secrets_match_rfc8448() {
-    let ks = KeySchedule::new(HashAlg::Sha256)
+    let ks = Schedule::new(Algorithm::Sha256)
         .into_handshake(&DHE_SHARED)
         .unwrap()
         .into_master()
@@ -163,7 +163,7 @@ fn application_traffic_secrets_match_rfc8448() {
 #[test]
 fn hkdf_expand_label_matches_explicit_info() {
     let mut from_label = [0u8; 16];
-    Hkdf::new(HashAlg::Sha256)
+    Hkdf::new(Algorithm::Sha256)
         .expand_label(&S_HS_TRAFFIC, "key", &[], &mut from_label)
         .unwrap();
     assert_eq!(from_label, S_HS_KEY);
@@ -172,7 +172,7 @@ fn hkdf_expand_label_matches_explicit_info() {
     let info = [
         0x00, 0x10, 0x09, b't', b'l', b's', b'1', b'3', b' ', b'k', b'e', b'y', 0x00,
     ];
-    Hkdf::new(HashAlg::Sha256)
+    Hkdf::new(Algorithm::Sha256)
         .expand(&S_HS_TRAFFIC, &info, &mut from_explicit)
         .unwrap();
     assert_eq!(from_explicit, S_HS_KEY);
@@ -182,7 +182,7 @@ fn hkdf_expand_label_matches_explicit_info() {
 
 #[test]
 fn aead_seal_open_round_trip() {
-    let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
+    let key = Key::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
     let plaintext = b"some plaintext payload";
     let aad = b"associated data";
     let mut sealed = key.seal(0, aad, plaintext).unwrap();
@@ -192,7 +192,7 @@ fn aead_seal_open_round_trip() {
 
 #[test]
 fn aead_seal_detached_matches_seal_and_round_trips() {
-    let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
+    let key = Key::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
     let plaintext = b"some plaintext payload";
     let aad = b"associated data";
 
@@ -206,33 +206,30 @@ fn aead_seal_detached_matches_seal_and_round_trips() {
 
 #[test]
 fn aead_open_rejects_tampered_tag() {
-    let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
+    let key = Key::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
     let mut sealed = key.seal(0, b"aad", b"payload").unwrap();
     let last = sealed.len() - 1;
     sealed[last] ^= 0x01;
-    assert_eq!(key.open(0, b"aad", &mut sealed), Err(AeadError::OpenFailed));
+    assert_eq!(key.open(0, b"aad", &mut sealed), Err(Error::OpenFailed));
 }
 
 #[test]
 fn aead_open_rejects_wrong_aad() {
-    let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
+    let key = Key::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
     let mut sealed = key.seal(0, b"aad-a", b"payload").unwrap();
-    assert_eq!(
-        key.open(0, b"aad-b", &mut sealed),
-        Err(AeadError::OpenFailed)
-    );
+    assert_eq!(key.open(0, b"aad-b", &mut sealed), Err(Error::OpenFailed));
 }
 
 #[test]
 fn aead_open_rejects_wrong_seq() {
-    let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
+    let key = Key::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
     let mut sealed = key.seal(0, b"aad", b"payload").unwrap();
-    assert_eq!(key.open(7, b"aad", &mut sealed), Err(AeadError::OpenFailed));
+    assert_eq!(key.open(7, b"aad", &mut sealed), Err(Error::OpenFailed));
 }
 
 #[test]
 fn aead_seq_mutates_nonce() {
-    let key = AeadKey::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
+    let key = Key::aes_128_gcm(&S_HS_KEY, S_HS_IV).unwrap();
     let n0 = key.nonce(0);
     let n1 = key.nonce(1);
     assert_eq!(&n0[..4], &S_HS_IV[..4]);

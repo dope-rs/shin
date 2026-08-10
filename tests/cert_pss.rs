@@ -114,7 +114,7 @@ fn pss_sha256_params_are_accepted_and_reach_verification() {
     let cert_der = patch_to_pss(&rsa_cert(), &params_with_hash(SHA256_OID));
     let cert = Cert::parse(&cert_der).expect("patched PSS cert parses");
     assert_eq!(
-        cert.verify_signature(&cert.spki).unwrap_err(),
+        cert.verify_signature(&cert.tbs.spki).unwrap_err(),
         VerifyError::Failed
     );
 }
@@ -124,7 +124,7 @@ fn pss_unknown_hash_is_rejected() {
     let cert_der = patch_to_pss(&rsa_cert(), &params_with_hash(SHA1_OID));
     let cert = Cert::parse(&cert_der).unwrap();
     assert_eq!(
-        cert.verify_signature(&cert.spki).unwrap_err(),
+        cert.verify_signature(&cert.tbs.spki).unwrap_err(),
         VerifyError::UnsupportedAlgorithm
     );
 }
@@ -134,7 +134,7 @@ fn pss_default_sha1_params_are_rejected() {
     let cert_der = patch_to_pss(&rsa_cert(), &[0x30, 0x00]);
     let cert = Cert::parse(&cert_der).unwrap();
     assert_eq!(
-        cert.verify_signature(&cert.spki).unwrap_err(),
+        cert.verify_signature(&cert.tbs.spki).unwrap_err(),
         VerifyError::UnsupportedAlgorithm
     );
 }

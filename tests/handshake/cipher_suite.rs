@@ -1,0 +1,121 @@
+use shin::client::Client;
+use shin::client::config::{Config, Verifier};
+use shin::connection::Epoch;
+use shin::crypto::sig::SigningKey;
+use shin::server::config::CertSource;
+use shin::wire::codec::Reader;
+use shin::wire::handshake::frame::Frame;
+use shin::wire::record::CipherSuite;
+
+use crate::common::CollectEvents;
+use crate::common::{Server, ServerConfig, send};
+
+type TestClient = Client<fn() -> u64>;
+type TestServer = Server<fn() -> u64>;
+
+fn clock() -> u64 {
+    1_000_000
+}
+
+fn signing_key() -> SigningKey {
+    SigningKey::from_seed(&[0x6cu8; 32]).unwrap()
+}
+
+fn server() -> TestServer {
+    Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: signing_key(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
+        },
+        clock,
+    )
+}
+
+fn client() -> TestClient {
+    Client::new(
+        Config {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: *signing_key().pubkey().unwrap(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
+        },
+        clock as fn() -> u64,
+    )
+    .unwrap()
+}
+
+fn ch_with_suites(ch_bytes: &[u8], suites: Vec<u16>) -> Vec<u8> {
+    let mut r = Reader::new(ch_bytes);
+    let Frame::ClientHello(mut ch) = Frame::decode(&mut r).unwrap() else {
+        panic!("not a ClientHello");
+    };
+    ch.cipher_suites = suites;
+    let mut out = Vec::new();
+    Frame::ClientHello(ch).encode(&mut out).unwrap();
+    out
+}
+
+fn server_hello_suite(blob: &[u8]) -> u16 {
+    let mut r = Reader::new(blob);
+    let Frame::ServerHello(sh) = Frame::decode(&mut r).unwrap() else {
+        panic!("not a ServerHello");
+    };
+    sh.cipher_suite
+}
+
+#[test]
+fn both_suites_offered_negotiates_aes() {
+    let mut server = server();
+    let mut client = client();
+    let ch = send(&client.start().unwrap(), Epoch::Plaintext);
+    let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
+    let sh = send(&s1, Epoch::Plaintext);
+    let s_hs = send(&s1, Epoch::Handshake);
+    client.read(Epoch::Plaintext, &sh).unwrap();
+    client.read(Epoch::Handshake, &s_hs).unwrap();
+
+    // AES is server-preferred, so a client offering both keeps AES.
+    assert_eq!(
+        server.negotiated_cipher_suite(),
+        Some(CipherSuite::Aes128GcmSha256)
+    );
+    assert_eq!(
+        client.negotiated_cipher_suite(),
+        Some(CipherSuite::Aes128GcmSha256)
+    );
+}
+
+#[test]
+fn server_selects_chacha_when_only_chacha_offered() {
+    let mut server = server();
+    let mut client = client();
+    let ch = send(&client.start().unwrap(), Epoch::Plaintext);
+    let ch = ch_with_suites(&ch, vec![0x1303]);
+
+    let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
+    assert_eq!(
+        server.negotiated_cipher_suite(),
+        Some(CipherSuite::ChaCha20Poly1305Sha256)
+    );
+    assert_eq!(server_hello_suite(&send(&s1, Epoch::Plaintext)), 0x1303);
+}
+
+#[test]
+fn server_rejects_when_no_supported_suite_offered() {
+    let mut server = server();
+    let mut client = client();
+    let ch = send(&client.start().unwrap(), Epoch::Plaintext);
+    let ch = ch_with_suites(&ch, vec![0x9999]);
+    assert_eq!(
+        server.read(Epoch::Plaintext, &ch).unwrap_err(),
+        shin::connection::Error::UnsupportedCipherSuite,
+    );
+}

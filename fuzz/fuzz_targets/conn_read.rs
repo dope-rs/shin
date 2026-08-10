@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use shin::client::Client;
 use shin::client::config::{Config, Verifier};
-use shin::server::{config, config::CertSource, config::ConnectionConfig, Server, Shard};
+use shin::server::{config, config::CertSource, config::Connection, Server, Shard};
 use shin::crypto::sig::SigningKey;
 use shin::connection::{Epoch, Event, EventContext, EventSink};
 
@@ -44,7 +44,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut server = Server::new(
-        ConnectionConfig {
+        Connection {
             transport_params: Vec::new(),
         },
         || 0,

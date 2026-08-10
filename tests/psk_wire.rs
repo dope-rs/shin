@@ -1,18 +1,18 @@
-use shin::wire::psk::{KX_MODE_PSK_DHE, KxModes, Offer, PskIdentity, SelectedIdentity};
+use shin::wire::psk::{Identity, KX_MODE_DHE, KxModes, Offer, SelectedIdentity};
 
 #[test]
 fn kx_modes_round_trip() {
-    let modes = vec![KX_MODE_PSK_DHE];
+    let modes = vec![KX_MODE_DHE];
     let bytes = KxModes::new(modes.clone()).encode().unwrap();
     assert_eq!(bytes[0], 1);
-    assert_eq!(bytes[1], KX_MODE_PSK_DHE);
+    assert_eq!(bytes[1], KX_MODE_DHE);
     let parsed = KxModes::decode(&bytes).unwrap();
     assert_eq!(parsed.as_slice(), modes);
 }
 
 #[test]
 fn offer_ch_round_trip_one_identity() {
-    let ids = vec![PskIdentity {
+    let ids = vec![Identity {
         identity: b"opaque-ticket-bytes".to_vec(),
         obfuscated_ticket_age: 0xDEADBEEF,
     }];
@@ -26,11 +26,11 @@ fn offer_ch_round_trip_one_identity() {
 #[test]
 fn offer_ch_round_trip_multiple() {
     let ids = vec![
-        PskIdentity {
+        Identity {
             identity: b"id-A".to_vec(),
             obfuscated_ticket_age: 1,
         },
-        PskIdentity {
+        Identity {
             identity: b"id-B".to_vec(),
             obfuscated_ticket_age: 2,
         },

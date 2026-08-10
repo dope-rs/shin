@@ -1,11 +1,10 @@
-use std::mem::MaybeUninit;
-
-use shin::crypto::aead::AeadKey;
-use shin::crypto::hash::HashAlg;
+use o3::buffer;
+use shin::crypto::aead::Key;
+use shin::crypto::hash::Algorithm;
 use shin::crypto::schedule::TrafficKeys;
 use shin::wire::record::{
-    AEAD_TAG_LEN, ContentType, HEADER_LEN, MAX_PLAINTEXT_BODY, Opener, PROTOCOL_VERSION,
-    PlaintextRecord, RecordError, Sealer,
+    AEAD_TAG_LEN, ContentType, Error, HEADER_LEN, MAX_PLAINTEXT_BODY, Opener, PROTOCOL_VERSION,
+    Plaintext, Sealer,
 };
 
 const TEST_SECRET: [u8; 32] = [
@@ -14,8 +13,8 @@ const TEST_SECRET: [u8; 32] = [
 ];
 
 fn craft_wire(seq: u64, inner_plaintext: &[u8]) -> Vec<u8> {
-    let keys = TrafficKeys::<16>::derive(HashAlg::Sha256, &TEST_SECRET).unwrap();
-    let aead = AeadKey::aes_128_gcm(&keys.key, keys.iv).unwrap();
+    let keys = TrafficKeys::<16>::derive(Algorithm::Sha256, &TEST_SECRET).unwrap();
+    let aead = Key::aes_128_gcm(&keys.key, keys.iv).unwrap();
     let outer_body_len = inner_plaintext.len() + AEAD_TAG_LEN;
     let mut wire = Vec::with_capacity(HEADER_LEN);
     wire.push(ContentType::ApplicationData as u8);
@@ -30,14 +29,15 @@ fn craft_wire(seq: u64, inner_plaintext: &[u8]) -> Vec<u8> {
 fn plaintext_round_trip() {
     let body = b"client-hello-bytes";
     let mut buf = Vec::new();
-    PlaintextRecord::encode_into(ContentType::Handshake, body, &mut buf).unwrap();
+    Plaintext::encode_into(ContentType::Handshake, body, &mut buf).unwrap();
     assert_eq!(buf[0], ContentType::Handshake as u8);
     assert_eq!(&buf[1..3], &PROTOCOL_VERSION.to_be_bytes());
     assert_eq!(&buf[3..5], &(body.len() as u16).to_be_bytes());
     assert_eq!(&buf[5..], body);
 
-    let parsed = PlaintextRecord::parse(&buf).unwrap().unwrap();
+    let parsed = Plaintext::parse(&buf).unwrap().unwrap();
     assert_eq!(parsed.0.content_type, ContentType::Handshake);
+    assert_eq!(parsed.0.legacy_record_version, PROTOCOL_VERSION);
     assert_eq!(parsed.0.body, body);
     assert_eq!(parsed.1, buf.len());
 }
@@ -46,22 +46,28 @@ fn plaintext_round_trip() {
 fn parse_plaintext_partial_returns_none() {
     let body = b"abc";
     let mut buf = Vec::new();
-    PlaintextRecord::encode_into(ContentType::Handshake, body, &mut buf).unwrap();
-    assert!(PlaintextRecord::parse(&buf[..3]).unwrap().is_none());
-    assert!(
-        PlaintextRecord::parse(&buf[..buf.len() - 1])
-            .unwrap()
-            .is_none()
-    );
+    Plaintext::encode_into(ContentType::Handshake, body, &mut buf).unwrap();
+    assert!(Plaintext::parse(&buf[..3]).unwrap().is_none());
+    assert!(Plaintext::parse(&buf[..buf.len() - 1]).unwrap().is_none());
 }
 
 #[test]
 fn parse_plaintext_rejects_unknown_content_type() {
     let buf = vec![99u8, 0x03, 0x03, 0x00, 0x00];
-    assert_eq!(
-        PlaintextRecord::parse(&buf).unwrap_err(),
-        RecordError::BadContentType
-    );
+    assert_eq!(Plaintext::parse(&buf).unwrap_err(), Error::BadContentType);
+}
+
+#[test]
+fn parse_plaintext_exposes_legacy_version_and_rejects_unknown_versions() {
+    let ssl3 = vec![ContentType::Handshake as u8, 0x03, 0x00, 0x00, 0x00];
+    assert!(matches!(
+        Plaintext::parse(&ssl3),
+        Err(Error::BadLegacyVersion)
+    ));
+
+    let tls10_client_hello = vec![ContentType::Handshake as u8, 0x03, 0x01, 0x00, 0x00];
+    let parsed = Plaintext::parse(&tls10_client_hello).unwrap().unwrap().0;
+    assert_eq!(parsed.legacy_record_version, 0x0301);
 }
 
 #[test]
@@ -93,47 +99,17 @@ fn ciphertext_round_trip_app_data_inner() {
 }
 
 #[test]
-fn ciphertext_open_into_copies_once_to_caller_storage() {
+fn ciphertext_open_decrypts_in_place() {
     let body = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
     let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
-    let wire = sealer.seal(ContentType::ApplicationData, body).unwrap();
-    let original = wire.clone();
-    let mut output = vec![MaybeUninit::uninit(); wire.len() - HEADER_LEN];
-    let output_start = output.as_ptr().cast::<u8>();
+    let mut wire = sealer.seal(ContentType::ApplicationData, body).unwrap();
     let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
 
-    let opened = opener
-        .open_into_uninit(&wire, &mut output)
-        .unwrap()
-        .unwrap();
+    let (content_type, range, consumed) = opener.open(&mut wire).unwrap().unwrap();
 
-    assert_eq!(opened.content_type, ContentType::ApplicationData);
-    assert_eq!(opened.body, body);
-    assert_eq!(opened.body.as_ptr(), output_start);
-    assert_eq!(opened.consumed, wire.len());
-    assert_eq!(wire, original);
-}
-
-#[test]
-fn ciphertext_open_into_retries_after_small_destination() {
-    let body = b"destination bound";
-    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
-    let wire = sealer.seal(ContentType::ApplicationData, body).unwrap();
-    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
-    let mut small = [MaybeUninit::uninit(); AEAD_TAG_LEN];
-
-    assert!(matches!(
-        opener.open_into_uninit(&wire, &mut small),
-        Err(RecordError::BufferTooSmall)
-    ));
-    assert_eq!(opener.seq(), 0);
-
-    let mut output = vec![MaybeUninit::uninit(); wire.len() - HEADER_LEN];
-    let opened = opener
-        .open_into_uninit(&wire, &mut output)
-        .unwrap()
-        .unwrap();
-    assert_eq!(opened.body, body);
+    assert_eq!(content_type, ContentType::ApplicationData);
+    assert_eq!(&wire[range], body);
+    assert_eq!(consumed, wire.len());
 }
 
 #[test]
@@ -160,38 +136,44 @@ fn seal_into_staged_equals_seal_and_round_trips() {
 fn seal_parts_crosses_slice_boundaries_without_changing_the_record() {
     let parts = [&b"response-"[..], &b""[..], &b"header"[..], &b"+body"[..]];
     let body_len = parts.iter().map(|part| part.len()).sum();
-    let mut output = [MaybeUninit::uninit(); 128];
+    let pool = buffer::pool::Pool::try_new(1, 128).unwrap();
+    let mut output = pool.try_acquire_buffer().unwrap();
     let mut vectored = Sealer::from_secret(&TEST_SECRET).unwrap();
-    let wire = vectored
-        .seal_parts_into_uninit(ContentType::ApplicationData, body_len, parts, &mut output)
-        .unwrap();
+    {
+        let mut writer = output.spare_writer();
+        vectored
+            .seal_parts_to(ContentType::ApplicationData, body_len, parts, &mut writer)
+            .unwrap();
+    }
 
     let mut contiguous = Sealer::from_secret(&TEST_SECRET).unwrap();
     let expected = contiguous
         .seal(ContentType::ApplicationData, b"response-header+body")
         .unwrap();
 
-    assert_eq!(wire, expected);
+    assert_eq!(output.as_slice(), expected);
 }
 
 #[test]
 fn seal_parts_rejects_length_mismatch_without_consuming_sequence() {
-    let mut output = [MaybeUninit::uninit(); 128];
+    let pool = buffer::pool::Pool::try_new(1, 128).unwrap();
+    let mut output = pool.try_acquire_buffer().unwrap();
+    let mut writer = output.spare_writer();
     let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
 
     assert_eq!(
         sealer
-            .seal_parts_into_uninit(ContentType::ApplicationData, 4, [&b"abc"[..]], &mut output,)
+            .seal_parts_to(ContentType::ApplicationData, 4, [&b"abc"[..]], &mut writer)
             .unwrap_err(),
-        RecordError::LengthMismatch
+        Error::LengthMismatch
     );
     assert_eq!(sealer.seq(), 0);
 
     assert_eq!(
         sealer
-            .seal_parts_into_uninit(ContentType::ApplicationData, 2, [&b"abc"[..]], &mut output,)
+            .seal_parts_to(ContentType::ApplicationData, 2, [&b"abc"[..]], &mut writer)
             .unwrap_err(),
-        RecordError::LengthMismatch
+        Error::LengthMismatch
     );
     assert_eq!(sealer.seq(), 0);
 }
@@ -210,12 +192,15 @@ fn seal_output_methods_match_byte_for_byte() {
         .unwrap();
     assert_eq!(&wire[..n], one.as_slice());
 
-    let mut uninit = vec![MaybeUninit::uninit(); one.len()];
+    let pool = buffer::pool::Pool::try_new(1, one.len()).unwrap();
+    let mut direct = pool.try_acquire_buffer().unwrap();
     let mut into = Sealer::from_secret(&TEST_SECRET).unwrap();
-    let wire = into
-        .seal_into_uninit(ContentType::ApplicationData, body, &mut uninit)
-        .unwrap();
-    assert_eq!(wire, one.as_slice());
+    {
+        let mut writer = direct.spare_writer();
+        into.seal_to(ContentType::ApplicationData, body, &mut writer)
+            .unwrap();
+    }
+    assert_eq!(direct.as_slice(), one.as_slice());
 }
 
 #[test]
@@ -224,7 +209,7 @@ fn seal_output_methods_reject_undersized_buffer() {
     let mut tiny = [0u8; HEADER_LEN];
     assert_eq!(
         sealer.seal_into_slice(ContentType::ApplicationData, b"x", &mut tiny),
-        Err(RecordError::BufferTooSmall)
+        Err(Error::BufferTooSmall)
     );
     assert_eq!(
         sealer.seq(),
@@ -232,10 +217,12 @@ fn seal_output_methods_reject_undersized_buffer() {
         "a rejected seal must not spend the sequence"
     );
 
-    let mut tiny = [MaybeUninit::uninit(); HEADER_LEN];
+    let pool = buffer::pool::Pool::try_new(1, HEADER_LEN).unwrap();
+    let mut tiny = pool.try_acquire_buffer().unwrap();
+    let mut writer = tiny.spare_writer();
     assert_eq!(
-        sealer.seal_into_uninit(ContentType::ApplicationData, b"x", &mut tiny),
-        Err(RecordError::BufferTooSmall)
+        sealer.seal_to(ContentType::ApplicationData, b"x", &mut writer),
+        Err(Error::BufferTooSmall)
     );
     assert_eq!(sealer.seq(), 0);
 }
@@ -243,30 +230,35 @@ fn seal_output_methods_reject_undersized_buffer() {
 #[test]
 fn encode_output_methods_match_byte_for_byte() {
     let body = b"client-hello-bytes";
-    let one = PlaintextRecord::encode(ContentType::Handshake, body).unwrap();
+    let one = Plaintext::encode(ContentType::Handshake, body).unwrap();
 
     let mut wire = vec![0u8; one.len()];
-    let n = PlaintextRecord::encode_into_slice(ContentType::Handshake, body, &mut wire).unwrap();
+    let n = Plaintext::encode_into_slice(ContentType::Handshake, body, &mut wire).unwrap();
     assert_eq!(&wire[..n], one.as_slice());
 
-    let mut uninit = vec![MaybeUninit::uninit(); one.len()];
-    let wire =
-        PlaintextRecord::encode_into_uninit(ContentType::Handshake, body, &mut uninit).unwrap();
-    assert_eq!(wire, one.as_slice());
+    let pool = buffer::pool::Pool::try_new(1, one.len()).unwrap();
+    let mut direct = pool.try_acquire_buffer().unwrap();
+    {
+        let mut writer = direct.spare_writer();
+        Plaintext::write_to(ContentType::Handshake, body, &mut writer).unwrap();
+    }
+    assert_eq!(direct.as_slice(), one.as_slice());
 }
 
 #[test]
 fn encode_output_methods_reject_undersized_buffer() {
     let mut tiny = [0u8; HEADER_LEN];
     assert_eq!(
-        PlaintextRecord::encode_into_slice(ContentType::Handshake, b"x", &mut tiny),
-        Err(RecordError::BufferTooSmall)
+        Plaintext::encode_into_slice(ContentType::Handshake, b"x", &mut tiny),
+        Err(Error::BufferTooSmall)
     );
 
-    let mut tiny = [MaybeUninit::uninit(); HEADER_LEN];
+    let pool = buffer::pool::Pool::try_new(1, HEADER_LEN).unwrap();
+    let mut tiny = pool.try_acquire_buffer().unwrap();
+    let mut writer = tiny.spare_writer();
     assert_eq!(
-        PlaintextRecord::encode_into_uninit(ContentType::Handshake, b"x", &mut tiny),
-        Err(RecordError::BufferTooSmall)
+        Plaintext::write_to(ContentType::Handshake, b"x", &mut writer),
+        Err(Error::BufferTooSmall)
     );
 }
 
@@ -292,7 +284,7 @@ fn ciphertext_open_rejects_tampered_tag() {
     let mut wire = sealer.seal(ContentType::ApplicationData, b"body").unwrap();
     let last = wire.len() - 1;
     wire[last] ^= 0x01;
-    assert_eq!(opener.open(&mut wire).unwrap_err(), RecordError::OpenFailed);
+    assert_eq!(opener.open(&mut wire).unwrap_err(), Error::OpenFailed);
 }
 
 #[test]
@@ -303,10 +295,7 @@ fn ciphertext_open_rejects_wrong_seq_order() {
     let mut wire2 = sealer
         .seal(ContentType::ApplicationData, b"second")
         .unwrap();
-    assert_eq!(
-        opener.open(&mut wire2).unwrap_err(),
-        RecordError::OpenFailed
-    );
+    assert_eq!(opener.open(&mut wire2).unwrap_err(), Error::OpenFailed);
 }
 
 #[test]
@@ -330,8 +319,22 @@ fn open_rejects_plaintext_outer_type() {
     wire[0] = ContentType::Handshake as u8;
     assert_eq!(
         opener.open(&mut wire).unwrap_err(),
-        RecordError::NotCipherTextOuter
+        Error::NotCipherTextOuter
     );
+}
+
+#[test]
+fn ciphertext_rejects_bad_legacy_version_and_poisons() {
+    let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut wire = sealer.seal(ContentType::Handshake, b"x").unwrap();
+    wire[1..3].copy_from_slice(&0x0301u16.to_be_bytes());
+
+    let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
+    assert_eq!(opener.open(&mut wire), Err(Error::BadLegacyVersion));
+
+    let mut fresh = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut valid = fresh.seal(ContentType::Handshake, b"x").unwrap();
+    assert_eq!(opener.open(&mut valid), Err(Error::Poisoned));
 }
 
 #[test]
@@ -342,15 +345,12 @@ fn auth_failure_poisons_opener_so_later_valid_records_are_refused() {
     tampered[last] ^= 0x01;
 
     let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
-    assert_eq!(
-        opener.open(&mut tampered).unwrap_err(),
-        RecordError::OpenFailed
-    );
+    assert_eq!(opener.open(&mut tampered).unwrap_err(), Error::OpenFailed);
     assert_eq!(opener.seq(), 0, "a forgery must not advance the sequence");
 
     let mut fresh = Sealer::from_secret(&TEST_SECRET).unwrap();
     let mut good = fresh.seal(ContentType::ApplicationData, b"body").unwrap();
-    assert_eq!(opener.open(&mut good).unwrap_err(), RecordError::Poisoned);
+    assert_eq!(opener.open(&mut good).unwrap_err(), Error::Poisoned);
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn seal_refuses_oversize_body() {
     let big = vec![0u8; MAX_PLAINTEXT_BODY + 1];
     assert_eq!(
         sealer.seal(ContentType::ApplicationData, &big),
-        Err(RecordError::BodyTooLarge)
+        Err(Error::BodyTooLarge)
     );
 }
 
@@ -368,8 +368,8 @@ fn encode_rejects_oversize_body() {
     let big = vec![0u8; MAX_PLAINTEXT_BODY + 1];
     let mut out = Vec::new();
     assert_eq!(
-        PlaintextRecord::encode_into(ContentType::Handshake, &big, &mut out),
-        Err(RecordError::BodyTooLarge)
+        Plaintext::encode_into(ContentType::Handshake, &big, &mut out),
+        Err(Error::BodyTooLarge)
     );
     assert!(out.is_empty());
 }
@@ -380,7 +380,11 @@ fn open_rejects_record_overflow() {
     inner.push(ContentType::ApplicationData as u8);
     let mut wire = craft_wire(0, &inner);
     let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
-    assert_eq!(opener.open(&mut wire), Err(RecordError::RecordOverflow));
+    assert_eq!(opener.open(&mut wire), Err(Error::RecordOverflow));
+
+    let mut fresh = Sealer::from_secret(&TEST_SECRET).unwrap();
+    let mut valid = fresh.seal(ContentType::ApplicationData, b"valid").unwrap();
+    assert_eq!(opener.open(&mut valid), Err(Error::Poisoned));
 }
 
 #[test]

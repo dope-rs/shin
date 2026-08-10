@@ -3,9 +3,10 @@ use rcgen::{
     Issuer, KeyPair, KeyUsagePurpose, NameConstraints, PKCS_ECDSA_P256_SHA256,
 };
 
+use shin::client::config::OwnedTrustAnchor;
+use shin::identity::UnixTime;
 use shin::identity::cert::Cert;
-use shin::identity::chain::{Chain, ChainError, TrustAnchor};
-use shin::identity::time::UnixTime;
+use shin::identity::chain::{Chain, Error, TrustAnchor};
 
 struct Ca {
     params: CertificateParams,
@@ -13,8 +14,8 @@ struct Ca {
     der: Vec<u8>,
 }
 
-fn ca_params(cn: &str, nc: Option<NameConstraints>) -> CertificateParams {
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+fn ca_params(cn: &str, nc: Option<NameConstraints>, sans: Vec<String>) -> CertificateParams {
+    let mut params = CertificateParams::new(sans).unwrap();
     params.distinguished_name = rcgen::DistinguishedName::new();
     params
         .distinguished_name
@@ -27,14 +28,30 @@ fn ca_params(cn: &str, nc: Option<NameConstraints>) -> CertificateParams {
 
 fn root(cn: &str) -> Ca {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let params = ca_params(cn, None);
+    let params = ca_params(cn, None, Vec::new());
+    let der = params.clone().self_signed(&key).unwrap().der().to_vec();
+    Ca { params, key, der }
+}
+
+fn constrained_root(cn: &str, nc: NameConstraints) -> Ca {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let params = ca_params(cn, Some(nc), Vec::new());
     let der = params.clone().self_signed(&key).unwrap().der().to_vec();
     Ca { params, key, der }
 }
 
 fn intermediate(cn: &str, nc: NameConstraints, parent: &Ca) -> Ca {
+    intermediate_with_sans(cn, Some(nc), Vec::new(), parent)
+}
+
+fn intermediate_with_sans(
+    cn: &str,
+    nc: Option<NameConstraints>,
+    sans: Vec<String>,
+    parent: &Ca,
+) -> Ca {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let params = ca_params(cn, Some(nc));
+    let params = ca_params(cn, nc, sans);
     let der = params
         .clone()
         .signed_by(&key, &Issuer::from_params(&parent.params, &parent.key))
@@ -61,12 +78,12 @@ fn leaf(san: &str, parent: &Ca) -> Vec<u8> {
 }
 
 fn mid_time(cert: &Cert<'_>) -> UnixTime {
-    let nb = UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
+    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
     UnixTime((nb.0 + na.0) / 2)
 }
 
-fn run(im_nc: NameConstraints, san: &str, host: &[u8]) -> Result<(), ChainError> {
+fn run(im_nc: NameConstraints, san: &str, host: &[u8]) -> Result<(), Error> {
     let r = root("root");
     let im = intermediate("im", im_nc, &r);
     let leaf_der = leaf(san, &im);
@@ -106,7 +123,7 @@ fn permitted_dns_subtree_rejects_outside_name() {
     let nc = permit(vec![GeneralSubtree::DnsName("corp.example".into())]);
     assert_eq!(
         run(nc, "evil.com", b"evil.com").unwrap_err(),
-        ChainError::NameConstraintViolation
+        Error::NameConstraintViolation
     );
 }
 
@@ -115,7 +132,7 @@ fn excluded_dns_subtree_rejects_match() {
     let nc = exclude(vec![GeneralSubtree::DnsName("bad.example".into())]);
     assert_eq!(
         run(nc, "x.bad.example", b"x.bad.example").unwrap_err(),
-        ChainError::NameConstraintViolation
+        Error::NameConstraintViolation
     );
 }
 
@@ -142,6 +159,86 @@ fn permitted_ip_subtree_rejects_out_of_range() {
     ))]);
     assert_eq!(
         run(nc, "192.168.1.1", b"192.168.1.1").unwrap_err(),
-        ChainError::NameConstraintViolation
+        Error::NameConstraintViolation
     );
+}
+
+#[test]
+fn certificate_derived_anchor_constraints_reject_leaf_outside_subtree() {
+    let r = constrained_root(
+        "root",
+        permit(vec![GeneralSubtree::DnsName("corp.example".into())]),
+    );
+    let im = intermediate_with_sans("im", None, Vec::new(), &r);
+    let leaf_der = leaf("evil.example", &im);
+    let leaf_cert = Cert::parse(&leaf_der).unwrap();
+    let im_cert = Cert::parse(&im.der).unwrap();
+    let root_cert = Cert::parse(&r.der).unwrap();
+    let now = mid_time(&leaf_cert);
+    let chain = [leaf_cert, im_cert];
+    let anchors = [TrustAnchor::from_cert(&root_cert)];
+
+    assert_eq!(
+        Chain::new(&chain)
+            .validate(&anchors, now, b"evil.example")
+            .unwrap_err(),
+        Error::NameConstraintViolation,
+    );
+}
+
+#[test]
+fn anchor_constraints_cover_every_subordinate_certificate() {
+    let r = constrained_root(
+        "root",
+        permit(vec![GeneralSubtree::DnsName("corp.example".into())]),
+    );
+    let im = intermediate_with_sans("im", None, vec!["outside.example".to_owned()], &r);
+    let leaf_der = leaf("host.corp.example", &im);
+    let leaf_cert = Cert::parse(&leaf_der).unwrap();
+    let im_cert = Cert::parse(&im.der).unwrap();
+    let root_cert = Cert::parse(&r.der).unwrap();
+    let now = mid_time(&leaf_cert);
+    let chain = [leaf_cert, im_cert];
+    let anchors = [TrustAnchor::from_cert(&root_cert)];
+
+    assert_eq!(
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.corp.example")
+            .unwrap_err(),
+        Error::NameConstraintViolation,
+    );
+}
+
+#[test]
+fn unconstrained_anchor_construction_is_explicit() {
+    let r = constrained_root(
+        "root",
+        permit(vec![GeneralSubtree::DnsName("corp.example".into())]),
+    );
+    let im = intermediate_with_sans("im", None, Vec::new(), &r);
+    let leaf_der = leaf("evil.example", &im);
+    let leaf_cert = Cert::parse(&leaf_der).unwrap();
+    let im_cert = Cert::parse(&im.der).unwrap();
+    let root_cert = Cert::parse(&r.der).unwrap();
+    let now = mid_time(&leaf_cert);
+    let chain = [leaf_cert, im_cert];
+    let anchors = [TrustAnchor::unconstrained(
+        root_cert.tbs.subject_der,
+        root_cert.tbs.spki,
+    )];
+
+    Chain::new(&chain)
+        .validate(&anchors, now, b"evil.example")
+        .expect("explicit out-of-band anchor has no certificate constraints");
+}
+
+#[test]
+fn owned_certificate_anchor_preserves_name_constraints() {
+    let r = constrained_root(
+        "root",
+        permit(vec![GeneralSubtree::DnsName("corp.example".into())]),
+    );
+    let anchor = OwnedTrustAnchor::from_cert_der(&r.der).unwrap();
+
+    assert!(anchor.name_constraints_der.is_some());
 }

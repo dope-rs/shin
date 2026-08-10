@@ -1,48 +1,54 @@
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::convert::Infallible;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use o3::buffer;
 use shin::client::Client;
 use shin::client::config::Config;
-use shin::connection::{Epoch, Event, EventContext, EventSink};
+use shin::connection::{DriveError, Epoch, Event, EventContext, EventSink};
+use shin::crypto::sig;
+use shin::server;
 use shin::wire::record::{CipherSuite, ContentType, Opener, Sealer};
 
-mod common;
-use common::CollectEvents;
-use common::{Server, ServerConfig, find_send, has_done, random_signing_key};
+mod raw;
 
 const TEST_SECRET: [u8; 32] = [
     0xb6, 0x7b, 0x7d, 0x69, 0x0c, 0xc1, 0x6c, 0x4e, 0x75, 0xe5, 0x42, 0x13, 0xcb, 0x2d, 0x37, 0xb4,
     0xe9, 0xc9, 0x12, 0xbc, 0xde, 0xd9, 0x10, 0x5d, 0x42, 0xbe, 0xfd, 0x59, 0xd3, 0x91, 0xad, 0x38,
 ];
 
-struct CountingAllocator;
+#[derive(Default)]
+struct HandshakeEvents {
+    sends: Vec<(Epoch, Vec<u8>)>,
+    done: bool,
+}
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
+impl HandshakeEvents {
+    fn send(&self, epoch: Epoch) -> Vec<u8> {
+        self.sends
+            .iter()
+            .find_map(|(event_epoch, data)| (*event_epoch == epoch).then(|| data.clone()))
+            .expect("expected handshake send")
     }
+}
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
-    }
+impl EventSink for HandshakeEvents {
+    type Error = Infallible;
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
+    fn event(&mut self, event: Event<'_>, _context: EventContext) -> Result<(), Self::Error> {
+        match event {
+            Event::Send { epoch, data } => self.sends.push((epoch, data.to_vec())),
+            Event::Done => self.done = true,
+            _ => {}
+        }
+        Ok(())
     }
+}
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
+fn collect_handshake_events(
+    run: impl FnOnce(&mut HandshakeEvents) -> Result<(), DriveError<Infallible>>,
+) -> HandshakeEvents {
+    let mut events = HandshakeEvents::default();
+    run(&mut events).expect("handshake drive failed");
+    events
 }
 
 struct KeyUpdateSink {
@@ -62,7 +68,14 @@ impl EventSink for KeyUpdateSink {
                 self.sends += 1;
                 self.suite = context.cipher_suite();
             }
-            Event::KeyUpdate { .. } => {
+            Event::KeyUpdate { secret, .. } => {
+                // Record protection consumes the synchronous secret borrow;
+                // the secret itself never escapes the callback.
+                let _ = Sealer::with_suite(
+                    secret.as_slice(),
+                    context.cipher_suite().expect("negotiated suite"),
+                )
+                .unwrap();
                 self.updates += 1;
                 self.suite = context.cipher_suite();
             }
@@ -75,54 +88,60 @@ impl EventSink for KeyUpdateSink {
 #[test]
 fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
     let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
-    let warmup = sealer
+    let mut warmup = sealer
         .seal(ContentType::ApplicationData, b"warm up crypto state")
         .unwrap();
-    let measured = sealer
+    let mut measured = sealer
         .seal(ContentType::ApplicationData, b"caller-owned output")
         .unwrap();
     let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let mut parts_sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
-    let mut warmup_output = [MaybeUninit::uninit(); 128];
-    let mut measured_output = [MaybeUninit::uninit(); 128];
-    let mut sealed_output = [MaybeUninit::uninit(); 128];
+    let pool = buffer::pool::Pool::try_new(1, 128).unwrap();
+    let mut sealed_output = pool.try_acquire_buffer().unwrap();
     let parts = [&b"caller-"[..], &b"owned "[..], &b"input"[..]];
 
-    opener
-        .open_into_uninit(&warmup, &mut warmup_output)
-        .unwrap()
-        .unwrap();
+    opener.open(&mut warmup).unwrap().unwrap();
 
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    let opened = opener
-        .open_into_uninit(&measured, &mut measured_output)
-        .unwrap()
-        .unwrap();
-    let sealed = parts_sealer
-        .seal_parts_into_uninit(
-            ContentType::ApplicationData,
-            b"caller-owned input".len(),
-            parts,
-            &mut sealed_output,
-        )
-        .unwrap();
-    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    raw::reset();
+    let (content_type, range, _) = opener.open(&mut measured).unwrap().unwrap();
+    let allocations = raw::count();
 
-    assert_eq!(opened.body, b"caller-owned output");
-    assert!(!sealed.is_empty());
-    assert_eq!(allocations, 0);
+    assert_eq!(content_type, ContentType::ApplicationData);
+    assert_eq!(&measured[range], b"caller-owned output");
+    assert_eq!(allocations, 0, "opening a caller-owned record allocated");
 
-    let server_key = random_signing_key();
+    raw::reset();
+    {
+        let mut writer = sealed_output.spare_writer();
+        parts_sealer
+            .seal_parts_to(
+                ContentType::ApplicationData,
+                b"caller-owned input".len(),
+                parts,
+                &mut writer,
+            )
+            .unwrap();
+    }
+    let allocations = raw::count();
+
+    assert!(!sealed_output.is_empty());
+    assert_eq!(
+        allocations, 0,
+        "sealing into caller-owned storage allocated"
+    );
+
+    let server_key = sig::SigningKey::from_seed(&[0x51; 32]).unwrap();
     let server_pubkey = *server_key.pubkey().unwrap();
-    let mut server = Server::new(
-        ServerConfig {
-            source: shin::server::config::CertSource::RawPublicKey {
-                signing_key: server_key,
-            },
+    let mut shard = server::Shard::new(server::config::Config {
+        source: server::config::CertSource::RawPublicKey {
+            signing_key: server_key,
+        },
+        alpn_protocols: Vec::new(),
+        ticket_keys: None,
+    });
+    let mut server = server::Server::new(
+        server::config::Connection {
             transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            ticket_keys: None,
-            accept_early_data: false,
         },
         || 0,
     );
@@ -139,16 +158,22 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
         || 0,
     )
     .unwrap();
-    let client_start = client.start().unwrap();
-    let client_hello = find_send(&client_start, Epoch::Plaintext).unwrap();
-    let server_start = server.read(Epoch::Plaintext, &client_hello).unwrap();
-    let server_hello = find_send(&server_start, Epoch::Plaintext).unwrap();
-    let server_flight = find_send(&server_start, Epoch::Handshake).unwrap();
-    client.read(Epoch::Plaintext, &server_hello).unwrap();
-    let client_finish = client.read(Epoch::Handshake, &server_flight).unwrap();
-    let client_flight = find_send(&client_finish, Epoch::Handshake).unwrap();
-    let server_finish = server.read(Epoch::Handshake, &client_flight).unwrap();
-    assert!(has_done(&server_finish));
+    let client_start = collect_handshake_events(|events| client.start_into(events));
+    let client_hello = client_start.send(Epoch::Plaintext);
+    let server_start = collect_handshake_events(|events| {
+        server.read_into(Epoch::Plaintext, &client_hello, &mut shard, events)
+    });
+    let server_hello = server_start.send(Epoch::Plaintext);
+    let server_flight = server_start.send(Epoch::Handshake);
+    collect_handshake_events(|events| client.read_into(Epoch::Plaintext, &server_hello, events));
+    let client_finish = collect_handshake_events(|events| {
+        client.read_into(Epoch::Handshake, &server_flight, events)
+    });
+    let client_flight = client_finish.send(Epoch::Handshake);
+    let server_finish = collect_handshake_events(|events| {
+        server.read_into(Epoch::Handshake, &client_flight, &mut shard, events)
+    });
+    assert!(server_finish.done);
 
     let key_update = [24, 0, 0, 1, 0];
     let mut sink = KeyUpdateSink {
@@ -156,20 +181,20 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
         updates: 0,
         suite: None,
     };
-    ALLOCATIONS.store(0, Ordering::Relaxed);
+    raw::reset();
     client.send_key_update_into(false, &mut sink).unwrap();
-    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocations = raw::count();
 
     assert_eq!(sink.sends, 1);
     assert_eq!(sink.updates, 1);
     assert_eq!(sink.suite, Some(CipherSuite::Aes128GcmSha256));
     assert_eq!(allocations, 0);
 
-    ALLOCATIONS.store(0, Ordering::Relaxed);
+    raw::reset();
     client
         .read_into(Epoch::Application, &key_update, &mut sink)
         .unwrap();
-    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocations = raw::count();
 
     assert_eq!(sink.updates, 2);
     assert_eq!(sink.suite, Some(CipherSuite::Aes128GcmSha256));
@@ -181,14 +206,14 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
     client
         .read_into(Epoch::Application, &key_update[2..], &mut sink)
         .unwrap();
-    ALLOCATIONS.store(0, Ordering::Relaxed);
+    raw::reset();
     client
         .read_into(Epoch::Application, &key_update[..3], &mut sink)
         .unwrap();
     client
         .read_into(Epoch::Application, &key_update[3..], &mut sink)
         .unwrap();
-    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocations = raw::count();
 
     assert_eq!(sink.updates, 4);
     assert_eq!(allocations, 0);

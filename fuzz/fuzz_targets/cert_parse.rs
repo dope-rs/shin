@@ -6,7 +6,7 @@ use shin::identity::cert::ext::ExtensionIter;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(cert) = Cert::parse(data) else { return };
-    let Some(exts) = cert.extensions_der else {
+    let Some(exts) = cert.tbs.extensions_der else {
         return;
     };
     for ext in ExtensionIter::new(exts) {

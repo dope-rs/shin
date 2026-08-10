@@ -1,15 +1,14 @@
-use alloc::vec::Vec;
-
-use crate::wire::record::{ContentType, PlaintextRecord, RecordError};
+use crate::wire::record;
+use alloc::vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum AlertLevel {
+pub enum Level {
     Warning = 1,
     Fatal = 2,
 }
 
-impl AlertLevel {
+impl Level {
     pub fn from_u8(b: u8) -> Option<Self> {
         match b {
             1 => Some(Self::Warning),
@@ -23,7 +22,7 @@ impl AlertLevel {
 /// and `user_canceled` are fatal in TLS 1.3 regardless of the level byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum AlertDescription {
+pub enum Description {
     CloseNotify = 0,
     UnexpectedMessage = 10,
     BadRecordMac = 20,
@@ -53,7 +52,7 @@ pub enum AlertDescription {
     NoApplicationProtocol = 120,
 }
 
-impl AlertDescription {
+impl Description {
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             0 => Self::CloseNotify,
@@ -96,22 +95,22 @@ impl AlertDescription {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Alert {
-    pub level: AlertLevel,
-    pub description: AlertDescription,
+    pub level: Level,
+    pub description: Description,
 }
 
 impl Alert {
-    pub fn fatal(description: AlertDescription) -> Self {
+    pub fn fatal(description: Description) -> Self {
         Self {
-            level: AlertLevel::Fatal,
+            level: Level::Fatal,
             description,
         }
     }
 
     pub fn close_notify() -> Self {
         Self {
-            level: AlertLevel::Warning,
-            description: AlertDescription::CloseNotify,
+            level: Level::Warning,
+            description: Description::CloseNotify,
         }
     }
 
@@ -121,33 +120,34 @@ impl Alert {
 
     /// Parse a 2-byte alert fragment. An unknown description byte is reported as
     /// a decode error rather than guessed at.
-    pub fn parse(body: &[u8]) -> Result<Self, AlertParseError> {
+    pub fn parse(body: &[u8]) -> Result<Self, Error> {
         if body.len() != 2 {
-            return Err(AlertParseError::BadLength);
+            return Err(Error::BadLength);
         }
-        let level = AlertLevel::from_u8(body[0]).ok_or(AlertParseError::BadLevel)?;
-        let description =
-            AlertDescription::from_u8(body[1]).ok_or(AlertParseError::UnknownDescription)?;
+        let level = Level::from_u8(body[0]).ok_or(Error::BadLevel)?;
+        let description = Description::from_u8(body[1]).ok_or(Error::UnknownDescription)?;
         Ok(Self { level, description })
     }
 
     /// Encode this alert as a plaintext alert record (content type 21). Used for
     /// alerts sent before the handshake traffic keys are established; later
     /// alerts must be sealed under the current epoch instead.
-    pub fn to_plaintext_record(&self) -> Result<Vec<u8>, RecordError> {
-        PlaintextRecord::encode(ContentType::Alert, &self.body())
+    pub fn to_plaintext_record(&self) -> Result<vec::Vec<u8>, record::Error> {
+        use crate::wire::record::ContentType;
+        use crate::wire::record::Plaintext;
+        Plaintext::encode(ContentType::Alert, &self.body())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlertParseError {
+pub enum Error {
     BadLength,
     BadLevel,
     UnknownDescription,
 }
 
-impl From<AlertParseError> for RecordError {
-    fn from(_: AlertParseError) -> Self {
-        RecordError::BadContentType
+impl From<Error> for record::Error {
+    fn from(_: Error) -> Self {
+        record::Error::BadContentType
     }
 }

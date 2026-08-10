@@ -3,9 +3,9 @@ use rcgen::{
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 
+use shin::identity::UnixTime;
 use shin::identity::cert::Cert;
-use shin::identity::chain::{Chain, ChainError, TrustAnchor};
-use shin::identity::time::UnixTime;
+use shin::identity::chain::{Chain, Error, TrustAnchor};
 
 type Ca = (CertificateParams, KeyPair, Vec<u8>);
 
@@ -56,8 +56,8 @@ fn leaf_signed_by(dns: &str, parent: &Ca) -> Vec<u8> {
 }
 
 fn now_for(leaf: &Cert<'_>) -> UnixTime {
-    let nb = UnixTime::from_time_value(&leaf.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&leaf.validity.not_after).unwrap();
+    let nb = UnixTime::from_time_value(&leaf.tbs.validity.not_before).unwrap();
+    let na = UnixTime::from_time_value(&leaf.tbs.validity.not_after).unwrap();
     UnixTime((nb.0 + na.0) / 2)
 }
 
@@ -129,6 +129,48 @@ fn tries_alternate_cross_signed_anchors() {
 }
 
 #[test]
+fn unique_same_name_issuer_with_wrong_key_is_rejected() {
+    let root = ca("root");
+    let actual_issuer = intermediate("issuer", &root, vec![]);
+    let wrong_issuer = intermediate("issuer", &root, vec![]);
+    let leaf_der = leaf_signed_by("host.local", &actual_issuer);
+
+    let leaf = Cert::parse(&leaf_der).unwrap();
+    let wrong_issuer = Cert::parse(&wrong_issuer.2).unwrap();
+    let root = Cert::parse(&root.2).unwrap();
+    let now = now_for(&leaf);
+    let chain = [leaf, wrong_issuer];
+    let anchors = [TrustAnchor::from_cert(&root)];
+
+    assert!(matches!(
+        Chain::new(&chain)
+            .validate(&anchors, now, b"host.local")
+            .unwrap_err(),
+        Error::Verify(_)
+    ));
+}
+
+#[test]
+fn ambiguous_same_name_issuers_choose_the_signature_valid_path() {
+    let root = ca("root");
+    let actual_issuer = intermediate("issuer", &root, vec![]);
+    let wrong_issuer = intermediate("issuer", &root, vec![]);
+    let leaf_der = leaf_signed_by("host.local", &actual_issuer);
+
+    let leaf = Cert::parse(&leaf_der).unwrap();
+    let actual_issuer = Cert::parse(&actual_issuer.2).unwrap();
+    let wrong_issuer = Cert::parse(&wrong_issuer.2).unwrap();
+    let root = Cert::parse(&root.2).unwrap();
+    let now = now_for(&leaf);
+    let chain = [leaf, wrong_issuer, actual_issuer];
+    let anchors = [TrustAnchor::from_cert(&root)];
+
+    Chain::new(&chain)
+        .validate(&anchors, now, b"host.local")
+        .expect("same-name candidates are disambiguated by signature");
+}
+
+#[test]
 fn rejects_intermediate_without_server_auth_eku() {
     let root = ca("root");
     let im = intermediate("im", &root, vec![ExtendedKeyUsagePurpose::ClientAuth]);
@@ -145,7 +187,7 @@ fn rejects_intermediate_without_server_auth_eku() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::NoServerAuth,
+        Error::NoServerAuth,
     );
 }
 
@@ -194,6 +236,6 @@ fn rejects_duplicate_extension() {
         Chain::new(&chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
-        ChainError::DuplicateExtension,
+        Error::DuplicateExtension,
     );
 }

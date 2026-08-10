@@ -1,109 +1,123 @@
-use crate::wire::codec::{DecodeError, Encode, EncodeError, Reader};
+use crate::wire::codec;
+use crate::wire::handshake::messages;
+use crate::wire::handshake::views;
 
-use super::messages::{
-    Certificate, CertificateRequest, CertificateVerify, ClientHello, EncryptedExtensions, Finished,
-    HandshakeType, KeyUpdate, NewSessionTicket, ServerHello,
-};
+/// Allocation-free view of one framed handshake message. This is the same
+/// acceptance path used by the live client and server state machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Borrowed<'a>(views::MessageRef<'a>);
+
+impl<'a> Borrowed<'a> {
+    /// Decodes one message and leaves any following framed messages in `reader`.
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+        Ok(Self(views::MessageRef::decode_from(reader)?))
+    }
+
+    /// Decodes exactly one complete framed message.
+    pub fn decode_exact(raw: &'a [u8]) -> Result<Self, codec::DecodeError> {
+        Ok(Self(views::MessageRef::decode(raw)?))
+    }
+
+    pub fn into_owned(self) -> Frame {
+        self.0.into()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    ClientHello(ClientHello),
-    ServerHello(ServerHello),
-    EncryptedExtensions(EncryptedExtensions),
-    CertificateRequest(CertificateRequest),
-    Certificate(Certificate),
-    CertificateVerify(CertificateVerify),
-    Finished(Finished),
+    ClientHello(messages::ClientHello),
+    ServerHello(messages::ServerHello),
+    EncryptedExtensions(messages::EncryptedExtensions),
+    CertificateRequest(messages::CertificateRequest),
+    Certificate(messages::Certificate),
+    CertificateVerify(messages::CertificateVerify),
+    Finished(messages::Finished),
     EndOfEarlyData,
-    KeyUpdate(KeyUpdate),
-    NewSessionTicket(NewSessionTicket),
+    KeyUpdate(messages::KeyUpdate),
+    NewSessionTicket(messages::NewSessionTicket),
 }
 
 impl Frame {
     pub(crate) fn encode_finished(
         verify_data: &[u8],
-        out: &mut impl Encode,
-    ) -> Result<(), EncodeError> {
-        out.put_u8(HandshakeType::Finished as u8);
-        out.put_vec_u24(|body| {
-            body.put_slice(verify_data);
-            Ok(())
-        })
+        out: &mut impl codec::Encode,
+    ) -> Result<(), codec::EncodeError> {
+        out.put_u8(super::Type::Finished as u8);
+        let mut body = out.begin_u24()?;
+        messages::Finished::encode_verify_data(verify_data, &mut body);
+        body.finish()
     }
 
     pub(crate) fn encode_certificate_verify(
         algorithm: u16,
         signature: &[u8],
-        out: &mut impl Encode,
-    ) -> Result<(), EncodeError> {
-        out.put_u8(HandshakeType::CertificateVerify as u8);
-        out.put_vec_u24(|body| {
-            body.put_u16(algorithm);
-            body.put_vec_u16(|signature_body| {
-                signature_body.put_slice(signature);
-                Ok(())
-            })
-        })
+        out: &mut impl codec::Encode,
+    ) -> Result<(), codec::EncodeError> {
+        out.put_u8(super::Type::CertificateVerify as u8);
+        let mut body = out.begin_u24()?;
+        messages::CertificateVerify::encode_fields(algorithm, signature, &mut body)?;
+        body.finish()
     }
 
-    pub fn msg_type(&self) -> HandshakeType {
+    pub fn msg_type(&self) -> super::Type {
         match self {
-            Self::ClientHello(_) => HandshakeType::ClientHello,
-            Self::ServerHello(_) => HandshakeType::ServerHello,
-            Self::EncryptedExtensions(_) => HandshakeType::EncryptedExtensions,
-            Self::CertificateRequest(_) => HandshakeType::CertificateRequest,
-            Self::Certificate(_) => HandshakeType::Certificate,
-            Self::CertificateVerify(_) => HandshakeType::CertificateVerify,
-            Self::Finished(_) => HandshakeType::Finished,
-            Self::EndOfEarlyData => HandshakeType::EndOfEarlyData,
-            Self::KeyUpdate(_) => HandshakeType::KeyUpdate,
-            Self::NewSessionTicket(_) => HandshakeType::NewSessionTicket,
+            Self::ClientHello(_) => super::Type::ClientHello,
+            Self::ServerHello(_) => super::Type::ServerHello,
+            Self::EncryptedExtensions(_) => super::Type::EncryptedExtensions,
+            Self::CertificateRequest(_) => super::Type::CertificateRequest,
+            Self::Certificate(_) => super::Type::Certificate,
+            Self::CertificateVerify(_) => super::Type::CertificateVerify,
+            Self::Finished(_) => super::Type::Finished,
+            Self::EndOfEarlyData => super::Type::EndOfEarlyData,
+            Self::KeyUpdate(_) => super::Type::KeyUpdate,
+            Self::NewSessionTicket(_) => super::Type::NewSessionTicket,
         }
     }
 
-    pub fn encode(&self, out: &mut impl Encode) -> Result<(), EncodeError> {
+    pub fn encode(&self, out: &mut impl codec::Encode) -> Result<(), codec::EncodeError> {
         out.put_u8(self.msg_type() as u8);
-        out.put_vec_u24(|o| match self {
-            Self::ClientHello(m) => m.encode(o),
-            Self::ServerHello(m) => m.encode(o),
-            Self::EncryptedExtensions(m) => m.encode(o),
-            Self::CertificateRequest(m) => m.encode(o),
-            Self::Certificate(m) => m.encode(o),
-            Self::CertificateVerify(m) => m.encode(o),
-            Self::Finished(m) => m.encode(o),
-            Self::EndOfEarlyData => Ok(()),
-            Self::KeyUpdate(m) => m.encode(o),
-            Self::NewSessionTicket(m) => m.encode(o),
-        })
+        let mut body = out.begin_u24()?;
+        match self {
+            Self::ClientHello(m) => m.encode(&mut body)?,
+            Self::ServerHello(m) => m.encode(&mut body)?,
+            Self::EncryptedExtensions(m) => m.encode(&mut body)?,
+            Self::CertificateRequest(m) => m.encode(&mut body)?,
+            Self::Certificate(m) => m.encode(&mut body)?,
+            Self::CertificateVerify(m) => m.encode(&mut body)?,
+            Self::Finished(m) => m.encode(&mut body)?,
+            Self::EndOfEarlyData => {}
+            Self::KeyUpdate(m) => m.encode(&mut body)?,
+            Self::NewSessionTicket(m) => m.encode(&mut body)?,
+        }
+        body.finish()
     }
 
-    pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        let ty = HandshakeType::from_u8(r.u8()?)?;
-        let mut body = r.sub_u24()?;
-        let m = match ty {
-            HandshakeType::ClientHello => Self::ClientHello(ClientHello::decode(&mut body)?),
-            HandshakeType::ServerHello => Self::ServerHello(ServerHello::decode(&mut body)?),
-            HandshakeType::EncryptedExtensions => {
-                Self::EncryptedExtensions(EncryptedExtensions::decode(&mut body)?)
+    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
+        Ok(Borrowed::decode(r)?.into_owned())
+    }
+}
+
+impl From<views::MessageRef<'_>> for Frame {
+    fn from(message: views::MessageRef<'_>) -> Self {
+        match message {
+            views::MessageRef::ClientHello(message) => Self::ClientHello(message.into()),
+            views::MessageRef::ServerHello(message) => Self::ServerHello(message.into()),
+            views::MessageRef::EncryptedExtensions(message) => {
+                Self::EncryptedExtensions(message.into())
             }
-            HandshakeType::CertificateRequest => {
-                Self::CertificateRequest(CertificateRequest::decode(&mut body)?)
+            views::MessageRef::CertificateRequest(message) => {
+                Self::CertificateRequest(message.into())
             }
-            HandshakeType::Certificate => Self::Certificate(Certificate::decode(&mut body)?),
-            HandshakeType::CertificateVerify => {
-                Self::CertificateVerify(CertificateVerify::decode(&mut body)?)
+            views::MessageRef::Certificate(message) => Self::Certificate(message.into()),
+            views::MessageRef::CertificateVerify(message) => {
+                Self::CertificateVerify(message.into())
             }
-            HandshakeType::Finished => Self::Finished(Finished::decode(&mut body)?),
-            HandshakeType::EndOfEarlyData => Self::EndOfEarlyData,
-            HandshakeType::KeyUpdate => Self::KeyUpdate(KeyUpdate::decode(&mut body)?),
-            HandshakeType::NewSessionTicket => {
-                Self::NewSessionTicket(NewSessionTicket::decode(&mut body)?)
-            }
-            HandshakeType::MessageHash => {
-                return Err(DecodeError::InvalidEnum);
-            }
-        };
-        body.finish()?;
-        Ok(m)
+            views::MessageRef::Finished(verify_data) => Self::Finished(messages::Finished {
+                verify_data: verify_data.to_vec(),
+            }),
+            views::MessageRef::EndOfEarlyData => Self::EndOfEarlyData,
+            views::MessageRef::KeyUpdate(message) => Self::KeyUpdate(message),
+            views::MessageRef::NewSessionTicket(message) => Self::NewSessionTicket(message.into()),
+        }
     }
 }

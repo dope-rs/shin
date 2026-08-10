@@ -2,9 +2,9 @@ use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use shin::identity::cert::Cert;
 use shin::identity::cert::ext::{
-    BasicConstraints, ExtensionIter, GeneralName, KeyUsage, OID_EKU_CLIENT_AUTH,
-    OID_EKU_SERVER_AUTH, OID_EXT_BASIC_CONSTRAINTS, OID_EXT_EXTENDED_KEY_USAGE, OID_EXT_KEY_USAGE,
-    OID_EXT_SAN,
+    BasicConstraints, ExtensionIter, GeneralName, KeyUsage, OID_BASIC_CONSTRAINTS,
+    OID_EKU_CLIENT_AUTH, OID_EKU_SERVER_AUTH, OID_EXTENDED_KEY_USAGE, OID_KEY_USAGE,
+    OID_SUBJECT_ALT_NAME,
 };
 
 fn make_cert(setup: impl FnOnce(&mut CertificateParams)) -> Vec<u8> {
@@ -21,12 +21,12 @@ fn iter_walks_all_entries() {
         p.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     });
     let cert = Cert::parse(&der).unwrap();
-    let exts: Vec<_> = ExtensionIter::new(cert.extensions_der.unwrap())
+    let exts: Vec<_> = ExtensionIter::new(cert.tbs.extensions_der.unwrap())
         .map(|e| e.unwrap())
         .collect();
     assert!(!exts.is_empty());
-    assert!(exts.iter().any(|e| e.oid == OID_EXT_BASIC_CONSTRAINTS));
-    assert!(exts.iter().any(|e| e.oid == OID_EXT_KEY_USAGE));
+    assert!(exts.iter().any(|e| e.oid == OID_BASIC_CONSTRAINTS));
+    assert!(exts.iter().any(|e| e.oid == OID_KEY_USAGE));
 }
 
 #[test]
@@ -36,7 +36,7 @@ fn basic_constraints_ca_with_path_len() {
     });
     let cert = Cert::parse(&der).unwrap();
     let (critical, val) =
-        ExtensionIter::find(cert.extensions_der.unwrap(), OID_EXT_BASIC_CONSTRAINTS)
+        ExtensionIter::find(cert.tbs.extensions_der.unwrap(), OID_BASIC_CONSTRAINTS)
             .unwrap()
             .expect("BC present");
     assert!(critical, "BC should be critical for CA");
@@ -114,7 +114,7 @@ fn key_usage_bits_decode() {
         ];
     });
     let cert = Cert::parse(&der).unwrap();
-    let (_, val) = ExtensionIter::find(cert.extensions_der.unwrap(), OID_EXT_KEY_USAGE)
+    let (_, val) = ExtensionIter::find(cert.tbs.extensions_der.unwrap(), OID_KEY_USAGE)
         .unwrap()
         .expect("KU present");
     let ku = KeyUsage::parse(val).unwrap();
@@ -130,7 +130,7 @@ fn key_usage_cert_sign_alone() {
         p.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     });
     let cert = Cert::parse(&der).unwrap();
-    let (_, val) = ExtensionIter::find(cert.extensions_der.unwrap(), OID_EXT_KEY_USAGE)
+    let (_, val) = ExtensionIter::find(cert.tbs.extensions_der.unwrap(), OID_KEY_USAGE)
         .unwrap()
         .unwrap();
     let ku = KeyUsage::parse(val).unwrap();
@@ -147,7 +147,7 @@ fn extended_key_usage_lists_purposes() {
         ];
     });
     let cert = Cert::parse(&der).unwrap();
-    let (_, val) = ExtensionIter::find(cert.extensions_der.unwrap(), OID_EXT_EXTENDED_KEY_USAGE)
+    let (_, val) = ExtensionIter::find(cert.tbs.extensions_der.unwrap(), OID_EXTENDED_KEY_USAGE)
         .unwrap()
         .expect("EKU present");
     let oids = KeyUsage::parse_extended(val).unwrap();
@@ -162,7 +162,7 @@ fn subject_alt_name_dns_entries() {
         CertificateParams::new(vec!["primary.example".into(), "alt.example".into()]).unwrap();
     let der = params.self_signed(&key).unwrap().der().to_vec();
     let cert = Cert::parse(&der).unwrap();
-    let (_, val) = ExtensionIter::find(cert.extensions_der.unwrap(), OID_EXT_SAN)
+    let (_, val) = ExtensionIter::find(cert.tbs.extensions_der.unwrap(), OID_SUBJECT_ALT_NAME)
         .unwrap()
         .expect("SAN present");
     let names = GeneralName::parse_alt_names(val).unwrap();

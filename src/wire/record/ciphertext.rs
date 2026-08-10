@@ -1,10 +1,8 @@
-use core::ops::Range;
-
-use super::{ContentType, HEADER_LEN, MAX_CIPHERTEXT_BODY, RecordError};
+use core::ops;
 
 pub(super) struct Ciphertext {
-    pub(super) aad: [u8; HEADER_LEN],
-    pub(super) body: Range<usize>,
+    pub(super) aad: [u8; super::HEADER_LEN],
+    pub(super) body: ops::Range<usize>,
     pub(super) total: usize,
 }
 
@@ -13,33 +11,41 @@ impl Ciphertext {
         input: &[u8],
         poisoned: bool,
         seq: u64,
-    ) -> Result<Option<Self>, RecordError> {
+    ) -> Result<Option<Self>, super::Error> {
+        use crate::wire::record::ContentType;
+        use crate::wire::record::MAX_CIPHERTEXT_BODY;
         if poisoned {
-            return Err(RecordError::Poisoned);
+            return Err(super::Error::Poisoned);
         }
-        if input.len() < HEADER_LEN {
+        if input.len() < super::HEADER_LEN {
             return Ok(None);
+        }
+        if input[1..3] != super::PROTOCOL_VERSION.to_be_bytes() {
+            return Err(super::Error::BadLegacyVersion);
         }
         let outer_type = input[0];
         let body_len = u16::from_be_bytes([input[3], input[4]]) as usize;
         if body_len > MAX_CIPHERTEXT_BODY {
-            return Err(RecordError::BodyTooLarge);
+            return Err(super::Error::BodyTooLarge);
         }
-        let total = HEADER_LEN + body_len;
+        let total = super::HEADER_LEN + body_len;
         if input.len() < total {
             return Ok(None);
         }
         if outer_type != ContentType::ApplicationData as u8 {
-            return Err(RecordError::NotCipherTextOuter);
+            return Err(super::Error::NotCipherTextOuter);
         }
         if seq == u64::MAX {
-            return Err(RecordError::SeqExhausted);
+            return Err(super::Error::SeqExhausted);
         }
-        let mut aad = [0u8; HEADER_LEN];
-        aad.copy_from_slice(&input[..HEADER_LEN]);
+        if seq >= super::AEAD_CONFIDENTIALITY_LIMIT {
+            return Err(super::Error::KeyLimitReached);
+        }
+        let mut aad = [0u8; super::HEADER_LEN];
+        aad.copy_from_slice(&input[..super::HEADER_LEN]);
         Ok(Some(Self {
             aad,
-            body: HEADER_LEN..total,
+            body: super::HEADER_LEN..total,
             total,
         }))
     }

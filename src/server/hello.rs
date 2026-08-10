@@ -1,453 +1,494 @@
-use super::resumption::Resumption;
-use super::*;
+use crate::connection;
+use crate::crypto::kx;
+use crate::server;
+use crate::server::config;
+use crate::server::resumption::Resumption as _;
+use crate::server::retry;
+use crate::server::retry::Retry as _;
+use crate::transport;
+use crate::wire::codec::Encode as _;
+use crate::wire::extension;
+use crate::wire::handshake::views;
+use crate::wire::protocols;
+use ring::rand::SecureRandom as _;
+
+use crate::wire::handshake;
 
 pub(super) trait Hello {
     fn handle_client_hello<G, V, S>(
         &mut self,
-        ch: ClientHelloRef<'_>,
+        ch: views::ClientHelloRef<'_>,
         raw: &[u8],
-        shard: &mut Shard<G, V>,
+        shard: &mut server::Shard<G, V>,
         events: &mut S,
-    ) -> Result<(), DriveError<S::Error>>
+    ) -> Result<(), connection::DriveError<S::Error>>
     where
-        G: EarlyDataGuard,
-        V: ClientCertVerifier,
-        S: EventSink + ?Sized;
-    fn send_hello_retry_request<S: EventSink + ?Sized>(
-        &mut self,
-        ch_raw: &[u8],
-        session_id_echo: &[u8],
-        request_group: KexGroup,
-        events: &mut S,
-    ) -> Result<(), DriveError<S::Error>>;
+        G: config::EarlyDataGuard,
+        V: config::ClientCertVerifier,
+        S: connection::EventSink + ?Sized;
 }
-impl<C: Clock> Hello for Server<C> {
+impl<C: connection::Clock> Hello for server::Server<C> {
     fn handle_client_hello<G, V, S>(
         &mut self,
-        ch: ClientHelloRef<'_>,
+        ch: views::ClientHelloRef<'_>,
         raw: &[u8],
-        shard: &mut Shard<G, V>,
+        shard: &mut server::Shard<G, V>,
         events: &mut S,
-    ) -> Result<(), DriveError<S::Error>>
+    ) -> Result<(), connection::DriveError<S::Error>>
     where
-        G: EarlyDataGuard,
-        V: ClientCertVerifier,
-        S: EventSink + ?Sized,
+        G: config::EarlyDataGuard,
+        V: config::ClientCertVerifier,
+        S: connection::EventSink + ?Sized,
     {
-        self.config.validate()?;
-        shard.config.validate()?;
+        use crate::crypto::schedule::Schedule;
+        use crate::server::negotiation::ClientHelloOffers;
+        use crate::server::session::State;
+        use crate::wire::handshake::RANDOM_LEN;
+        use crate::wire::handshake::frame::Frame;
+        use crate::wire::handshake::messages::Finished;
+        use crate::wire::protocols::SignatureAlgorithms;
+        use crate::wire::protocols::SupportedGroups;
+        use crate::wire::protocols::SupportedVersions;
+        use crate::wire::psk::RESUMPTION_HASH;
+        use crate::wire::record::CipherSuite;
+        if ch.legacy_version != handshake::TLS_1_2 {
+            return Err(connection::Error::IllegalParameter.into());
+        }
+        if let Some(invariant) = self.session.handshake.hrr_invariant {
+            invariant.validate(ch)?;
+        }
         let selected_suite = CipherSuite::SUPPORTED
             .iter()
             .copied()
             .find(|s| ch.cipher_suites.contains(s.wire_id()))
-            .ok_or(Error::UnsupportedCipherSuite)?;
-        self.negotiated_suite = Some(selected_suite);
+            .ok_or(connection::Error::UnsupportedCipherSuite)?;
         let hash_alg = selected_suite.hash_alg();
+        self.session
+            .handshake
+            .transcript
+            .select(hash_alg)
+            .map_err(connection::Error::from)?;
+        self.session.application.traffic.select(selected_suite)?;
         if ch.legacy_compression_methods != [0] {
-            return Err(Error::IllegalParameter.into());
+            return Err(connection::Error::IllegalParameter.into());
         }
-        if ch.legacy_session_id.len() > 32 {
-            return Err(Error::Decode.into());
+        if self.session.transport_mode.uses_legacy_session_id() {
+            if ch.legacy_session_id.len() > 32 {
+                return Err(connection::Error::Decode.into());
+            }
+        } else if !ch.legacy_session_id.is_empty() {
+            return Err(connection::Error::IllegalParameter.into());
         }
         let sv = ch
             .extensions
-            .find(ExtensionType::SUPPORTED_VERSIONS)
-            .ok_or(Error::MissingExtension)?;
-        if !SupportedVersions::decode_client(sv.data)?.contains(TLS_1_3) {
-            return Err(Error::BadVersion.into());
+            .find(extension::Type::SUPPORTED_VERSIONS)
+            .ok_or(connection::Error::MissingExtension)?;
+        if !SupportedVersions::decode_client(sv.data)?.contains(protocols::TLS_1_3) {
+            return Err(connection::Error::BadVersion.into());
         }
         let groups = ch
             .extensions
-            .find(ExtensionType::SUPPORTED_GROUPS)
-            .ok_or(Error::MissingExtension)?;
+            .find(extension::Type::SUPPORTED_GROUPS)
+            .ok_or(connection::Error::MissingExtension)?;
         let supported_groups = SupportedGroups::decode(groups.data)?;
         let mut hrr_group = None;
-        for group in KexGroup::SUPPORTED {
+        for group in kx::KexGroup::SUPPORTED {
             if supported_groups.contains(group.wire_id()) {
                 hrr_group = Some(group);
                 break;
             }
         }
-        let hrr_group = hrr_group.ok_or(Error::UnsupportedGroup)?;
+        let hrr_group = hrr_group.ok_or(connection::Error::UnsupportedGroup)?;
         let sigs = ch
             .extensions
-            .find(ExtensionType::SIGNATURE_ALGORITHMS)
-            .ok_or(Error::MissingExtension)?;
-        let local_sig_scheme = shard.config.source.signing_key().sig_scheme();
+            .find(extension::Type::SIGNATURE_ALGORITHMS)
+            .ok_or(connection::Error::MissingExtension)?;
+        let local_sig_scheme = shard.policy.config.source.signing_key().sig_scheme();
         if !SignatureAlgorithms::contains(sigs.data, local_sig_scheme)? {
-            return Err(Error::UnsupportedSigScheme.into());
+            return Err(connection::Error::UnsupportedSigScheme.into());
+        }
+        let offers = ClientHelloOffers::parse(ch.extensions)?;
+        match (
+            self.session.transport_mode,
+            offers.peer_quic_transport_parameters(),
+        ) {
+            (transport::Mode::Quic, None) => {
+                return Err(connection::Error::MissingExtension.into());
+            }
+            (transport::Mode::Tls, Some(_)) => {
+                return Err(connection::Error::UnsolicitedExtension.into());
+            }
+            _ => {}
         }
         let chosen_share = ch
             .extensions
-            .find(ExtensionType::KEY_SHARE)
+            .find(extension::Type::KEY_SHARE)
             .map(|ks| {
+                use crate::wire::protocols::KeyShares;
                 KeyShares::decode_client(ks.data)
-                    .map(|shares| shares.select_client_entry(&KexGroup::SUPPORTED))
+                    .map(|shares| shares.select_client_entry(&kx::KexGroup::SUPPORTED))
             })
             .transpose()?
             .flatten();
         let (kex_group, peer_pubkey) = match chosen_share {
             Some(v) => v,
-            None if !self.hrr_done => {
-                return self.send_hello_retry_request(raw, ch.legacy_session_id, hrr_group, events);
+            None if !self.session.handshake.hrr_done => {
+                let invariant = retry::ClientHelloInvariant::capture(ch, hrr_group)?;
+                return self.send_hello_retry_request(
+                    raw,
+                    ch.legacy_session_id,
+                    hrr_group,
+                    invariant,
+                    events,
+                );
             }
-            None => return Err(Error::MissingExtension.into()),
+            None => return Err(connection::Error::MissingExtension.into()),
         };
 
-        let offers = ClientHelloOffers::parse(ch.extensions)?;
-        self.selected_alpn = offers.select_alpn(&shard.config.alpn_protocols)?;
+        self.session.peer.selected_alpn =
+            offers.select_alpn(&shard.policy.config.alpn_protocols)?;
         if let Some(parameters) = offers.peer_quic_transport_parameters() {
-            EventContext::emit(
+            connection::EventContext::emit(
                 events,
-                self.negotiated_suite,
-                Event::PeerExtension {
-                    ty: ExtensionType::QUIC_TRANSPORT_PARAMETERS.0,
+                self.session.application.traffic.suite(),
+                connection::Event::PeerExtension {
+                    ty: extension::Type::QUIC_TRANSPORT_PARAMETERS.0,
                     data: parameters,
                 },
             )?;
         }
 
         let psk_accepted = if hash_alg == RESUMPTION_HASH {
-            self.try_accept_psk(&ch, raw, shard.config.ticket_keys.as_ref())
+            self.try_accept_psk(
+                &ch,
+                raw,
+                shard.policy.config.ticket_keys.as_ref(),
+                shard.prepared.replay_domain.id(),
+            )
         } else {
             None
         };
-        let now_ms = self.now_ms();
-        let early_accepted = self.early_data.admit(
-            &mut shard.guard,
+        let now_ms = self.session.runtime.clock.now_ms();
+        let early_accepted = self.session.peer.early_data.admit(
+            &mut shard.policy.guard,
             offers.early_data(),
             psk_accepted.as_ref(),
-            self.selected_alpn.as_deref(),
-            self.negotiated_suite,
+            self.session.peer.selected_alpn.as_deref(),
+            self.session.application.traffic.suite(),
             now_ms,
         );
 
-        self.transcript.update(raw);
+        self.session.handshake.transcript.update(raw);
 
         if let (Some(p), true) = (psk_accepted.as_ref(), early_accepted) {
-            let h_ch = self.transcript.hash(RESUMPTION_HASH);
-            let cets =
-                KeySchedule::client_early_traffic_secret(&p.psk, h_ch.as_slice())?.to_digest();
-            EventContext::emit(
+            let h_ch = self
+                .session
+                .handshake
+                .transcript
+                .hash(RESUMPTION_HASH)
+                .map_err(connection::Error::from)?;
+            let cets = Schedule::client_early_traffic_secret(p.psk.as_slice(), h_ch.as_slice())?;
+            connection::EventContext::emit(
                 events,
-                self.negotiated_suite,
-                Event::ZeroRttKeysReady { secret: cets },
+                self.session.application.traffic.suite(),
+                connection::Event::ZeroRttKeysReady { secret: &cets },
             )?;
         }
 
         let (server_share, dhe) = kex_group
-            .respond(peer_pubkey, &self.rng)
-            .map_err(|_| Error::Kx)?;
+            .respond(peer_pubkey, &self.session.runtime.rng)
+            .map_err(|_| connection::Error::Kx)?;
         let mut server_random = [0u8; RANDOM_LEN];
-        self.rng.fill(&mut server_random).map_err(|_| Error::Rng)?;
+        self.session
+            .runtime
+            .rng
+            .fill(&mut server_random)
+            .map_err(|_| connection::Error::Rng)?;
 
-        self.flight.clear();
-        self.flight.put_u8(HandshakeType::ServerHello as u8);
-        self.flight.put_vec_u24(|hello| {
-            hello.put_u16(TLS_1_2);
-            hello.put_slice(&server_random);
-            hello.put_vec_u8(|session| {
-                session.put_slice(ch.legacy_session_id);
-                Ok(())
-            })?;
-            hello.put_u16(selected_suite.wire_id());
-            hello.put_u8(0);
-            hello.put_vec_u16(|extensions| {
-                Extension::encode_with(extensions, ExtensionType::SUPPORTED_VERSIONS, |version| {
-                    version.put_u16(TLS_1_3);
-                    Ok(())
-                })?;
-                Extension::encode_with(extensions, ExtensionType::KEY_SHARE, |share| {
-                    share.put_u16(kex_group.wire_id());
-                    share.put_vec_u16(|key| {
-                        key.put_slice(&server_share);
-                        Ok(())
-                    })
-                })?;
-                if psk_accepted.is_some() {
-                    Extension::encode_with(
-                        extensions,
-                        ExtensionType::PRE_SHARED_KEY,
-                        |identity| {
-                            identity.put_u16(0);
-                            Ok(())
-                        },
-                    )?;
-                }
-                Ok(())
-            })
-        })?;
-        self.transcript.update(&self.flight);
+        self.session.buffers.flight.clear();
+        self.session
+            .buffers
+            .flight
+            .put_u8(handshake::Type::ServerHello as u8);
+        let mut hello = self.session.buffers.flight.begin_u24()?;
+        hello.put_u16(handshake::TLS_1_2);
+        hello.put_slice(&server_random);
+        let mut session = hello.begin_u8()?;
+        session.put_slice(ch.legacy_session_id);
+        session.finish()?;
+        hello.put_u16(selected_suite.wire_id());
+        hello.put_u8(0);
+        let mut extensions = hello.begin_u16()?;
+        let mut version =
+            extension::Extension::begin(&mut extensions, extension::Type::SUPPORTED_VERSIONS)?;
+        version.put_u16(protocols::TLS_1_3);
+        version.finish()?;
+        let mut share = extension::Extension::begin(&mut extensions, extension::Type::KEY_SHARE)?;
+        share.put_u16(kex_group.wire_id());
+        let mut key = share.begin_u16()?;
+        key.put_slice(&server_share);
+        key.finish()?;
+        share.finish()?;
+        if psk_accepted.is_some() {
+            let mut identity =
+                extension::Extension::begin(&mut extensions, extension::Type::PRE_SHARED_KEY)?;
+            identity.put_u16(0);
+            identity.finish()?;
+        }
+        extensions.finish()?;
+        hello.finish()?;
+        self.session
+            .handshake
+            .transcript
+            .update(&self.session.buffers.flight);
 
-        EventContext::emit(
+        connection::EventContext::emit(
             events,
-            self.negotiated_suite,
-            Event::Send {
-                epoch: Epoch::Plaintext,
-                data: &self.flight,
+            self.session.application.traffic.suite(),
+            connection::Event::Send {
+                epoch: connection::Epoch::Plaintext,
+                data: &self.session.buffers.flight,
             },
         )?;
 
         let ks_handshake = match &psk_accepted {
-            Some(p) => {
-                KeySchedule::new_psk(RESUMPTION_HASH, &p.psk).into_handshake(dhe.as_slice())?
-            }
-            None => KeySchedule::new(hash_alg).into_handshake(dhe.as_slice())?,
+            Some(p) => Schedule::new_psk(RESUMPTION_HASH, p.psk.as_slice())
+                .into_handshake(dhe.as_slice())?,
+            None => Schedule::new(hash_alg).into_handshake(dhe.as_slice())?,
         };
-        let h_chsh = self.transcript.hash(hash_alg);
-        let c_hs = ks_handshake
-            .client_handshake_traffic_secret(h_chsh.as_slice())?
-            .to_digest();
-        let s_hs = ks_handshake
-            .server_handshake_traffic_secret(h_chsh.as_slice())?
-            .to_digest();
+        let h_chsh = self
+            .session
+            .handshake
+            .transcript
+            .hash(hash_alg)
+            .map_err(connection::Error::from)?;
+        let c_hs = ks_handshake.client_handshake_traffic_secret(h_chsh.as_slice())?;
+        let s_hs = ks_handshake.server_handshake_traffic_secret(h_chsh.as_slice())?;
 
-        EventContext::emit(
+        connection::EventContext::emit(
             events,
-            self.negotiated_suite,
-            Event::KeysReady {
-                epoch: Epoch::Handshake,
-                read_secret: c_hs,
-                write_secret: s_hs,
+            self.session.application.traffic.suite(),
+            connection::Event::KeysReady {
+                epoch: connection::Epoch::Handshake,
+                read_secret: &c_hs,
+                write_secret: &s_hs,
             },
         )?;
 
-        let certificate_negotiation = offers.certificate_negotiation(&shard.config.source)?;
-        self.negotiated_client_cert_type = certificate_negotiation.client_type;
-        self.flight.clear();
-        let ee_start = self.flight.len();
-        self.flight.put_u8(HandshakeType::EncryptedExtensions as u8);
-        self.flight.put_vec_u24(|encrypted_extensions| {
-            encrypted_extensions.put_vec_u16(|extensions| {
-                if offers.offered_server_certificate_type() {
-                    Extension::encode_with(
-                        extensions,
-                        ExtensionType::SERVER_CERTIFICATE_TYPE,
-                        |cert_type| {
-                            cert_type.put_u8(certificate_negotiation.server_type);
-                            Ok(())
-                        },
-                    )?;
-                }
-                if offers.offered_client_certificate_type() {
-                    Extension::encode_with(
-                        extensions,
-                        ExtensionType::CLIENT_CERTIFICATE_TYPE,
-                        |cert_type| {
-                            cert_type.put_u8(certificate_negotiation.client_type);
-                            Ok(())
-                        },
-                    )?;
-                }
-                if offers.offered_quic_transport_parameters() {
-                    Extension::encode_with(
-                        extensions,
-                        ExtensionType::QUIC_TRANSPORT_PARAMETERS,
-                        |parameters| {
-                            parameters.put_slice(&self.config.transport_params);
-                            Ok(())
-                        },
-                    )?;
-                }
-                if let Some(protocol) = self.selected_alpn.as_deref() {
-                    Extension::encode_with(
-                        extensions,
-                        ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
-                        |protocols| {
-                            protocols.put_vec_u16(|list| {
-                                list.put_vec_u8(|encoded| {
-                                    encoded.put_slice(protocol);
-                                    Ok(())
-                                })
-                            })
-                        },
-                    )?;
-                }
-                if early_accepted {
-                    Extension::encode_with(extensions, ExtensionType::EARLY_DATA, |_| Ok(()))?;
-                }
-                Ok(())
-            })
-        })?;
-        self.transcript.update(&self.flight[ee_start..]);
+        let certificate_negotiation =
+            offers.certificate_negotiation(&shard.policy.config.source)?;
+        self.session.peer.client_cert_type = certificate_negotiation.client_type;
+        self.session.buffers.flight.clear();
+        let ee_start = self.session.buffers.flight.len();
+        self.session
+            .buffers
+            .flight
+            .put_u8(handshake::Type::EncryptedExtensions as u8);
+        let mut encrypted_extensions = self.session.buffers.flight.begin_u24()?;
+        let mut extensions = encrypted_extensions.begin_u16()?;
+        if offers.offered_server_certificate_type() {
+            let mut cert_type = extension::Extension::begin(
+                &mut extensions,
+                extension::Type::SERVER_CERTIFICATE_TYPE,
+            )?;
+            cert_type.put_u8(certificate_negotiation.server_type);
+            cert_type.finish()?;
+        }
+        if offers.offered_client_certificate_type() {
+            let mut cert_type = extension::Extension::begin(
+                &mut extensions,
+                extension::Type::CLIENT_CERTIFICATE_TYPE,
+            )?;
+            cert_type.put_u8(certificate_negotiation.client_type);
+            cert_type.finish()?;
+        }
+        if self.session.transport_mode.is_quic() {
+            let mut parameters = extension::Extension::begin(
+                &mut extensions,
+                extension::Type::QUIC_TRANSPORT_PARAMETERS,
+            )?;
+            parameters.put_slice(&self.session.connection.transport_params);
+            parameters.finish()?;
+        }
+        if let Some(protocol) = self.session.peer.selected_alpn.as_deref() {
+            let mut protocols = extension::Extension::begin(
+                &mut extensions,
+                extension::Type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+            )?;
+            let mut list = protocols.begin_u16()?;
+            let mut encoded = list.begin_u8()?;
+            encoded.put_slice(protocol);
+            encoded.finish()?;
+            list.finish()?;
+            protocols.finish()?;
+        }
+        if early_accepted {
+            extension::Extension::begin(&mut extensions, extension::Type::EARLY_DATA)?.finish()?;
+        }
+        extensions.finish()?;
+        encrypted_extensions.finish()?;
+        self.session
+            .handshake
+            .transcript
+            .update(&self.session.buffers.flight[ee_start..]);
 
-        if psk_accepted.is_none() && shard.client_auth.is_some() {
-            let cr_start = self.flight.len();
-            self.flight.put_u8(HandshakeType::CertificateRequest as u8);
-            self.flight.put_vec_u24(|request| {
-                request.put_vec_u8(|_| Ok(()))?;
-                request.put_vec_u16(|extensions| {
-                    Extension::encode_with(
-                        extensions,
-                        ExtensionType::SIGNATURE_ALGORITHMS,
-                        |algorithms| {
-                            algorithms.put_vec_u16(|encoded| {
-                                for algorithm in SignatureAlgorithms::x509().as_slice() {
-                                    encoded.put_u16(*algorithm);
-                                }
-                                Ok(())
-                            })
-                        },
-                    )
-                })
-            })?;
-            self.transcript.update(&self.flight[cr_start..]);
+        if psk_accepted.is_none() && shard.policy.client_auth.is_some() {
+            let cr_start = self.session.buffers.flight.len();
+            self.session
+                .buffers
+                .flight
+                .put_u8(handshake::Type::CertificateRequest as u8);
+            let mut request = self.session.buffers.flight.begin_u24()?;
+            request.begin_u8()?.finish()?;
+            let mut extensions = request.begin_u16()?;
+            let mut algorithms = extension::Extension::begin(
+                &mut extensions,
+                extension::Type::SIGNATURE_ALGORITHMS,
+            )?;
+            let mut encoded = algorithms.begin_u16()?;
+            for algorithm in SignatureAlgorithms::x509().as_slice() {
+                encoded.put_u16(*algorithm);
+            }
+            encoded.finish()?;
+            algorithms.finish()?;
+            extensions.finish()?;
+            request.finish()?;
+            self.session
+                .handshake
+                .transcript
+                .update(&self.session.buffers.flight[cr_start..]);
         }
 
         if psk_accepted.is_none() {
-            let raw_public_key = match &shard.config.source {
-                CertSource::RawPublicKey { signing_key } => Some(
-                    SubjectPublicKey::encoded_ed25519(signing_key.pubkey().ok_or(Error::Sig)?),
-                ),
+            use crate::server::config::CertSource;
+            use crate::wire::codec::EncodeError;
+            use crate::wire::handshake::messages::CertificateVerify;
+            let raw_public_key = match &shard.policy.config.source {
+                CertSource::RawPublicKey { signing_key } => {
+                    use crate::identity::spki::SubjectPublicKey;
+                    Some(SubjectPublicKey::encoded_ed25519(
+                        signing_key.pubkey().ok_or(connection::Error::Sig)?,
+                    ))
+                }
                 CertSource::X509 { .. } => None,
             };
-            let cert_start = self.flight.len();
-            self.flight.put_u8(HandshakeType::Certificate as u8);
-            self.flight.put_vec_u24(|certificate| {
-                certificate.put_vec_u8(|_| Ok(()))?;
-                certificate.put_vec_u24(|entries| match (&shard.config.source, raw_public_key) {
-                    (CertSource::RawPublicKey { .. }, Some(public_key)) => {
-                        entries.put_vec_u24(|data| {
-                            data.put_slice(&public_key);
-                            Ok(())
-                        })?;
-                        entries.put_vec_u16(|_| Ok(()))
+            let cert_start = self.session.buffers.flight.len();
+            self.session
+                .buffers
+                .flight
+                .put_u8(handshake::Type::Certificate as u8);
+            let mut certificate = self.session.buffers.flight.begin_u24()?;
+            certificate.begin_u8()?.finish()?;
+            let mut entries = certificate.begin_u24()?;
+            match (&shard.policy.config.source, raw_public_key) {
+                (CertSource::RawPublicKey { .. }, Some(public_key)) => {
+                    let mut data = entries.begin_u24()?;
+                    data.put_slice(&public_key);
+                    data.finish()?;
+                    entries.begin_u16()?.finish()?;
+                }
+                (CertSource::X509 { chain_der, .. }, _) => {
+                    for der in chain_der {
+                        let mut data = entries.begin_u24()?;
+                        data.put_slice(der);
+                        data.finish()?;
+                        entries.begin_u16()?.finish()?;
                     }
-                    (CertSource::X509 { chain_der, .. }, _) => {
-                        for der in chain_der {
-                            entries.put_vec_u24(|data| {
-                                data.put_slice(der);
-                                Ok(())
-                            })?;
-                            entries.put_vec_u16(|_| Ok(()))?;
-                        }
-                        Ok(())
-                    }
-                    (CertSource::RawPublicKey { .. }, None) => Err(EncodeError::Overflow),
-                })
-            })?;
-            self.transcript.update(&self.flight[cert_start..]);
+                }
+                (CertSource::RawPublicKey { .. }, None) => return Err(EncodeError::Overflow.into()),
+            }
+            entries.finish()?;
+            certificate.finish()?;
+            self.session
+                .handshake
+                .transcript
+                .update(&self.session.buffers.flight[cert_start..]);
 
-            let h_pre_cv = self.transcript.hash(hash_alg);
+            let h_pre_cv = self
+                .session
+                .handshake
+                .transcript
+                .hash(hash_alg)
+                .map_err(connection::Error::from)?;
             let cv_msg = CertificateVerify::message(h_pre_cv.as_slice(), true)?;
             let sig = shard
+                .policy
                 .config
                 .source
                 .signing_key()
                 .sign_fixed(&cv_msg)
-                .map_err(|_| Error::Sig)?;
-            let cv_start = self.flight.len();
+                .map_err(|_| connection::Error::Sig)?;
+            let cv_start = self.session.buffers.flight.len();
             Frame::encode_certificate_verify(
-                shard.config.source.signing_key().sig_scheme(),
+                shard.policy.config.source.signing_key().sig_scheme(),
                 &sig,
-                &mut self.flight,
+                &mut self.session.buffers.flight,
             )?;
-            self.transcript.update(&self.flight[cv_start..]);
+            self.session
+                .handshake
+                .transcript
+                .update(&self.session.buffers.flight[cv_start..]);
         }
 
-        let h_pre_sf = self.transcript.hash(hash_alg);
+        let h_pre_sf = self
+            .session
+            .handshake
+            .transcript
+            .hash(hash_alg)
+            .map_err(connection::Error::from)?;
         let sf_data = Finished::verify_data(hash_alg, s_hs.as_slice(), h_pre_sf.as_slice())?;
-        let sf_start = self.flight.len();
-        Frame::encode_finished(sf_data.as_slice(), &mut self.flight)?;
-        self.transcript.update(&self.flight[sf_start..]);
-        EventContext::emit(
+        let sf_start = self.session.buffers.flight.len();
+        Frame::encode_finished(sf_data.as_slice(), &mut self.session.buffers.flight)?;
+        self.session
+            .handshake
+            .transcript
+            .update(&self.session.buffers.flight[sf_start..]);
+        connection::EventContext::emit(
             events,
-            self.negotiated_suite,
-            Event::Send {
-                epoch: Epoch::Handshake,
-                data: &self.flight,
+            self.session.application.traffic.suite(),
+            connection::Event::Send {
+                epoch: connection::Epoch::Handshake,
+                data: &self.session.buffers.flight,
             },
         )?;
 
-        let h_sf = self.transcript.hash(hash_alg);
+        let h_sf = self
+            .session
+            .handshake
+            .transcript
+            .hash(hash_alg)
+            .map_err(connection::Error::from)?;
         let ks_master = ks_handshake.into_master()?;
-        let c_ap = ks_master
-            .client_application_traffic_secret(h_sf.as_slice())?
-            .to_digest();
-        let s_ap = ks_master
-            .server_application_traffic_secret(h_sf.as_slice())?
-            .to_digest();
-        self.c_ap_traffic = Some(c_ap);
-        self.s_ap_traffic = Some(s_ap);
-        self.exporter_master = Some(
-            ks_master
-                .exporter_master_secret(h_sf.as_slice())?
-                .to_digest(),
-        );
-        self.master = Some(ks_master);
+        let c_ap = ks_master.client_application_traffic_secret(h_sf.as_slice())?;
+        let s_ap = ks_master.server_application_traffic_secret(h_sf.as_slice())?;
+        let exporter_master = ks_master.exporter_master_secret(h_sf.as_slice())?;
+        self.session.application.traffic.activate(c_ap, s_ap)?;
+        self.session.application.exporter_master = Some(exporter_master);
+        self.session.application.master = Some(ks_master);
 
-        EventContext::emit(
+        let (read_secret, write_secret) = self.session.application.traffic_secrets()?;
+        connection::EventContext::emit(
             events,
-            self.negotiated_suite,
-            Event::KeysReady {
-                epoch: Epoch::Application,
-                read_secret: c_ap,
-                write_secret: s_ap,
+            self.session.application.traffic.suite(),
+            connection::Event::KeysReady {
+                epoch: connection::Epoch::Application,
+                read_secret,
+                write_secret,
             },
         )?;
 
-        if early_accepted {
-            self.state = State::ExpectEndOfEarlyData {
+        if early_accepted && self.session.transport_mode.uses_end_of_early_data() {
+            self.session.handshake.state = State::ExpectEndOfEarlyData {
                 client_handshake_traffic: c_hs,
             };
-        } else if psk_accepted.is_none() && shard.client_auth.is_some() {
-            self.state = State::ExpectClientCertificate {
+        } else if psk_accepted.is_none() && shard.policy.client_auth.is_some() {
+            self.session.handshake.state = State::ExpectClientCertificate {
                 client_handshake_traffic: c_hs,
             };
         } else {
             let verify_data = Finished::verify_data(hash_alg, c_hs.as_slice(), h_sf.as_slice())?;
-            self.state = State::ExpectClientFinished { verify_data };
+            self.session.handshake.state = State::ExpectClientFinished { verify_data };
         }
-        Ok(())
-    }
-
-    /// RFC 8446 §4.1.4: ask for a retry (one only) when the ClientHello carried
-    /// no usable key_share, rewriting the transcript to `message_hash(CH1)`.
-    fn send_hello_retry_request<S: EventSink + ?Sized>(
-        &mut self,
-        ch_raw: &[u8],
-        session_id_echo: &[u8],
-        request_group: KexGroup,
-        events: &mut S,
-    ) -> Result<(), DriveError<S::Error>> {
-        let suite = self.negotiated_suite.ok_or(Error::UnsupportedCipherSuite)?;
-        self.flight.clear();
-        self.flight.put_u8(HandshakeType::ServerHello as u8);
-        self.flight.put_vec_u24(|hello| {
-            hello.put_u16(TLS_1_2);
-            hello.put_slice(&HELLO_RETRY_REQUEST_RANDOM);
-            hello.put_vec_u8(|session| {
-                session.put_slice(session_id_echo);
-                Ok(())
-            })?;
-            hello.put_u16(suite.wire_id());
-            hello.put_u8(0);
-            hello.put_vec_u16(|extensions| {
-                Extension::encode_with(extensions, ExtensionType::SUPPORTED_VERSIONS, |version| {
-                    version.put_u16(TLS_1_3);
-                    Ok(())
-                })?;
-                Extension::encode_with(extensions, ExtensionType::KEY_SHARE, |group| {
-                    group.put_u16(request_group.wire_id());
-                    Ok(())
-                })
-            })
-        })?;
-
-        let mut t = Transcript::new();
-        t.update(ch_raw);
-        self.transcript = Transcript::restart_with_message_hash(&t.hash(self.hash_alg()));
-        self.transcript.update(&self.flight);
-
-        self.hrr_done = true;
-        EventContext::emit(
-            events,
-            self.negotiated_suite,
-            Event::Send {
-                epoch: Epoch::Plaintext,
-                data: &self.flight,
-            },
-        )?;
         Ok(())
     }
 }

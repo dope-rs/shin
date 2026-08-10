@@ -1,12 +1,9 @@
-use alloc::vec::Vec;
-use core::ops::Deref;
-
-use crate::wire::codec::{Encode, EncodeError};
-
-use super::MAX_HANDSHAKE_SIZE;
+use crate::wire::{codec, record};
+use alloc::vec;
+use core::ops;
 
 pub(crate) struct BoundedBuffer {
-    bytes: Vec<u8>,
+    bytes: vec::Vec<u8>,
     limit: usize,
     overflowed: bool,
 }
@@ -19,8 +16,12 @@ impl Default for BoundedBuffer {
 
 impl BoundedBuffer {
     fn with_capacity(limit: usize) -> Self {
+        Self::with_reservation(limit, limit)
+    }
+
+    fn with_reservation(limit: usize, reservation: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(limit),
+            bytes: vec::Vec::with_capacity(reservation.min(limit)),
             limit,
             overflowed: false,
         }
@@ -51,9 +52,9 @@ impl BoundedBuffer {
         &mut self.bytes
     }
 
-    pub(crate) fn try_extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
+    pub(crate) fn try_extend(&mut self, bytes: &[u8]) -> Result<(), codec::EncodeError> {
         if bytes.len() > self.limit - self.bytes.len() {
-            return Err(EncodeError::Capacity);
+            return Err(codec::EncodeError::Capacity);
         }
         self.bytes.extend_from_slice(bytes);
         Ok(())
@@ -66,37 +67,6 @@ impl BoundedBuffer {
         }
         true
     }
-
-    fn encode_length<F>(&mut self, width: usize, maximum: usize, body: F) -> Result<(), EncodeError>
-    where
-        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
-    {
-        if self.overflowed {
-            return Err(EncodeError::Capacity);
-        }
-        let start = self.bytes.len();
-        if !self.reserve_encoded(width) {
-            return Err(EncodeError::Capacity);
-        }
-        self.bytes.resize(start + width, 0);
-        let body_start = self.bytes.len();
-        if let Err(error) = body(self) {
-            self.bytes.truncate(start);
-            return Err(error);
-        }
-        if self.overflowed {
-            self.bytes.truncate(start);
-            return Err(EncodeError::Capacity);
-        }
-        let len = self.bytes.len() - body_start;
-        if len > maximum {
-            self.bytes.truncate(start);
-            return Err(EncodeError::Overflow);
-        }
-        let encoded = (len as u32).to_be_bytes();
-        self.bytes[start..start + width].copy_from_slice(&encoded[4 - width..]);
-        Ok(())
-    }
 }
 
 impl AsRef<[u8]> for BoundedBuffer {
@@ -105,7 +75,7 @@ impl AsRef<[u8]> for BoundedBuffer {
     }
 }
 
-impl Deref for BoundedBuffer {
+impl ops::Deref for BoundedBuffer {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -113,7 +83,7 @@ impl Deref for BoundedBuffer {
     }
 }
 
-impl Encode for BoundedBuffer {
+impl codec::Encode for BoundedBuffer {
     fn put_u8(&mut self, v: u8) {
         if self.reserve_encoded(1) {
             self.bytes.push(v);
@@ -138,36 +108,48 @@ impl Encode for BoundedBuffer {
         }
     }
 
-    fn put_vec_u8<F>(&mut self, body: F) -> Result<(), EncodeError>
-    where
-        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
-    {
-        self.encode_length(1, u8::MAX as usize, body)
+    fn encoded_len(&self) -> usize {
+        self.bytes.len()
     }
 
-    fn put_vec_u16<F>(&mut self, body: F) -> Result<(), EncodeError>
-    where
-        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
-    {
-        self.encode_length(2, u16::MAX as usize, body)
+    fn reserve_length_prefix(&mut self, width: usize) -> Result<usize, codec::EncodeError> {
+        if self.overflowed || !self.reserve_encoded(width) {
+            return Err(codec::EncodeError::Capacity);
+        }
+        let start = self.bytes.len();
+        self.bytes.resize(start + width, 0);
+        Ok(start)
     }
 
-    fn put_vec_u24<F>(&mut self, body: F) -> Result<(), EncodeError>
-    where
-        F: FnOnce(&mut Self) -> Result<(), EncodeError>,
-    {
-        self.encode_length(3, (1 << 24) - 1, body)
+    fn rollback_to(&mut self, len: usize) {
+        self.bytes.truncate(len);
+    }
+
+    fn patch_length_prefix(&mut self, start: usize, width: usize, len: usize) {
+        let encoded = (len as u32).to_be_bytes();
+        self.bytes[start..start + width].copy_from_slice(&encoded[4 - width..]);
+    }
+
+    fn status(&self) -> Result<(), codec::EncodeError> {
+        (!self.overflowed)
+            .then_some(())
+            .ok_or(codec::EncodeError::Capacity)
     }
 }
 
-/// Recyclable storage allocated once for input, flights, and peer identity.
-pub struct HandshakeWorkspace {
+/// Recyclable bounded storage for input, flights, and peer identity.
+pub struct Scratch {
     pub(crate) reassembly: BoundedBuffer,
     pub(crate) flight: BoundedBuffer,
     pub(crate) identity: BoundedBuffer,
 }
 
-impl HandshakeWorkspace {
+impl Scratch {
+    const DEFAULT_RESERVATION: usize = record::MAX_PLAINTEXT_BODY;
+
+    /// Creates a workspace whose logical limits are fully reserved up front.
+    /// This is the strict no-allocation profile for callers that know their
+    /// maximum handshake sizes.
     pub fn new(
         fragmented_message_capacity: usize,
         outbound_flight_capacity: usize,
@@ -181,11 +163,49 @@ impl HandshakeWorkspace {
     }
 
     pub fn for_client() -> Self {
-        Self::new(MAX_HANDSHAKE_SIZE, MAX_HANDSHAKE_SIZE, 0)
+        Self::with_reservations(
+            super::MAX_SIZE,
+            super::MAX_SIZE,
+            0,
+            Self::DEFAULT_RESERVATION,
+            Self::DEFAULT_RESERVATION,
+            0,
+        )
     }
 
     pub fn for_server() -> Self {
-        Self::new(MAX_HANDSHAKE_SIZE, MAX_HANDSHAKE_SIZE, MAX_HANDSHAKE_SIZE)
+        Self::with_reservations(
+            super::MAX_SIZE,
+            super::MAX_SIZE,
+            super::MAX_SIZE,
+            Self::DEFAULT_RESERVATION,
+            Self::DEFAULT_RESERVATION,
+            0,
+        )
+    }
+
+    fn with_reservations(
+        fragmented_message_capacity: usize,
+        outbound_flight_capacity: usize,
+        peer_identity_capacity: usize,
+        fragmented_message_reservation: usize,
+        outbound_flight_reservation: usize,
+        peer_identity_reservation: usize,
+    ) -> Self {
+        Self {
+            reassembly: BoundedBuffer::with_reservation(
+                fragmented_message_capacity,
+                fragmented_message_reservation,
+            ),
+            flight: BoundedBuffer::with_reservation(
+                outbound_flight_capacity,
+                outbound_flight_reservation,
+            ),
+            identity: BoundedBuffer::with_reservation(
+                peer_identity_capacity,
+                peer_identity_reservation,
+            ),
+        }
     }
 
     pub(crate) fn from_buffers(
