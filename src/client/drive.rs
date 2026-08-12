@@ -1,5 +1,4 @@
 use crate::client;
-use crate::client::offer::Offer as _;
 use crate::connection;
 use crate::crypto::kx;
 use crate::crypto::schedule;
@@ -7,130 +6,75 @@ use crate::wire::handshake;
 use ring::rand::SecureRandom as _;
 
 pub(super) trait Drive {
-    fn start_with_workspace<S: connection::EventSink + ?Sized>(
+    fn start<S: connection::EventSink + ?Sized>(
         &mut self,
-        hybrid_workspace: Option<&mut kx::HybridWorkspace>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>;
 
-    fn read_with_workspace<S: connection::EventSink + ?Sized>(
+    fn read<S: connection::EventSink + ?Sized>(
         &mut self,
         epoch: connection::Epoch,
         data: &[u8],
-        hybrid_workspace: Option<&mut kx::HybridWorkspace>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>;
 
-    fn send_key_update<S: connection::EventSink + ?Sized>(
-        &mut self,
-        request_update: bool,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>;
+    fn poison(&mut self);
 }
 
-impl<C: connection::Clock> Drive for client::Client<C> {
-    fn start_with_workspace<S: connection::EventSink + ?Sized>(
+impl<C: connection::Clock, K: kx::Initiator> Drive for client::Client<C, K> {
+    fn start<S: connection::EventSink + ?Sized>(
         &mut self,
-        hybrid_workspace: Option<&mut kx::HybridWorkspace>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        use client::state::StateKind;
-        if self.session.handshake.state.kind() == StateKind::Failed {
+        if matches!(self.session.handshake.state, client::state::State::Failed) {
             return Err(connection::Error::ConnectionFailed.into());
         }
         self.session.handshake.require_initial()?;
-        let result = start(self, hybrid_workspace, events);
+        let result = start(self, events);
         if result.is_err() {
-            poison(self);
+            self.poison();
         }
         result
     }
 
-    fn read_with_workspace<S: connection::EventSink + ?Sized>(
+    fn read<S: connection::EventSink + ?Sized>(
         &mut self,
         epoch: connection::Epoch,
         data: &[u8],
-        hybrid_workspace: Option<&mut kx::HybridWorkspace>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        use client::state::StateKind;
-        if self.session.handshake.state.kind() == StateKind::Failed {
+        if matches!(self.session.handshake.state, client::state::State::Failed) {
             return Err(connection::Error::ConnectionFailed.into());
         }
-        let result = read(self, epoch, data, hybrid_workspace, events);
+        let result = read(self, epoch, data, events);
         if result.is_err() {
-            poison(self);
+            self.poison();
         }
         result
     }
 
-    fn send_key_update<S: connection::EventSink + ?Sized>(
-        &mut self,
-        request_update: bool,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>> {
-        use client::state::StateKind;
-        if self.session.handshake.state.kind() == StateKind::Failed {
-            return Err(connection::Error::ConnectionFailed.into());
-        }
-        if !self
-            .session
-            .offer
-            .config
-            .transport_mode()
-            .allows_tls_key_update()
-            || self.session.handshake.state.kind() != StateKind::Done
-        {
-            return Err(connection::Error::UnexpectedMessage.into());
-        }
-        let result = send_key_update(self, request_update, events);
-        if result.is_err() {
-            poison(self);
-        }
-        result
+    fn poison(&mut self) {
+        use client::session::EarlyData;
+        self.session.handshake.state.fail();
+        self.session.kx.clear();
+        self.session.handshake.resumption = None;
+        self.session.extensions.early_data = EarlyData::NotOffered;
+        self.session.application.zeroize_secrets();
+        self.session.buffers.reasm.discard();
+        self.session.buffers.flight.clear();
     }
 }
 
-fn start<C, S>(
-    client: &mut client::Client<C>,
-    hybrid_workspace: Option<&mut kx::HybridWorkspace>,
+fn start<C, K, S>(
+    client: &mut client::Client<C, K>,
     events: &mut S,
 ) -> Result<(), connection::DriveError<S::Error>>
 where
     C: connection::Clock,
+    K: kx::Initiator,
     S: connection::EventSink + ?Sized,
 {
-    match hybrid_workspace {
-        Some(workspace) => {
-            let (eph, share) = kx::EphemeralKey::generate_in(
-                client.session.offer.kex_group,
-                &client.session.runtime.rng,
-                workspace.slot_mut(),
-            )
-            .map_err(|_| connection::Error::Kx)?;
-            start_with_ephemeral(client, eph, Some(&share), events)
-        }
-        None => {
-            let eph = kx::EphemeralKey::generate(
-                client.session.offer.kex_group,
-                &client.session.runtime.rng,
-            )
-            .map_err(|_| connection::Error::Kx)?;
-            start_with_ephemeral(client, eph, None, events)
-        }
-    }
-}
-
-fn start_with_ephemeral<C, S>(
-    client: &mut client::Client<C>,
-    eph: kx::EphemeralKey,
-    in_place_share: Option<&[u8]>,
-    events: &mut S,
-) -> Result<(), connection::DriveError<S::Error>>
-where
-    C: connection::Clock,
-    S: connection::EventSink + ?Sized,
-{
+    use client::offer::Request;
     use client::session::EarlyData;
     use client::state::State;
     let mut client_random = [0u8; handshake::RANDOM_LEN];
@@ -158,81 +102,115 @@ where
     client.session.handshake.client_random = client_random;
     client.session.handshake.session_id = session_id;
 
-    let resumption = client.session.offer.resumption.take();
-    let early_data_offered = client.session.offer.config.enable_early_data()
-        && resumption.as_ref().is_some_and(|resumption| {
-            resumption.permits_early_data(client.session.offer.config.transport_mode())
-        });
-    client.session.extensions.early_data = if early_data_offered {
-        EarlyData::Offered
+    use crate::wire::psk::RESUMPTION_HASH;
+    let mut resumption = client.session.handshake.resumption.take().filter(|_| {
+        client
+            .session
+            .offer
+            .offered_suites
+            .iter()
+            .any(|suite| suite.hash_alg() == RESUMPTION_HASH)
+    });
+    let now_ms = client.session.runtime.clock.now_ms();
+    let ticket_age = resumption
+        .as_ref()
+        .and_then(|resumption| resumption.obfuscated_ticket_age(now_ms));
+    if ticket_age.is_none() {
+        resumption = None;
+    }
+    let offer = resumption
+        .as_ref()
+        .zip(ticket_age)
+        .map(|(resumption, ticket_age)| resumption.offer(ticket_age));
+    let early_data = if offer.is_some() && client.session.offer.enable_early_data {
+        resumption.as_ref().and_then(|resumption| {
+            resumption.early_data_offer(&client.session.offer.offered_suites)
+        })
     } else {
-        EarlyData::NotOffered
+        None
     };
-    let client_share = in_place_share.unwrap_or_else(|| eph.client_share());
-    client.encode_client_hello(client_share, None, resumption.as_ref(), early_data_offered)?;
+    let early_data_offered = early_data.is_some();
+    client.session.extensions.early_data = early_data
+        .map(EarlyData::Offered)
+        .unwrap_or(EarlyData::NotOffered);
+    let certificate_types = client.session.certificate_type_offers();
+    let session = &mut client.session;
+    let client_share = session
+        .kx
+        .generate(session.offer.kex_group, &session.runtime.rng)
+        .map_err(|_| connection::Error::Kx)?;
+    let binder_slot = Request {
+        certificate_types,
+        kx_pubkey: client_share.as_ref(),
+        cookie: None,
+        resumption: offer,
+        offer_early_data: early_data_offered,
+    }
+    .encode(
+        &session.offer,
+        &session.handshake,
+        &mut session.buffers.flight,
+    )?;
+    drop(client_share);
 
-    if let Some(resumption) = &resumption {
-        client::Client::<C>::splice_psk_binder(
-            &client.session.handshake.transcript,
-            client.session.buffers.flight.as_mut_slice(),
-            resumption.psk.as_array(),
-        )?;
+    match (resumption.as_ref(), binder_slot) {
+        (Some(resumption), Some(slot)) => slot.splice(
+            &session.handshake.transcript,
+            session.buffers.flight.as_mut_slice(),
+            resumption.psk().as_array(),
+        )?,
+        (None, None) => {}
+        _ => return Err(connection::Error::Encode.into()),
     }
 
-    client
-        .session
-        .handshake
-        .transcript
-        .update(&client.session.buffers.flight);
-    client.session.handshake.active_resumption = resumption;
+    session.handshake.transcript.update(&session.buffers.flight);
+    session.handshake.resumption = resumption;
 
     connection::EventContext::emit(
         events,
-        client.session.application.traffic.suite(),
+        session.application.traffic.suite(),
         connection::Event::Send {
             epoch: connection::Epoch::Plaintext,
-            data: &client.session.buffers.flight,
+            data: &session.buffers.flight,
         },
     )?;
-    if let Some(resumption) = client
-        .session
-        .handshake
-        .active_resumption
-        .as_ref()
-        .filter(|_| early_data_offered)
+    if let (Some(resumption), Some(authority)) = (session.handshake.resumption.as_ref(), early_data)
     {
-        use crate::wire::psk::RESUMPTION_HASH;
-        let client_hello_hash = client
-            .session
+        let client_hello_hash = session
             .handshake
             .transcript
             .hash(RESUMPTION_HASH)
             .map_err(connection::Error::from)?;
         let secret = schedule::Schedule::client_early_traffic_secret(
-            resumption.psk.as_slice(),
+            resumption.psk().as_slice(),
             client_hello_hash.as_slice(),
         )?;
         connection::EventContext::emit(
             events,
-            client.session.application.traffic.suite(),
-            connection::Event::ZeroRttKeysReady { secret: &secret },
+            Some(authority.suite),
+            connection::Event::ZeroRttKeysReady {
+                secret: &secret,
+                max_early_data: authority.maximum,
+                alpn: authority
+                    .alpn
+                    .and_then(|alpn| session.offer.config.alpn(alpn)),
+            },
         )?;
     }
 
-    client.session.handshake.eph = Some(eph);
-    client.session.handshake.state = State::expect_server_hello();
+    session.handshake.state = State::expect_server_hello();
     Ok(())
 }
 
-fn read<C, S>(
-    client: &mut client::Client<C>,
+fn read<C, K, S>(
+    client: &mut client::Client<C, K>,
     epoch: connection::Epoch,
     data: &[u8],
-    mut hybrid_workspace: Option<&mut kx::HybridWorkspace>,
     events: &mut S,
 ) -> Result<(), connection::DriveError<S::Error>>
 where
     C: connection::Clock,
+    K: kx::Initiator,
     S: connection::EventSink + ?Sized,
 {
     client.session.buffers.reasm.begin_record(epoch)?;
@@ -246,65 +224,8 @@ where
         use crate::wire::handshake::views::MessageRef;
         use client::session::Session;
         let message = MessageRef::decode(raw.as_ref())?;
-        Session::dispatch(
-            client,
-            epoch,
-            message,
-            raw.as_ref(),
-            hybrid_workspace.as_deref_mut(),
-            events,
-        )?;
+        Session::dispatch(client, epoch, message, raw.as_ref(), events)?;
         client.session.buffers.reasm.recycle(raw);
     }
     Ok(())
-}
-
-fn send_key_update<C, S>(
-    client: &mut client::Client<C>,
-    request_update: bool,
-    events: &mut S,
-) -> Result<(), connection::DriveError<S::Error>>
-where
-    C: connection::Clock,
-    S: connection::EventSink + ?Sized,
-{
-    use crate::connection::KeyDirection;
-    use crate::crypto::material;
-    use crate::wire::handshake::messages::KeyUpdate;
-    let application = &mut client.session.application;
-    let suite = application.traffic.suite();
-
-    let bytes = KeyUpdate {
-        request_update: u8::from(request_update),
-    }
-    .encode_framed();
-    connection::EventContext::emit(
-        events,
-        suite,
-        connection::Event::Send {
-            epoch: connection::Epoch::Application,
-            data: &bytes,
-        },
-    )?;
-    connection::EventContext::emit(
-        events,
-        suite,
-        connection::Event::KeyUpdate {
-            direction: KeyDirection::Write,
-            secret: application.traffic.advance(material::Side::Client)?,
-        },
-    )?;
-    Ok(())
-}
-
-fn poison<C: connection::Clock>(client: &mut client::Client<C>) {
-    use client::session::EarlyData;
-    client.session.handshake.state.fail();
-    client.session.handshake.eph = None;
-    client.session.handshake.active_resumption = None;
-    client.session.extensions.early_data = EarlyData::NotOffered;
-    client.session.application.zeroize_secrets();
-    client.session.buffers.reasm.discard();
-    client.session.buffers.flight.clear();
-    client.session.buffers.identity_workspace.clear();
 }

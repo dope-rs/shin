@@ -24,21 +24,23 @@ use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25
 
 use shin::client::Client;
 use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
-use shin::connection::Epoch;
+use shin::connection::{Epoch, Error};
 use shin::crypto::sig::SigningKey;
+use shin::identity::CertificateType;
 use shin::identity::asn1::{self, Tag};
-use shin::identity::cert::Cert;
 use shin::server::config::CertSource;
 use shin::transport::Mode;
 use shin::wire::codec;
-use shin::wire::extension::Type;
+use shin::wire::extension::{Extension, Type};
 use shin::wire::handshake::frame::Frame;
 
 use crate::common::CollectEvents;
 use crate::common::Event;
-use crate::common::{Server, ServerConfig, find_send};
+use crate::common::{Server, ServerConfig, cert_validity_midpoint, find_send};
 
 const HOSTNAME: &str = "host.local";
+type TestClock = fn() -> u64;
+type RpkPair = (Server<TestClock>, Client<TestClock>);
 
 fn ed25519_self_signed() -> (Vec<u8>, SigningKey) {
     let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
@@ -60,7 +62,7 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     let mut r = asn1::Reader::new(pkcs8);
     let inner = r.read_tagged(Tag::SEQUENCE).ok()?;
     let mut ir = asn1::Reader::new(inner);
-    let _version = ir.read_tagged(Tag::INTEGER).ok()?;
+    let _version = ir.read_uint().ok()?;
     let _alg = ir.read_tagged(Tag::SEQUENCE).ok()?;
     let outer_oct = ir.read_tagged(Tag::OCTET_STRING).ok()?;
     let mut or = asn1::Reader::new(outer_oct);
@@ -73,13 +75,6 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     Some(seed)
 }
 
-fn cert_validity_midpoint(cert_der: &[u8]) -> u64 {
-    let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let na = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
-    (nb.0 + na.0) / 2
-}
-
 /// Pull the EE extensions out of the server's plaintext handshake
 /// flight. shin emits the concatenation EE+Cert+CV+SF as a single
 /// `Event::Send { Handshake }` payload — record-layer encryption is
@@ -89,7 +84,7 @@ fn server_ee_extensions(server_events: &[Event]) -> Vec<(u16, Vec<u8>)> {
         .expect("server should emit a Handshake-epoch Send");
     let mut r = codec::Reader::new(&blob);
     while !r.is_empty() {
-        let hs = Frame::decode(&mut r).expect("decode handshake");
+        let hs = crate::decode_owned(&mut r).expect("decode handshake");
         if let Frame::EncryptedExtensions(ee) = hs {
             return ee
                 .extensions
@@ -113,6 +108,47 @@ fn ext_data(ee: &[(u16, Vec<u8>)], ty: Type) -> Option<&[u8]> {
 
 fn x509_anchor(cert_der: &[u8]) -> OwnedTrustAnchor {
     OwnedTrustAnchor::from_cert_der(cert_der).unwrap()
+}
+
+fn rpk_pair(seed: u8) -> RpkPair {
+    let server_key = SigningKey::from_seed(&[seed; 32]).unwrap();
+    let server_pubkey = *server_key.pubkey().unwrap();
+    let server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: server_key,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
+        },
+        (|| 0) as TestClock,
+    );
+    let client = Client::new(
+        Config {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            enable_early_data: false,
+        },
+        (|| 0) as TestClock,
+    )
+    .unwrap();
+    (server, client)
+}
+
+fn tamper_client_hello(encoded: &[u8], mutate: impl FnOnce(&mut Vec<Extension>)) -> Vec<u8> {
+    let mut reader = codec::Reader::new(encoded);
+    let Frame::ClientHello(mut hello) = crate::decode_owned(&mut reader).unwrap() else {
+        panic!("expected ClientHello");
+    };
+    mutate(&mut hello.extensions);
+    let mut tampered = Vec::new();
+    Frame::ClientHello(hello).encode(&mut tampered).unwrap();
+    tampered
 }
 
 // -------------------------------------------------------------------
@@ -145,10 +181,10 @@ fn x509_server_omits_cert_type_and_quic_tp_when_client_did_not_offer() {
             verifier: Verifier::X509 {
                 anchors: vec![x509_anchor(&cert_der)],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now * 1000,
@@ -210,10 +246,10 @@ fn quic_server_rejects_tls_client_without_transport_parameters() {
             verifier: Verifier::X509 {
                 anchors: vec![x509_anchor(&cert_der)],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(), // ← TCP-TLS: client doesn't offer
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now * 1000,
@@ -257,7 +293,6 @@ fn quic_transport_params_round_trip_when_client_offers() {
             },
             transport_params: b"\xca\xfe\xba\xbe-client".to_vec(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         Mode::Quic,
@@ -268,7 +303,7 @@ fn quic_transport_params_round_trip_when_client_offers() {
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let mut encoded = codec::Reader::new(&ch);
-    let Frame::ClientHello(client_hello) = Frame::decode(&mut encoded).unwrap() else {
+    let Frame::ClientHello(client_hello) = crate::decode_owned(&mut encoded).unwrap() else {
         panic!("expected ClientHello");
     };
     assert!(client_hello.legacy_session_id.is_empty());
@@ -304,7 +339,6 @@ fn explicit_quic_emits_empty_transport_parameters_and_empty_session_id() {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         Mode::Quic,
@@ -315,7 +349,7 @@ fn explicit_quic_emits_empty_transport_parameters_and_empty_session_id() {
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let mut encoded = codec::Reader::new(&ch);
-    let Frame::ClientHello(client_hello) = Frame::decode(&mut encoded).unwrap() else {
+    let Frame::ClientHello(client_hello) = crate::decode_owned(&mut encoded).unwrap() else {
         panic!("expected ClientHello");
     };
     assert!(client_hello.legacy_session_id.is_empty());
@@ -331,7 +365,7 @@ fn explicit_quic_emits_empty_transport_parameters_and_empty_session_id() {
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
     let sh = find_send(&s1, Epoch::Plaintext).unwrap();
     let mut encoded = codec::Reader::new(&sh);
-    let Frame::ServerHello(server_hello) = Frame::decode(&mut encoded).unwrap() else {
+    let Frame::ServerHello(server_hello) = crate::decode_owned(&mut encoded).unwrap() else {
         panic!("expected ServerHello");
     };
     assert!(server_hello.legacy_session_id_echo.is_empty());
@@ -348,34 +382,7 @@ fn explicit_quic_emits_empty_transport_parameters_and_empty_session_id() {
 // -------------------------------------------------------------------
 #[test]
 fn rpk_handshake_echoes_cert_type_extensions() {
-    let server_key = SigningKey::from_seed(&[0x22u8; 32]).unwrap();
-    let server_pubkey = *server_key.pubkey().unwrap();
-
-    let mut server = Server::new(
-        ServerConfig {
-            source: CertSource::RawPublicKey {
-                signing_key: server_key,
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            ticket_keys: None,
-            accept_early_data: false,
-        },
-        || 0,
-    );
-    let mut client = Client::new(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: server_pubkey,
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption: None,
-            enable_early_data: false,
-        },
-        || 0,
-    )
-    .unwrap();
+    let (mut server, mut client) = rpk_pair(0x22);
 
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -393,7 +400,7 @@ fn rpk_handshake_echoes_cert_type_extensions() {
     let s_ct = ext_data(&ee, Type::SERVER_CERTIFICATE_TYPE).unwrap();
     assert_eq!(
         s_ct,
-        &[2u8],
+        &[CertificateType::RawPublicKey.wire_id()],
         "server should pick CERT_TYPE_RAW_PUBLIC_KEY (=2)"
     );
 
@@ -402,6 +409,55 @@ fn rpk_handshake_echoes_cert_type_extensions() {
     client.read(Epoch::Plaintext, &sh).unwrap();
     let c3 = client.read(Epoch::Handshake, &s_hs).unwrap();
     assert!(c3.iter().any(|e| matches!(e, Event::Done)));
+}
+
+#[test]
+fn server_rejects_empty_certificate_type_offer() {
+    let (mut server, mut client) = rpk_pair(0x23);
+    let started = client.start().unwrap();
+    let encoded = find_send(&started, Epoch::Plaintext).unwrap();
+    let malformed = tamper_client_hello(&encoded, |extensions| {
+        extensions
+            .iter_mut()
+            .find(|extension| extension.ty == Type::SERVER_CERTIFICATE_TYPE)
+            .unwrap()
+            .data = vec![0];
+    });
+
+    assert_eq!(
+        server.read(Epoch::Plaintext, &malformed).unwrap_err(),
+        Error::Decode,
+    );
+}
+
+#[test]
+fn server_ignores_unknown_offers_and_selects_known_certificate_type() {
+    let (mut server, mut client) = rpk_pair(0x24);
+    let started = client.start().unwrap();
+    let encoded = find_send(&started, Epoch::Plaintext).unwrap();
+    let offered = [2, u8::MAX, CertificateType::RawPublicKey.wire_id()];
+    let tampered = tamper_client_hello(&encoded, |extensions| {
+        for extension in extensions.iter_mut().filter(|extension| {
+            matches!(
+                extension.ty,
+                Type::SERVER_CERTIFICATE_TYPE | Type::CLIENT_CERTIFICATE_TYPE
+            )
+        }) {
+            extension.data = offered.to_vec();
+        }
+    });
+
+    let flight = server.read(Epoch::Plaintext, &tampered).unwrap();
+    let encrypted_extensions = server_ee_extensions(&flight);
+    let selected = [CertificateType::RawPublicKey.wire_id()];
+    assert_eq!(
+        ext_data(&encrypted_extensions, Type::SERVER_CERTIFICATE_TYPE),
+        Some(selected.as_slice()),
+    );
+    assert_eq!(
+        ext_data(&encrypted_extensions, Type::CLIENT_CERTIFICATE_TYPE),
+        Some(selected.as_slice()),
+    );
 }
 
 // -------------------------------------------------------------------
@@ -434,7 +490,6 @@ fn x509_server_rejects_rpk_only_client_offer() {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         || 0,
@@ -478,7 +533,6 @@ fn alpn_intersection_emits_extension() {
             },
             transport_params: Vec::new(),
             alpn_protocols: vec![b"http/1.1".to_vec()],
-            resumption: None,
             enable_early_data: false,
         },
         || 0,
@@ -530,7 +584,6 @@ fn alpn_no_overlap_aborts() {
             },
             transport_params: Vec::new(),
             alpn_protocols: vec![b"http/1.1".to_vec()],
-            resumption: None,
             enable_early_data: false,
         },
         || 0,
@@ -573,7 +626,6 @@ fn alpn_client_silent_omits_extension() {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(), // silent
-            resumption: None,
             enable_early_data: false,
         },
         || 0,

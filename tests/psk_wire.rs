@@ -1,4 +1,6 @@
-use shin::wire::psk::{Identity, KX_MODE_DHE, KxModes, Offer, SelectedIdentity};
+use shin::wire::psk::{
+    Identity, KX_MODE_DHE, KxModes, KxModesRef, Offer, OfferedPsks, SelectedIdentity,
+};
 
 #[test]
 fn kx_modes_round_trip() {
@@ -6,8 +8,14 @@ fn kx_modes_round_trip() {
     let bytes = KxModes::new(modes.clone()).encode().unwrap();
     assert_eq!(bytes[0], 1);
     assert_eq!(bytes[1], KX_MODE_DHE);
-    let parsed = KxModes::decode(&bytes).unwrap();
+    let parsed = KxModesRef::decode(&bytes).unwrap();
     assert_eq!(parsed.as_slice(), modes);
+}
+
+#[test]
+fn empty_kx_modes_are_rejected() {
+    let encoded = KxModes::new(Vec::new()).encode().unwrap();
+    assert!(KxModesRef::decode(&encoded).is_err());
 }
 
 #[test]
@@ -18,7 +26,7 @@ fn offer_ch_round_trip_one_identity() {
     }];
     let binders = vec![vec![0xAB; 32]];
     let bytes = Offer::new(ids.clone(), binders.clone()).encode().unwrap();
-    let got = Offer::decode(&bytes).unwrap();
+    let got = OfferedPsks::decode(&bytes).unwrap().into_owned();
     assert_eq!(got.identities, ids);
     assert_eq!(got.binders, binders);
 }
@@ -37,9 +45,25 @@ fn offer_ch_round_trip_multiple() {
     ];
     let binders = vec![vec![0x11; 32], vec![0x22; 32]];
     let bytes = Offer::new(ids.clone(), binders.clone()).encode().unwrap();
-    let got = Offer::decode(&bytes).unwrap();
+    let got = OfferedPsks::decode(&bytes).unwrap().into_owned();
     assert_eq!(got.identities, ids);
     assert_eq!(got.binders, binders);
+}
+
+#[test]
+fn offered_psks_require_matching_nonempty_lists_and_full_length_binders() {
+    fn decode_round_trip(offer: Offer) -> Result<Offer, shin::wire::codec::DecodeError> {
+        let encoded = offer.encode().unwrap();
+        OfferedPsks::decode(&encoded).map(OfferedPsks::into_owned)
+    }
+
+    let identity = Identity {
+        identity: b"ticket".to_vec(),
+        obfuscated_ticket_age: 7,
+    };
+    assert!(decode_round_trip(Offer::new(Vec::new(), Vec::new())).is_err());
+    assert!(decode_round_trip(Offer::new(vec![identity.clone()], Vec::new())).is_err());
+    assert!(decode_round_trip(Offer::new(vec![identity], vec![vec![0; 31]])).is_err());
 }
 
 #[test]

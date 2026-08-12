@@ -7,20 +7,37 @@ use core::mem;
 /// Saturating peer-triggered KeyUpdate allowance, reset at a progress boundary.
 #[derive(Default)]
 pub(crate) struct KeyUpdateBudget<const LIMIT: u32> {
-    used: u32,
+    state: u32,
 }
 
 impl<const LIMIT: u32> KeyUpdateBudget<LIMIT> {
+    const RESPONSE_PENDING: u32 = 1 << 31;
+    const VALID_LIMIT: () = assert!(LIMIT < Self::RESPONSE_PENDING);
+
     pub(crate) fn consume(&mut self) -> bool {
-        if self.used >= LIMIT {
+        let () = Self::VALID_LIMIT;
+        let count = self.state & !Self::RESPONSE_PENDING;
+        if count >= LIMIT {
             return false;
         }
-        self.used += 1;
+        self.state = (count + 1) | (self.state & Self::RESPONSE_PENDING);
         true
     }
 
     pub(crate) fn reset(&mut self) {
-        self.used = 0;
+        self.state &= Self::RESPONSE_PENDING;
+    }
+
+    pub(crate) fn response_pending(&self) -> bool {
+        self.state & Self::RESPONSE_PENDING != 0
+    }
+
+    pub(crate) fn request_response(&mut self) {
+        self.state |= Self::RESPONSE_PENDING;
+    }
+
+    pub(crate) fn clear_response(&mut self) {
+        self.state &= !Self::RESPONSE_PENDING;
     }
 }
 
@@ -55,6 +72,10 @@ impl HsReassembler {
             key_updates: KeyUpdateBudget::default(),
             _thread: threadbound::ThreadBound::NEW,
         }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
     }
 
     pub(crate) fn begin_record(

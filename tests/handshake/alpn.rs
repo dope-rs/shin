@@ -1,14 +1,15 @@
 use shin::client::Client;
 use shin::client::config::{Config, Verifier};
-use shin::connection::{Clock, Epoch};
+use shin::connection::{Clock, Epoch, Error};
 use shin::crypto::sig::SigningKey;
-use shin::server::{config::CertSource, config::EarlyDataGuard};
+use shin::server::{Shard, config::CertSource, config::Connection, config::EarlyDataGuard};
 use shin::wire::codec::Reader;
 use shin::wire::extension::Type;
 use shin::wire::handshake::frame::Frame;
 use shin::wire::handshake::messages::ClientHello;
 
 use crate::common::CollectEvents;
+use crate::common::CollectServerEvents;
 use crate::common::Event;
 use crate::common::{Server, ServerConfig};
 
@@ -20,7 +21,6 @@ fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
             },
             transport_params: Vec::new(),
             alpn_protocols: alpn,
-            resumption: None,
             enable_early_data: false,
         },
         || 0,
@@ -38,7 +38,7 @@ fn drive_client_hello_alpn(alpn: Vec<Vec<u8>>) -> ClientHello {
         })
         .unwrap();
     let mut r = Reader::new(&ch_bytes);
-    match Frame::decode(&mut r).unwrap() {
+    match crate::decode_owned(&mut r).unwrap() {
         Frame::ClientHello(ch) => ch,
         _ => panic!(),
     }
@@ -87,6 +87,38 @@ fn multiple_protocols_emit_in_order() {
 }
 
 #[test]
+fn server_rejects_empty_alpn_protocol_list_during_decode() {
+    let signing = SigningKey::from_seed(&[0x42u8; 32]).unwrap();
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::RawPublicKey {
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"h2".to_vec()],
+            ticket_keys: None,
+            accept_early_data: false,
+        },
+        || 0,
+    );
+    let mut hello = drive_client_hello_alpn(vec![b"h2".to_vec()]);
+    let alpn = hello
+        .extensions
+        .iter_mut()
+        .find(|extension| extension.ty == Type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION)
+        .unwrap();
+    alpn.data.clear();
+    alpn.data.extend_from_slice(&0u16.to_be_bytes());
+    let mut encoded = Vec::new();
+    Frame::ClientHello(hello).encode(&mut encoded).unwrap();
+
+    assert_eq!(
+        server.read(Epoch::Plaintext, &encoded).unwrap_err(),
+        Error::Decode,
+    );
+}
+
+#[test]
 fn server_picks_first_overlap_and_client_observes() {
     let signing = SigningKey::from_seed(&[0x42u8; 32]).unwrap();
     let server_pubkey = *signing.pubkey().unwrap();
@@ -109,8 +141,7 @@ fn server_picks_first_overlap_and_client_observes() {
                 expected_pubkey: server_pubkey,
             },
             transport_params: Vec::new(),
-            alpn_protocols: vec![b"http/1.1".to_vec()],
-            resumption: None,
+            alpn_protocols: vec![b"http/1.1".to_vec(), b"h2".to_vec()],
             enable_early_data: false,
         },
         || 0,
@@ -119,8 +150,47 @@ fn server_picks_first_overlap_and_client_observes() {
 
     drive_handshake(&mut client, &mut server);
 
-    assert_eq!(server.selected_alpn(), Some(&b"http/1.1"[..]));
-    assert_eq!(client.selected_alpn(), Some(&b"http/1.1"[..]));
+    assert_eq!(server.selected_alpn(), Some(&b"h2"[..]));
+    assert_eq!(client.selected_alpn(), Some(&b"h2"[..]));
+}
+
+#[test]
+fn selected_protocol_is_available_from_the_bound_connection() {
+    let signing = SigningKey::from_seed(&[0x42u8; 32]).unwrap();
+    let server_pubkey = *signing.pubkey().unwrap();
+    let mut shard = Shard::new(shin::server::config::Config {
+        source: CertSource::RawPublicKey {
+            signing_key: signing,
+        },
+        alpn_protocols: vec![b"h2".to_vec()],
+        ticket_keys: None,
+    })
+    .unwrap();
+    let server = shin::server::Server::new(
+        Connection {
+            transport_params: Vec::new(),
+        },
+        || 0,
+    )
+    .unwrap();
+    let mut client = Client::new(
+        Config {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: vec![b"h2".to_vec()],
+            enable_early_data: false,
+        },
+        || 0,
+    )
+    .unwrap();
+    let mut server = shard.bind(server).unwrap();
+
+    let client_hello = take_send(client.start().unwrap(), Epoch::Plaintext);
+    server.read(Epoch::Plaintext, &client_hello).unwrap();
+
+    assert_eq!(server.selected_alpn(), Some(&b"h2"[..]));
 }
 
 #[test]
@@ -147,7 +217,6 @@ fn no_overlap_aborts_with_no_application_protocol() {
             },
             transport_params: Vec::new(),
             alpn_protocols: vec![b"http/1.1".to_vec()],
-            resumption: None,
             enable_early_data: false,
         },
         || 0,

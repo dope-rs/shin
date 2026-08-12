@@ -1,28 +1,17 @@
+use crate::crypto::sig;
 use crate::wire::codec;
 use crate::wire::handshake::messages;
 use crate::wire::handshake::views;
 
-/// Allocation-free view of one framed handshake message. This is the same
-/// acceptance path used by the live client and server state machines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Borrowed<'a>(views::MessageRef<'a>);
+pub use views::{
+    CertificateEntries, CertificateEntryRef, CertificateEntryRefs, CertificateRef,
+    CertificateRequestRef, CertificateVerifyRef, ClientHelloRef, EncryptedExtensionsRef,
+    MessageRef, NewSessionTicketRef, ServerHelloRef, U16List, U16s,
+};
 
-impl<'a> Borrowed<'a> {
-    /// Decodes one message and leaves any following framed messages in `reader`.
-    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
-        Ok(Self(views::MessageRef::decode_from(reader)?))
-    }
-
-    /// Decodes exactly one complete framed message.
-    pub fn decode_exact(raw: &'a [u8]) -> Result<Self, codec::DecodeError> {
-        Ok(Self(views::MessageRef::decode(raw)?))
-    }
-
-    pub fn into_owned(self) -> Frame {
-        self.0.into()
-    }
-}
-
+/// Owned handshake representation for construction, mutation, and retention.
+/// Decode through [`MessageRef`] and cross this allocation boundary explicitly
+/// with [`MessageRef::into_owned`] only when ownership is required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     ClientHello(messages::ClientHello),
@@ -49,7 +38,7 @@ impl Frame {
     }
 
     pub(crate) fn encode_certificate_verify(
-        algorithm: u16,
+        algorithm: sig::SignatureScheme,
         signature: &[u8],
         out: &mut impl codec::Encode,
     ) -> Result<(), codec::EncodeError> {
@@ -91,33 +80,24 @@ impl Frame {
         }
         body.finish()
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(Borrowed::decode(r)?.into_owned())
-    }
 }
 
-impl From<views::MessageRef<'_>> for Frame {
-    fn from(message: views::MessageRef<'_>) -> Self {
-        match message {
-            views::MessageRef::ClientHello(message) => Self::ClientHello(message.into()),
-            views::MessageRef::ServerHello(message) => Self::ServerHello(message.into()),
-            views::MessageRef::EncryptedExtensions(message) => {
-                Self::EncryptedExtensions(message.into())
-            }
-            views::MessageRef::CertificateRequest(message) => {
-                Self::CertificateRequest(message.into())
-            }
-            views::MessageRef::Certificate(message) => Self::Certificate(message.into()),
-            views::MessageRef::CertificateVerify(message) => {
-                Self::CertificateVerify(message.into())
-            }
-            views::MessageRef::Finished(verify_data) => Self::Finished(messages::Finished {
+impl MessageRef<'_> {
+    /// Materializes this borrowed message for mutation or storage.
+    pub fn into_owned(self) -> Frame {
+        match self {
+            Self::ClientHello(message) => Frame::ClientHello(message.into_owned()),
+            Self::ServerHello(message) => Frame::ServerHello(message.into_owned()),
+            Self::EncryptedExtensions(message) => Frame::EncryptedExtensions(message.into_owned()),
+            Self::CertificateRequest(message) => Frame::CertificateRequest(message.into_owned()),
+            Self::Certificate(message) => Frame::Certificate(message.into_owned()),
+            Self::CertificateVerify(message) => Frame::CertificateVerify(message.into_owned()),
+            Self::Finished(verify_data) => Frame::Finished(messages::Finished {
                 verify_data: verify_data.to_vec(),
             }),
-            views::MessageRef::EndOfEarlyData => Self::EndOfEarlyData,
-            views::MessageRef::KeyUpdate(message) => Self::KeyUpdate(message),
-            views::MessageRef::NewSessionTicket(message) => Self::NewSessionTicket(message.into()),
+            Self::EndOfEarlyData => Frame::EndOfEarlyData,
+            Self::KeyUpdate(message) => Frame::KeyUpdate(message),
+            Self::NewSessionTicket(message) => Frame::NewSessionTicket(message.into_owned()),
         }
     }
 }

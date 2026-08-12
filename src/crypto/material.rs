@@ -135,6 +135,22 @@ impl State {
         }
     }
 
+    pub(crate) fn key_update_response_pending(&self) -> bool {
+        matches!(self, Self::Active(active) if active.updates.response_pending())
+    }
+
+    pub(crate) fn request_key_update_response(&mut self) {
+        if let Self::Active(active) = self {
+            active.updates.request_response();
+        }
+    }
+
+    pub(crate) fn clear_key_update_response(&mut self) {
+        if let Self::Active(active) = self {
+            active.updates.clear_response();
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         *self = Self::Empty;
     }

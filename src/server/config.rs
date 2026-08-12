@@ -2,9 +2,12 @@ use crate::connection;
 use crate::crypto::hash;
 use crate::crypto::sig;
 use crate::crypto::ticket;
+use crate::identity;
 use crate::transport;
 use crate::wire::handshake;
 use crate::wire::handshake::views;
+use crate::wire::protocols;
+use crate::wire::record;
 use alloc::vec;
 
 pub struct Config {
@@ -23,11 +26,7 @@ impl Config {
         client_auth: bool,
         early_data: bool,
     ) -> Result<FlightProfile, connection::Error> {
-        if self
-            .alpn_protocols
-            .iter()
-            .any(|protocol| protocol.is_empty() || protocol.len() > u8::MAX as usize)
-        {
+        if protocols::PreparedAlpn::validate(&self.alpn_protocols).is_err() {
             return Err(connection::Error::BadConfig);
         }
         let certificate_len = self
@@ -43,12 +42,15 @@ impl Config {
             .map(vec::Vec::len)
             .max()
             .unwrap_or(0);
-        Ok(FlightProfile {
+        let profile = FlightProfile::new(
             certificate_len,
+            self.source.signing_key().signature_len_upper_bound(),
             maximum_alpn_len,
             client_auth,
             early_data,
-        })
+        )
+        .ok_or(connection::Error::BadConfig)?;
+        Ok(profile)
     }
 }
 
@@ -85,68 +87,109 @@ const EMPTY_EARLY_DATA_EXTENSION_LEN: usize = EXTENSION_HEADER_LEN;
 
 #[derive(Clone, Copy)]
 pub(super) struct FlightProfile {
-    certificate_len: usize,
-    maximum_alpn_len: usize,
+    tls_flight_len: usize,
+    maximum_quic_transport_parameters_len: u16,
     client_auth: bool,
-    early_data: bool,
 }
 
 impl FlightProfile {
-    pub(super) fn fits(
+    fn new(
+        certificate_len: usize,
+        signature_len_upper_bound: usize,
+        maximum_alpn_len: usize,
+        client_auth: bool,
+        early_data: bool,
+    ) -> Option<Self> {
+        let (tls_flight_len, tls_extensions_len) = full_tls_handshake_flight_len(
+            certificate_len,
+            signature_len_upper_bound,
+            maximum_alpn_len,
+            client_auth,
+            early_data,
+        )?;
+        let extension_bound = (u16::MAX as usize)
+            .checked_sub(tls_extensions_len)?
+            .checked_sub(EXTENSION_HEADER_LEN)?;
+        let flight_bound = handshake::MAX_SIZE
+            .checked_sub(tls_flight_len)?
+            .checked_sub(EXTENSION_HEADER_LEN)?;
+        let maximum_quic_transport_parameters_len =
+            u16::try_from(extension_bound.min(flight_bound)).ok()?;
+        Some(Self {
+            tls_flight_len,
+            maximum_quic_transport_parameters_len,
+            client_auth,
+        })
+    }
+
+    pub(super) fn tls_flight_len(self) -> usize {
+        self.tls_flight_len
+    }
+
+    pub(super) fn peer_identity_capacity<V: ClientCertVerifier>(self) -> usize {
+        if self.client_auth {
+            V::MAX_CERTIFICATE_MESSAGE_SIZE
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn flight_len(
         self,
         transport_mode: transport::Mode,
         transport_parameters_len: usize,
-    ) -> bool {
-        full_handshake_flight_fits(self, transport_mode, transport_parameters_len)
+    ) -> Option<usize> {
+        if transport_mode.is_tls() {
+            return (transport_parameters_len == 0).then_some(self.tls_flight_len);
+        }
+        (transport_parameters_len <= self.maximum_quic_transport_parameters_len as usize)
+            .then_some(self.tls_flight_len + EXTENSION_HEADER_LEN + transport_parameters_len)
     }
 }
 
-fn full_handshake_flight_fits(
-    profile: FlightProfile,
-    transport_mode: transport::Mode,
-    transport_parameters_len: usize,
-) -> bool {
+fn full_tls_handshake_flight_len(
+    certificate_len: usize,
+    signature_len_upper_bound: usize,
+    maximum_alpn_len: usize,
+    client_auth: bool,
+    early_data: bool,
+) -> Option<(usize, usize)> {
     const HANDSHAKE_HEADER_LEN: usize = 4;
     const EXTENSIONS_VECTOR_LEN: usize = 2;
     const CERTIFICATE_REQUEST_LEN: usize =
         HANDSHAKE_HEADER_LEN + 1 + EXTENSIONS_VECTOR_LEN + EXTENSION_HEADER_LEN + 2 + 2 * 6;
-    const CERTIFICATE_VERIFY_MAX_LEN: usize = HANDSHAKE_HEADER_LEN + 2 + 2 + sig::MAX_SIGNATURE_LEN;
     const FINISHED_MAX_LEN: usize = HANDSHAKE_HEADER_LEN + hash::MAX_LEN;
 
-    let transport_parameters_extension_len = if transport_mode.is_quic() {
-        EXTENSION_HEADER_LEN + transport_parameters_len
+    let certificate_verify_len =
+        handshake::messages::CertificateVerify::frame_len(signature_len_upper_bound);
+    let alpn_extension_len = if maximum_alpn_len != 0 {
+        EXTENSION_HEADER_LEN + 2 + 1 + maximum_alpn_len
     } else {
         0
     };
-    let alpn_extension_len = if profile.maximum_alpn_len != 0 {
-        EXTENSION_HEADER_LEN + 2 + 1 + profile.maximum_alpn_len
-    } else {
-        0
-    };
-    let early_data_extension_len = if profile.early_data {
+    let early_data_extension_len = if early_data {
         EMPTY_EARLY_DATA_EXTENSION_LEN
     } else {
         0
     };
-    let extension_list_len = TWO_CERTIFICATE_TYPE_EXTENSIONS_LEN
-        + transport_parameters_extension_len
-        + alpn_extension_len
-        + early_data_extension_len;
+    let extension_list_len =
+        TWO_CERTIFICATE_TYPE_EXTENSIONS_LEN + alpn_extension_len + early_data_extension_len;
     if extension_list_len > u16::MAX as usize {
-        return false;
+        return None;
     }
     let encrypted_extensions_len =
         HANDSHAKE_HEADER_LEN + EXTENSIONS_VECTOR_LEN + extension_list_len;
-    encrypted_extensions_len
-        .checked_add(if profile.client_auth {
+    let flight_len = encrypted_extensions_len
+        .checked_add(if client_auth {
             CERTIFICATE_REQUEST_LEN
         } else {
             0
         })
-        .and_then(|len| len.checked_add(profile.certificate_len))
-        .and_then(|len| len.checked_add(CERTIFICATE_VERIFY_MAX_LEN))
+        .and_then(|len| len.checked_add(certificate_len))
+        .and_then(|len| len.checked_add(certificate_verify_len))
         .and_then(|len| len.checked_add(FINISHED_MAX_LEN))
-        .is_some_and(|len| len <= handshake::MAX_SIZE)
+        .filter(|&len| len <= handshake::MAX_SIZE)?;
+    Some((flight_len, extension_list_len))
 }
 
 /// Replay store required for safe 0-RTT. Without one, early data is refused even
@@ -183,6 +226,13 @@ pub enum CertSource {
 }
 
 impl CertSource {
+    pub(super) const fn cert_type(&self) -> identity::CertificateType {
+        match self {
+            Self::RawPublicKey { .. } => identity::CertificateType::RawPublicKey,
+            Self::X509 { .. } => identity::CertificateType::X509,
+        }
+    }
+
     pub(super) fn signing_key(&self) -> &sig::SigningKey {
         match self {
             Self::RawPublicKey { signing_key } => signing_key,
@@ -241,16 +291,44 @@ impl ClientCertVerifier for NoClientAuth {
     }
 }
 
+/// Type-level proof that a shard requests and verifies client authentication.
+///
+/// The wrapper is transparent and constructed only by the client-auth shard
+/// constructors. This keeps its workspace reservation profile in the shard's
+/// type without adding runtime state.
+#[repr(transparent)]
+pub struct ClientAuthVerifier<V>(V);
+
+impl<V> ClientAuthVerifier<V> {
+    pub(super) fn new(verifier: V) -> Self {
+        Self(verifier)
+    }
+}
+
+impl<V: ClientCertVerifier> ClientCertVerifier for ClientAuthVerifier<V> {
+    const MAX_CERTIFICATE_MESSAGE_SIZE: usize = V::MAX_CERTIFICATE_MESSAGE_SIZE;
+
+    fn verify(&self, identity: &ClientIdentity<'_>) -> bool {
+        self.0.verify(identity)
+    }
+}
+
 /// Authorizes a possession-proven client identity, typically by pinning
 /// `spki_der`; CertificateVerify authenticity has already succeeded.
 pub trait ClientCertVerifier {
+    /// Maximum encoded client Certificate message retained for verification.
+    ///
+    /// The server reserves this many bytes once per connection workspace and
+    /// rejects a larger fragmented or retained identity without reallocating.
+    const MAX_CERTIFICATE_MESSAGE_SIZE: usize = record::MAX_PLAINTEXT_BODY;
+
     fn verify(&self, identity: &ClientIdentity<'_>) -> bool;
 }
 
 /// A signature-verified client identity handed to [`ClientCertVerifier`].
 pub struct ClientIdentity<'a> {
-    /// `CERT_TYPE_X509` (0) or `CERT_TYPE_RAW_PUBLIC_KEY` (2).
-    pub cert_type: u8,
+    /// The negotiated certificate representation.
+    pub cert_type: identity::CertificateType,
     /// The leaf SubjectPublicKeyInfo DER — a uniform pinning target across key
     /// types. For RawPublicKey this is the entire certificate.
     pub spki_der: &'a [u8],

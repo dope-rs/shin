@@ -2,7 +2,10 @@ use crate::crypto::material;
 use crate::crypto::ticket;
 use crate::memory::threadbound;
 use crate::transport;
+use crate::wire::record;
 use alloc::rc;
+use core::mem;
+use o3::collections::fixed::array;
 use ring::aead;
 use ring::rand;
 use zeroize::Zeroize as _;
@@ -15,27 +18,62 @@ use zeroize::Zeroize as _;
 #[derive(Clone)]
 pub struct Secret {
     /// Cached expansion shared by immutable per-connection key snapshots.
-    aead_key: Result<rc::Rc<aead::LessSafeKey>, ticket::Error>,
+    aead_key: rc::Rc<aead::LessSafeKey>,
     _thread: threadbound::ThreadBound,
 }
 
-struct Plaintext {
-    psk: [u8; ticket::PSK_LEN],
-    age_add: [u8; ticket::AGE_ADD_LEN],
-    issued_at: [u8; ticket::ISSUED_AT_LEN],
-    suite: u16,
-    alpn: arrayvec::ArrayVec<u8, { ticket::MAX_ALPN_LEN }>,
-    context: ticket::Context,
+pub(super) struct Opened<'a> {
+    pub(super) psk: &'a [u8; ticket::PSK_LEN],
+    pub(super) age_add: u32,
+    pub(super) issued_at_ms: u64,
+    pub(super) suite: record::CipherSuite,
+    pub(super) alpn: &'a [u8],
+    pub(super) context: ticket::Context,
+}
+
+impl Opened<'_> {
+    pub(super) fn to_owned(&self) -> Result<ticket::Decrypted, ticket::Error> {
+        Ok(ticket::Decrypted {
+            psk: material::ResumptionPsk::new(*self.psk),
+            age_add: self.age_add,
+            issued_at_ms: self.issued_at_ms,
+            suite: self.suite,
+            alpn: array::CopyInline::try_from_slice(self.alpn)
+                .map_err(|_| ticket::Error::BadFormat)?,
+            context: self.context,
+            _thread: threadbound::ThreadBound::NEW,
+        })
+    }
+}
+
+const _: () = assert!(mem::size_of::<Opened<'static>>() <= 104);
+
+struct OpenBuffer {
+    bytes: array::CopyInline<u8, { ticket::MAX_CIPHERTEXT_LEN }>,
+}
+
+impl OpenBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: array::CopyInline::new(),
+        }
+    }
+}
+
+impl Drop for OpenBuffer {
+    fn drop(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+    }
 }
 
 impl Secret {
-    pub fn new(mut secret: [u8; 32]) -> Self {
-        let aead_key = Self::derive_aead_key(&secret).map(rc::Rc::new);
+    pub fn new(mut secret: [u8; 32]) -> Result<Self, ticket::Error> {
+        let aead_key = Self::derive_aead_key(&secret);
         secret.zeroize();
-        Self {
-            aead_key,
+        Ok(Self {
+            aead_key: rc::Rc::new(aead_key?),
             _thread: threadbound::ThreadBound::NEW,
-        }
+        })
     }
 
     pub fn encrypt(
@@ -43,7 +81,7 @@ impl Secret {
         psk: &[u8; ticket::PSK_LEN],
         age_add: u32,
         issued_at_ms: u64,
-        suite: u16,
+        suite: record::CipherSuite,
         alpn: &[u8],
         rng: &impl rand::SecureRandom,
     ) -> Result<ticket::Encrypted, ticket::Error> {
@@ -78,23 +116,23 @@ impl Secret {
         if alpn.len() > ticket::MAX_ALPN_LEN {
             return Err(ticket::Error::BadFormat);
         }
-        let key = self.aead_key()?;
+        let key = &self.aead_key;
         let mut nonce_bytes = [0u8; ticket::NONCE_LEN];
         rng.fill(&mut nonce_bytes)
             .map_err(|_| ticket::Error::BadKey)?;
         let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
 
-        let mut buf = arrayvec::ArrayVec::<u8, { ticket::MAX_PLAINTEXT_LEN }>::new();
+        let mut buf = array::CopyInline::<u8, { ticket::MAX_PLAINTEXT_LEN }>::new();
         buf.try_extend_from_slice(psk.as_slice())
             .map_err(|_| ticket::Error::BadFormat)?;
         buf.try_extend_from_slice(&age_add.to_be_bytes())
             .map_err(|_| ticket::Error::BadFormat)?;
         buf.try_extend_from_slice(&issued_at_ms.to_be_bytes())
             .map_err(|_| ticket::Error::BadFormat)?;
-        buf.try_extend_from_slice(&suite.to_be_bytes())
+        buf.try_extend_from_slice(&suite.wire_id().to_be_bytes())
             .map_err(|_| ticket::Error::BadFormat)?;
         context.encode(&mut buf)?;
-        buf.try_push(alpn.len() as u8)
+        buf.push(alpn.len() as u8)
             .map_err(|_| ticket::Error::BadFormat)?;
         buf.try_extend_from_slice(alpn)
             .map_err(|_| ticket::Error::BadFormat)?;
@@ -116,6 +154,14 @@ impl Secret {
     }
 
     pub fn decrypt(&self, encrypted: &[u8]) -> Result<ticket::Decrypted, ticket::Error> {
+        self.decrypt_with(encrypted, &|opened| opened.to_owned())?
+    }
+
+    pub(super) fn decrypt_with<R>(
+        &self,
+        encrypted: &[u8],
+        consume: &impl for<'a> Fn(Opened<'a>) -> R,
+    ) -> Result<R, ticket::Error> {
         if encrypted.len()
             < ticket::NONCE_LEN + ticket::LEGACY_FIXED_PLAINTEXT_LEN + ticket::TAG_LEN
         {
@@ -124,39 +170,23 @@ impl Secret {
         if encrypted.len() > ticket::MAX_LEN {
             return Err(ticket::Error::BadFormat);
         }
-        let key = self.aead_key()?;
+        let key = &self.aead_key;
         let mut nonce_bytes = [0u8; ticket::NONCE_LEN];
         nonce_bytes.copy_from_slice(&encrypted[..ticket::NONCE_LEN]);
         let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
 
-        let mut buf = arrayvec::ArrayVec::<u8, { ticket::MAX_CIPHERTEXT_LEN }>::new();
-        buf.try_extend_from_slice(&encrypted[ticket::NONCE_LEN..])
+        let mut buffer = OpenBuffer::new();
+        buffer
+            .bytes
+            .try_extend_from_slice(&encrypted[ticket::NONCE_LEN..])
             .map_err(|_| ticket::Error::BadFormat)?;
         let plain = key
-            .open_in_place(nonce, aead::Aad::empty(), buf.as_mut_slice())
+            .open_in_place(nonce, aead::Aad::empty(), buffer.bytes.as_mut_slice())
             .map_err(|_| ticket::Error::BadAuth)?;
         if plain.len() < ticket::LEGACY_FIXED_PLAINTEXT_LEN {
             return Err(ticket::Error::BadFormat);
         }
-        let parsed = Self::parse_plaintext(plain);
-        buf.as_mut_slice().zeroize();
-        let Plaintext {
-            psk,
-            age_add,
-            issued_at,
-            suite,
-            alpn,
-            context,
-        } = parsed?;
-        Ok(ticket::Decrypted {
-            psk: material::ResumptionPsk::new(psk),
-            age_add: u32::from_be_bytes(age_add),
-            issued_at_ms: u64::from_be_bytes(issued_at),
-            suite,
-            alpn,
-            context,
-            _thread: threadbound::ThreadBound::NEW,
-        })
+        Ok(consume(Self::parse_plaintext(plain)?))
     }
 
     fn derive_aead_key(secret: &[u8; 32]) -> Result<aead::LessSafeKey, ticket::Error> {
@@ -173,11 +203,7 @@ impl Secret {
         Ok(aead::LessSafeKey::new(unbound))
     }
 
-    fn aead_key(&self) -> Result<&aead::LessSafeKey, ticket::Error> {
-        self.aead_key.as_deref().map_err(|error| *error)
-    }
-
-    fn parse_plaintext(plain: &[u8]) -> Result<Plaintext, ticket::Error> {
+    fn parse_plaintext(plain: &[u8]) -> Result<Opened<'_>, ticket::Error> {
         let age_add_off = ticket::PSK_LEN;
         let issued_at_off = age_add_off + ticket::AGE_ADD_LEN;
         let suite_off = issued_at_off + ticket::ISSUED_AT_LEN;
@@ -193,21 +219,29 @@ impl Secret {
             return Err(ticket::Error::BadFormat);
         }
         let context = ticket::Context::decode(&plain[context_off..alpn_len_off])?;
-        let alpn = arrayvec::ArrayVec::try_from(&plain[fixed_plaintext_len..])
-            .map_err(|_| ticket::Error::BadFormat)?;
-        let mut age_bytes = [0u8; ticket::AGE_ADD_LEN];
-        age_bytes.copy_from_slice(&plain[age_add_off..issued_at_off]);
-        let mut issued_bytes = [0u8; ticket::ISSUED_AT_LEN];
-        issued_bytes.copy_from_slice(&plain[issued_at_off..suite_off]);
-        let suite = u16::from_be_bytes([plain[suite_off], plain[suite_off + 1]]);
-        let mut psk = [0u8; ticket::PSK_LEN];
-        psk.copy_from_slice(&plain[..ticket::PSK_LEN]);
-        Ok(Plaintext {
-            psk,
-            age_add: age_bytes,
-            issued_at: issued_bytes,
+        let age_add = u32::from_be_bytes(
+            plain[age_add_off..issued_at_off]
+                .try_into()
+                .map_err(|_| ticket::Error::BadFormat)?,
+        );
+        let issued_at_ms = u64::from_be_bytes(
+            plain[issued_at_off..suite_off]
+                .try_into()
+                .map_err(|_| ticket::Error::BadFormat)?,
+        );
+        let suite = record::CipherSuite::from_u16(u16::from_be_bytes([
+            plain[suite_off],
+            plain[suite_off + 1],
+        ]))
+        .ok_or(ticket::Error::BadFormat)?;
+        Ok(Opened {
+            psk: plain[..ticket::PSK_LEN]
+                .try_into()
+                .map_err(|_| ticket::Error::BadFormat)?,
+            age_add,
+            issued_at_ms,
             suite,
-            alpn,
+            alpn: &plain[fixed_plaintext_len..],
             context,
         })
     }

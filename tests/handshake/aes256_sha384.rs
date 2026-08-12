@@ -43,7 +43,6 @@ fn client() -> TestClient {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         clock as fn() -> u64,

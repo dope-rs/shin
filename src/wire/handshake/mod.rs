@@ -6,6 +6,26 @@ pub(crate) mod reassemblers;
 pub(crate) mod views;
 pub mod workspace;
 
+/// Whether a TLS KeyUpdate asks the peer to update its write key.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyUpdateRequest {
+    NotRequested = 0,
+    Requested = 1,
+}
+
+impl KeyUpdateRequest {
+    pub(crate) fn from_u8(b: u8) -> Result<Self, codec::DecodeError> {
+        match b {
+            0 => Ok(Self::NotRequested),
+            1 => Ok(Self::Requested),
+            _ => Err(codec::DecodeError::InvalidEnum),
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<KeyUpdateRequest>() == 1);
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {

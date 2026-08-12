@@ -6,29 +6,26 @@ use crate::server::config;
 use crate::server::session;
 use crate::wire::codec::Encode as _;
 use crate::wire::extension;
-use crate::wire::handshake::views;
 use crate::wire::psk;
 use ring::rand::SecureRandom as _;
 use subtle::ConstantTimeEq as _;
-
-use core::mem;
 
 use crate::wire::handshake;
 
 pub(super) trait Resumption {
     fn try_accept_psk(
         &self,
-        ch: &views::ClientHelloRef<'_>,
-        raw: &[u8],
+        offer: psk::Tail<'_>,
         keys: Option<&ticket::Keys>,
+        selected_alpn: Option<&[u8]>,
         replay_domain: &[u8; ticket::REPLAY_DOMAIN_LEN],
-    ) -> Option<session::AcceptedPsk>;
-    fn handle_client_finished<G, V, S>(
+    ) -> Result<Option<session::AcceptedPsk>, connection::Error>;
+    fn handle_client_finished<G, V, S, const DOMAIN: u8>(
         &mut self,
         f: &[u8],
         raw: &[u8],
         expected: material::FinishedVerifyData,
-        shard: &server::Shard<G, V>,
+        shard: &server::Shard<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
@@ -38,78 +35,72 @@ pub(super) trait Resumption {
     fn emit_session_ticket<S: connection::EventSink + ?Sized>(
         &mut self,
         keys: Option<&ticket::Keys>,
+        selected_alpn: Option<&[u8]>,
         replay_domain: [u8; ticket::REPLAY_DOMAIN_LEN],
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>;
 }
-impl<C: connection::Clock> Resumption for server::Server<C> {
+impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
+    for server::Server<C, SERVER_DOMAIN>
+{
     fn try_accept_psk(
         &self,
-        ch: &views::ClientHelloRef<'_>,
-        raw: &[u8],
+        offer: psk::Tail<'_>,
         keys: Option<&ticket::Keys>,
+        selected_alpn: Option<&[u8]>,
         replay_domain: &[u8; ticket::REPLAY_DOMAIN_LEN],
-    ) -> Option<session::AcceptedPsk> {
+    ) -> Result<Option<session::AcceptedPsk>, connection::Error> {
         use crate::memory::threadbound::ThreadBound;
-        use crate::wire::psk::KX_MODE_DHE;
-        use crate::wire::psk::KxModes;
-        use crate::wire::psk::Offer;
         use crate::wire::psk::ResumptionBinder;
-        let keys = keys?;
+        let Some(keys) = keys else {
+            return Ok(None);
+        };
         let now = self.session.runtime.clock.now_ms();
-        let kx_ext = ch
-            .extensions
-            .find(extension::Type::PSK_KEY_EXCHANGE_MODES)?;
-        if !KxModes::contains(kx_ext.data, KX_MODE_DHE).ok()? {
-            return None;
+        let selected_alpn = selected_alpn.unwrap_or_default();
+        let opened = match keys.decrypt_resumption(offer.identity(), selected_alpn) {
+            Ok(opened) => opened,
+            Err(_) => return Ok(None),
+        };
+        if !session::AcceptedPsk::issued_at_is_resumable(opened.issued_at_ms, now) {
+            return Ok(None);
         }
-        let psk_ext = ch.extensions.find(extension::Type::PRE_SHARED_KEY)?;
-        let offer = Offer::decode_first(psk_ext.data).ok()??;
-        let bind = offer.binder;
-        if bind.len() != 32 {
-            return None;
-        }
-        let mut dt = keys.decrypt(offer.identity).ok()?;
-        let suite = dt.suite;
-        let max_early_data = dt.context.early_data_for_replay_domain(
-            self.session.transport_mode,
-            &self.session.connection.transport_params,
-            replay_domain,
-        );
-        let (psk, age_add, issued_at_ms, alpn) =
-            (dt.psk, dt.age_add, dt.issued_at_ms, mem::take(&mut dt.alpn));
-        if !session::AcceptedPsk::issued_at_is_resumable(issued_at_ms, now) {
-            return None;
-        }
-        let binder_prefix = Offer::binder_transcript_prefix(raw, bind.len())?;
-        let mut t = self.session.handshake.transcript.fork();
-        t.update(binder_prefix);
-        let partial_hash = t.hash(psk::RESUMPTION_HASH).ok()?;
-        let expected = ResumptionBinder::compute(psk.as_array(), partial_hash.as_slice()).ok()?;
-        if expected.as_slice().len() != bind.len() || !bool::from(expected.as_slice().ct_eq(bind)) {
-            return None;
-        }
-        Some(session::AcceptedPsk {
-            psk,
+        let bind = offer.binder();
+        let binder: [u8; 32] = bind
+            .try_into()
+            .map_err(|_| connection::Error::BadPskBinder)?;
+        let accepted = session::AcceptedPsk {
+            psk: opened.psk,
             ticket: session::Ticket {
-                age_add,
-                issued_at_ms,
-                suite,
-                obfuscated_age: offer.obfuscated_ticket_age,
-                max_early_data,
+                age_add: opened.age_add,
+                issued_at_ms: opened.issued_at_ms,
+                suite: opened.suite,
+                obfuscated_age: offer.obfuscated_ticket_age(),
+                max_early_data: opened.context.early_data_for_replay_domain(
+                    self.session.transport_mode,
+                    &self.session.connection.transport_params,
+                    replay_domain,
+                ),
             },
-            binder: bind.try_into().ok()?,
-            alpn,
+            binder,
+            alpn_matches: opened.alpn_matches,
             _thread: ThreadBound::NEW,
-        })
+        };
+        let mut t = self.session.handshake.transcript.fork();
+        t.update(offer.transcript_prefix());
+        let partial_hash = t.hash(psk::RESUMPTION_HASH)?;
+        let expected = ResumptionBinder::compute(accepted.psk.as_array(), partial_hash.as_slice())?;
+        if expected.as_slice().len() != bind.len() || !bool::from(expected.as_slice().ct_eq(bind)) {
+            return Err(connection::Error::BadPskBinder);
+        }
+        Ok(Some(accepted))
     }
 
-    fn handle_client_finished<G, V, S>(
+    fn handle_client_finished<G, V, S, const DOMAIN: u8>(
         &mut self,
         f: &[u8],
         raw: &[u8],
         expected: material::FinishedVerifyData,
-        shard: &server::Shard<G, V>,
+        shard: &server::Shard<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
@@ -130,7 +121,8 @@ impl<C: connection::Clock> Resumption for server::Server<C> {
         )?;
         self.session.handshake.state = State::Done;
         self.emit_session_ticket(
-            shard.policy.config.ticket_keys.as_ref(),
+            shard.policy.ticket_keys.as_ref(),
+            self.session.peer.selected_alpn(&shard.policy.alpn),
             *shard.prepared.replay_domain.id(),
             events,
         )?;
@@ -140,6 +132,7 @@ impl<C: connection::Clock> Resumption for server::Server<C> {
     fn emit_session_ticket<S: connection::EventSink + ?Sized>(
         &mut self,
         keys: Option<&ticket::Keys>,
+        selected_alpn: Option<&[u8]>,
         replay_domain: [u8; ticket::REPLAY_DOMAIN_LEN],
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
@@ -177,19 +170,13 @@ impl<C: connection::Clock> Resumption for server::Server<C> {
             .map_err(|_| connection::Error::Rng)?;
         let age_add = u32::from_be_bytes(age_add_bytes);
         let psk = ResumptionMaster::from_secret(&rms).psk(&nonce)?;
-        let alpn = self
-            .session
-            .peer
-            .selected_alpn
-            .as_deref()
-            .unwrap_or_default();
+        let alpn = selected_alpn.unwrap_or_default();
         let suite = self
             .session
             .application
             .traffic
             .suite()
-            .ok_or(connection::Error::UnexpectedMessage)?
-            .wire_id();
+            .ok_or(connection::Error::UnexpectedMessage)?;
         let max_early_data = self
             .session
             .peer
@@ -244,11 +231,6 @@ impl<C: connection::Clock> Resumption for server::Server<C> {
                 epoch: Epoch::Application,
                 data: &self.session.buffers.flight,
             },
-        )?;
-        connection::EventContext::emit(
-            events,
-            self.session.application.traffic.suite(),
-            connection::Event::ResumptionSecret { psk: &psk },
         )?;
         Ok(())
     }

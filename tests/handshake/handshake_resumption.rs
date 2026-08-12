@@ -1,5 +1,5 @@
 use shin::client::Client;
-use shin::client::config::{Config, Resumption, Verifier};
+use shin::client::config::{Config, Restore, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
@@ -22,27 +22,32 @@ fn fresh_server() -> Server<FixedClock> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET).unwrap()),
             accept_early_data: false,
         },
         FixedClock(1_000_000),
     )
 }
 
-fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
-    Client::new(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: *signing_key().pubkey().unwrap(),
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption,
-            enable_early_data: false,
+fn fresh_client(restore: Option<Restore<'_>>) -> Client<fn() -> u64> {
+    let template = Config {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: *signing_key().pubkey().unwrap(),
         },
-        (|| 0) as fn() -> u64,
-    )
-    .unwrap()
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        enable_early_data: false,
+    }
+    .try_into_template()
+    .unwrap();
+    let prepared = match restore {
+        Some(restore) => template.restore(restore).unwrap(),
+        None => template.without_resumption(),
+    };
+    let workspace = prepared.workspace_layout(None).allocate();
+    prepared
+        .try_into_client_with_workspace(None, (|| 0) as fn() -> u64, workspace)
+        .unwrap()
 }
 
 fn drive(
@@ -78,26 +83,20 @@ fn drive(
     (all_client, all_server)
 }
 
-fn first_session_ticket(events: &[Event]) -> Option<(Resumption, [u8; 32])> {
-    let mut psk: Option<[u8; 32]> = None;
+fn first_session_ticket(events: &[Event]) -> Option<(Restore<'static>, [u8; 32])> {
     for e in events {
-        if let Event::ResumptionSecret { psk: p } = e {
-            psk = Some(*p);
-        }
         if let Event::NewSessionTicket {
+            psk,
+            ticket_lifetime,
             ticket_age_add,
             ticket,
             ..
         } = e
         {
             return Some((
-                Resumption::new(
-                    psk.expect("ResumptionSecret precedes NewSessionTicket"),
-                    ticket.clone(),
-                    *ticket_age_add,
-                    0,
-                ),
-                psk.unwrap(),
+                Restore::try_new(*psk, ticket.clone(), *ticket_age_add, 0, *ticket_lifetime)
+                    .unwrap(),
+                *psk,
             ));
         }
     }
@@ -121,12 +120,12 @@ fn resumed_handshake_skips_certificate_and_certificate_verify() {
 
     use shin::wire::codec::Reader;
     use shin::wire::handshake::Type;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::frame::MessageRef;
     let mut r = Reader::new(&s_hs_blob);
     let mut types = Vec::new();
     while !r.is_empty() {
         let snap = r.remaining();
-        let m = Frame::decode(&mut r).unwrap();
+        let m = MessageRef::decode_from(&mut r).unwrap();
         let _ = snap;
         types.push(m.msg_type());
     }

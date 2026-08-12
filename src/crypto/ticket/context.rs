@@ -1,7 +1,7 @@
 use crate::crypto::hash;
 use crate::crypto::ticket;
 use crate::transport;
-use arrayvec;
+use o3::collections::fixed::array;
 
 const TRANSPORT_PARAMS_HASH_LEN: usize = hash::SHA256_LEN;
 const LEGACY_FORMAT_VERSION: u8 = 1;
@@ -89,11 +89,11 @@ impl Context {
 
     pub(super) fn encode<const N: usize>(
         self,
-        out: &mut arrayvec::ArrayVec<u8, N>,
+        out: &mut array::CopyInline<u8, N>,
     ) -> Result<(), ticket::Error> {
-        out.try_push(FORMAT_VERSION)
+        out.push(FORMAT_VERSION)
             .map_err(|_| ticket::Error::BadFormat)?;
-        out.try_push(match self.transport_mode {
+        out.push(match self.transport_mode {
             transport::Mode::Tls => 0,
             transport::Mode::Quic => 1,
         })
@@ -103,8 +103,7 @@ impl Context {
             Some(_) => return Err(ticket::Error::BadFormat),
             None => (0, 0),
         };
-        out.try_push(present)
-            .map_err(|_| ticket::Error::BadFormat)?;
+        out.push(present).map_err(|_| ticket::Error::BadFormat)?;
         out.try_extend_from_slice(&maximum.to_be_bytes())
             .map_err(|_| ticket::Error::BadFormat)?;
         out.try_extend_from_slice(&self.transport_params_hash)

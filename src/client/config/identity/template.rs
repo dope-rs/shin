@@ -1,3 +1,4 @@
+use crate::identity;
 use alloc::rc;
 use core::mem;
 use core::ops;
@@ -17,8 +18,12 @@ impl IdentityTemplate {
         }
     }
 
-    pub(crate) fn cert_type(&self) -> u8 {
+    pub(crate) fn cert_type(&self) -> identity::CertificateType {
         self.source.cert_type()
+    }
+
+    pub(crate) fn outbound_flight_capacity(&self) -> usize {
+        self.source.outbound_flight_capacity()
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::wire::codec;
 use crate::wire::codec::Encode as _;
 use alloc::vec;
+use o3::collections::fixed::array;
 
 pub const MAX_EXTENSIONS: usize = 64;
 
@@ -49,12 +50,6 @@ impl Extension {
         out.begin_u16()
     }
 
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        let ty = Type(r.u16()?);
-        let data = r.vec_u16()?.to_vec();
-        Ok(Self { ty, data })
-    }
-
     pub fn encode_list(
         exts: &[Self],
         out: &mut impl codec::Encode,
@@ -65,57 +60,44 @@ impl Extension {
         }
         list.finish()
     }
-
-    pub fn decode_list(r: &mut codec::Reader<'_>) -> Result<vec::Vec<Self>, codec::DecodeError> {
-        let mut sub = r.sub_u16()?;
-        let mut out: vec::Vec<Self> = vec::Vec::new();
-        let mut seen: vec::Vec<u16> = vec::Vec::new();
-        while !sub.is_empty() {
-            if out.len() >= MAX_EXTENSIONS {
-                return Err(codec::DecodeError::InvalidEnum);
-            }
-            let ext = Self::decode(&mut sub)?;
-            match seen.binary_search(&ext.ty.0) {
-                Ok(_) => return Err(codec::DecodeError::DuplicateExtension),
-                Err(pos) => seen.insert(pos, ext.ty.0),
-            }
-            out.push(ext);
-        }
-        Ok(out)
-    }
 }
 
+/// Allocation-free view of one validated extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Ref<'a> {
-    pub(crate) ty: Type,
-    pub(crate) data: &'a [u8],
+pub struct ExtensionRef<'a> {
+    pub ty: Type,
+    pub data: &'a [u8],
 }
 
-impl<'a> Ref<'a> {
+impl<'a> ExtensionRef<'a> {
     fn decode(r: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
             ty: Type(r.u16()?),
             data: r.vec_u16()?,
         })
     }
+
+    pub fn into_owned(self) -> Extension {
+        Extension::new(self.ty, self.data.to_vec())
+    }
 }
 
+/// Validated, allocation-free view of an encoded extension list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Extensions<'a> {
+pub struct Extensions<'a> {
     encoded: &'a [u8],
 }
 
 impl<'a> Extensions<'a> {
-    pub(crate) fn decode(r: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
-        use arrayvec::ArrayVec;
+    pub fn decode(r: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         let encoded = r.vec_u16()?;
         let mut reader = codec::Reader::new(encoded);
-        let mut seen = ArrayVec::<u16, MAX_EXTENSIONS>::new();
+        let mut seen = array::CopyInline::<u16, MAX_EXTENSIONS>::new();
         while !reader.is_empty() {
-            let extension = Ref::decode(&mut reader)?;
+            let extension = ExtensionRef::decode(&mut reader)?;
             match seen.binary_search(&extension.ty.0) {
                 Ok(_) => return Err(codec::DecodeError::DuplicateExtension),
-                Err(position) if seen.try_insert(position, extension.ty.0).is_err() => {
+                Err(position) if seen.insert(position, extension.ty.0).is_err() => {
                     return Err(codec::DecodeError::InvalidEnum);
                 }
                 Err(_) => {}
@@ -124,28 +106,32 @@ impl<'a> Extensions<'a> {
         Ok(Self { encoded })
     }
 
-    pub(crate) fn iter(self) -> Refs<'a> {
-        Refs {
+    pub fn iter(self) -> ExtensionRefs<'a> {
+        ExtensionRefs {
             reader: codec::Reader::new(self.encoded),
         }
     }
 
-    pub(crate) fn find(self, ty: Type) -> Option<Ref<'a>> {
+    pub fn find(self, ty: Type) -> Option<ExtensionRef<'a>> {
         self.iter().find(|extension| extension.ty == ty)
+    }
+
+    pub fn into_owned(self) -> vec::Vec<Extension> {
+        self.iter().map(ExtensionRef::into_owned).collect()
     }
 }
 
-pub(crate) struct Refs<'a> {
+pub struct ExtensionRefs<'a> {
     reader: codec::Reader<'a>,
 }
 
-impl<'a> Iterator for Refs<'a> {
-    type Item = Ref<'a>;
+impl<'a> Iterator for ExtensionRefs<'a> {
+    type Item = ExtensionRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.reader.is_empty() {
             return None;
         }
-        Ref::decode(&mut self.reader).ok()
+        ExtensionRef::decode(&mut self.reader).ok()
     }
 }

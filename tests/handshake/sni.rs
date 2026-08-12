@@ -1,7 +1,6 @@
 use shin::client::Client;
 use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
 use shin::connection::Epoch;
-use shin::identity::spki::SubjectPublicKey;
 use shin::wire::codec::Reader;
 use shin::wire::extension::Type;
 use shin::wire::handshake::frame::Frame;
@@ -15,7 +14,6 @@ fn drive_client_hello(verifier: Verifier) -> ClientHello {
             verifier,
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         || 0,
@@ -33,19 +31,22 @@ fn drive_client_hello(verifier: Verifier) -> ClientHello {
         })
         .expect("ClientHello sent at Plaintext epoch");
     let mut r = Reader::new(&ch_bytes);
-    match Frame::decode(&mut r).unwrap() {
+    match crate::decode_owned(&mut r).unwrap() {
         Frame::ClientHello(ch) => ch,
         _ => panic!("expected ClientHello"),
     }
 }
 
 fn x509_verifier(hostname: &[u8]) -> Verifier {
+    let root = &webpki_roots::TLS_SERVER_ROOTS[0];
     Verifier::X509 {
-        anchors: vec![OwnedTrustAnchor::unconstrained(
-            vec![0x30, 0x00],
-            SubjectPublicKey::Ed25519([0; 32]).encode().unwrap(),
+        anchors: vec![OwnedTrustAnchor::from_der_fields(
+            root.subject.as_ref(),
+            root.subject_public_key_info.as_ref(),
+            root.name_constraints.as_ref().map(|value| value.as_ref()),
         )],
         hostname: hostname.to_vec(),
+        certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
     }
 }
 

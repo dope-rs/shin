@@ -35,8 +35,8 @@ fn self_signed_ip_leaf(ip: &str) -> Vec<u8> {
 }
 
 fn now_for(leaf: &Cert<'_>) -> UnixTime {
-    let nb = UnixTime::from_time_value(&leaf.tbs.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&leaf.tbs.validity.not_after).unwrap();
+    let nb = leaf.tbs.validity.not_before;
+    let na = leaf.tbs.validity.not_after;
     UnixTime((nb.0 + na.0) / 2)
 }
 
@@ -45,13 +45,13 @@ fn validates_self_signed_leaf_with_ipv6_san() {
     let der = self_signed_ip_leaf("2001:db8::1");
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, now, b"2001:db8::1")
         .expect("ipv6 SAN matches");
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"2001:db8::2")
             .unwrap_err(),
         Error::HostnameMismatch,
@@ -63,14 +63,14 @@ fn ipv6_san_matches_compressed_reference_forms() {
     let der = self_signed_ip_leaf("2001:db8::1");
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     for form in [
         &b"2001:db8::1"[..],
         &b"2001:0db8:0000:0000:0000:0000:0000:0001"[..],
         &b"2001:db8:0:0:0:0:0:1"[..],
     ] {
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, form)
             .unwrap_or_else(|_| panic!("form {:?} should match", core::str::from_utf8(form)));
     }
@@ -81,10 +81,10 @@ fn ipv6_san_rejects_dns_reference_and_vice_versa() {
     let ip_der = self_signed_ip_leaf("2001:db8::1");
     let ip_cert = Cert::parse(&ip_der).unwrap();
     let ip_now = now_for(&ip_cert);
-    let ip_chain = [ip_cert.clone()];
+    let ip_chain = [ip_cert];
     let ip_anchors = [TrustAnchor::from_cert(&ip_cert)];
     assert_eq!(
-        Chain::new(&ip_chain)
+        Chain::new(ip_chain)
             .validate(&ip_anchors, ip_now, b"example.com")
             .unwrap_err(),
         Error::HostnameMismatch
@@ -93,10 +93,10 @@ fn ipv6_san_rejects_dns_reference_and_vice_versa() {
     let dns_der = self_signed_leaf(&["host.local"]);
     let dns_cert = Cert::parse(&dns_der).unwrap();
     let dns_now = now_for(&dns_cert);
-    let dns_chain = [dns_cert.clone()];
+    let dns_chain = [dns_cert];
     let dns_anchors = [TrustAnchor::from_cert(&dns_cert)];
     assert_eq!(
-        Chain::new(&dns_chain)
+        Chain::new(dns_chain)
             .validate(&dns_anchors, dns_now, b"2001:db8::1")
             .unwrap_err(),
         Error::HostnameMismatch
@@ -108,18 +108,18 @@ fn ipv4_mapped_and_distinct_ipv6_do_not_collide() {
     let der = self_signed_ip_leaf("2001:db8::1");
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     // A different address whose textual prefix overlaps must not match.
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"2001:db8::1:0")
             .unwrap_err(),
         Error::HostnameMismatch
     );
     // Garbage that is neither a valid IP nor a DNS label must not match.
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"2001:db8::zz")
             .unwrap_err(),
         Error::HostnameMismatch
@@ -131,9 +131,9 @@ fn validates_self_signed_leaf_with_dns_san() {
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, now, b"host.local")
         .expect("valid");
 }
@@ -148,7 +148,7 @@ fn rejects_unknown_anchor() {
     let chain = [leaf];
     let anchors = [TrustAnchor::from_cert(&other)];
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
         Error::NoTrustAnchor
@@ -160,10 +160,10 @@ fn rejects_hostname_mismatch() {
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"other.local")
             .unwrap_err(),
         Error::HostnameMismatch
@@ -174,12 +174,12 @@ fn rejects_hostname_mismatch() {
 fn rejects_expired_cert() {
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
-    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
-    let chain = [cert.clone()];
+    let na = cert.tbs.validity.not_after;
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     let beyond = UnixTime(na.0 + 60);
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, beyond, b"host.local")
             .unwrap_err(),
         Error::Expired
@@ -191,24 +191,24 @@ fn validity_boundaries_are_inclusive() {
     // RFC 5280 §4.1.2.5: notBefore and notAfter are both inclusive.
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
-    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
-    let chain = [cert.clone()];
+    let nb = cert.tbs.validity.not_before;
+    let na = cert.tbs.validity.not_after;
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, nb, b"host.local")
         .expect("notBefore is inclusive");
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, na, b"host.local")
         .expect("notAfter is inclusive");
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, UnixTime(nb.0 - 1), b"host.local")
             .unwrap_err(),
         Error::NotYetValid
     );
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, UnixTime(na.0 + 1), b"host.local")
             .unwrap_err(),
         Error::Expired
@@ -219,12 +219,12 @@ fn validity_boundaries_are_inclusive() {
 fn rejects_not_yet_valid() {
     let der = self_signed_leaf(&["host.local"]);
     let cert = Cert::parse(&der).unwrap();
-    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let chain = [cert.clone()];
+    let nb = cert.tbs.validity.not_before;
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     let earlier = UnixTime(nb.0.saturating_sub(60));
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, earlier, b"host.local")
             .unwrap_err(),
         Error::NotYetValid
@@ -239,10 +239,10 @@ fn rejects_ca_marked_cert_as_leaf() {
     let der = params.self_signed(&key).unwrap().der().to_vec();
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"ca.local")
             .unwrap_err(),
         Error::NotEndEntity
@@ -258,10 +258,10 @@ fn rejects_missing_server_auth_eku() {
     let der = params.self_signed(&key).unwrap().der().to_vec();
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
         Error::NoServerAuth
@@ -285,10 +285,10 @@ fn rejects_unknown_critical_extension() {
     let der = leaf_with_custom_ext(true);
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
         Error::UnhandledCriticalExtension
@@ -300,9 +300,9 @@ fn accepts_unknown_noncritical_extension() {
     let der = leaf_with_custom_ext(false);
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, now, b"host.local")
         .expect("non-critical unknown ext is ok");
 }
@@ -349,10 +349,10 @@ fn rejects_issuer_subject_dn_mismatch() {
     let root_cert = Cert::parse(&root.2).unwrap();
     let now = now_for(&leaf_cert);
 
-    let chain = [leaf_cert.clone(), wrong_cert];
+    let chain = [leaf_cert, wrong_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
         Error::IssuerSubjectMismatch
@@ -364,9 +364,9 @@ fn wildcard_san_matches_subdomain() {
     let der = self_signed_leaf(&["*.example.local"]);
     let cert = Cert::parse(&der).unwrap();
     let now = now_for(&cert);
-    let chain = [cert.clone()];
+    let chain = [cert];
     let anchors = [TrustAnchor::from_cert(&cert)];
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, now, b"foo.example.local")
         .expect("valid");
 }

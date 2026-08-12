@@ -2,11 +2,9 @@ use crate::connection;
 use crate::crypto::kx;
 use crate::crypto::schedule;
 use crate::transport;
-use crate::wire::handshake;
-use crate::wire::handshake::workspace;
 use crate::wire::record;
 
-use core::mem;
+use o3::collections::fixed::array;
 
 mod authentication;
 pub mod config;
@@ -15,20 +13,22 @@ mod negotiation;
 mod offer;
 mod session;
 mod state;
+mod updates;
+mod workspace;
+
+pub use config::Ticket;
+pub use updates::Updates;
+pub use workspace::{Workspace, WorkspaceLayout, WorkspaceMismatch, WorkspaceRejection};
 
 use drive::Drive as _;
-
-/// RFC 8446 §4.6.1: a client MUST NOT cache a ticket longer than 7 days, and a
-/// server MUST NOT send a larger lifetime.
-const MAX_TICKET_LIFETIME_SECS: u32 = 604_800;
 
 /// ```compile_fail
 /// use shin::client::Client;
 /// fn assert_send<T: Send>() {}
 /// assert_send::<Client<fn() -> u64>>();
 /// ```
-pub struct Client<C: connection::Clock> {
-    session: session::Session<C>,
+pub struct Client<C: connection::Clock, K = kx::Owned> {
+    session: session::Session<C, K>,
 }
 
 /// Opt-in client whose hybrid private state lives in caller-owned storage.
@@ -43,20 +43,30 @@ pub struct Client<C: connection::Clock> {
 /// fn assert_send<T: Send>() {}
 /// assert_send::<Hybrid<'static, fn() -> u64>>();
 /// ```
+///
+/// ```compile_fail
+/// use shin::client::{Client, Hybrid};
+/// use shin::connection::Clock;
+/// use shin::crypto::kx::HybridWorkspace;
+///
+/// fn bind_twice<C: Clock>(
+///     first: Client<C>,
+///     second: Client<C>,
+///     workspace: &mut HybridWorkspace,
+/// ) {
+///     let first = Hybrid::from_client(first, workspace).unwrap();
+///     let second = Hybrid::from_client(second, workspace).unwrap();
+///     drop((first, second));
+/// }
+/// ```
 pub struct Hybrid<'workspace, C: connection::Clock> {
-    client: Client<C>,
-    workspace: &'workspace mut kx::HybridWorkspace,
+    client: Client<C, kx::Workspace<'workspace>>,
 }
 
 impl<C: connection::Clock> Client<C> {
     /// Creates a TLS-over-stream client.
     pub fn new(config: config::Config, clock: C) -> Result<Self, config::Error> {
-        Self::with_transport_workspace(
-            config,
-            transport::Mode::Tls,
-            clock,
-            workspace::Scratch::for_client(),
-        )
+        Self::new_with_transport(config, transport::Mode::Tls, clock)
     }
 
     /// Creates a client for the explicitly selected transport.
@@ -65,107 +75,48 @@ impl<C: connection::Clock> Client<C> {
         transport_mode: transport::Mode,
         clock: C,
     ) -> Result<Self, config::Error> {
-        Self::with_transport_workspace(
-            config,
-            transport_mode,
-            clock,
-            workspace::Scratch::for_client(),
-        )
+        let config = config.try_into_prepared_with_transport(transport_mode)?;
+        let workspace = config.workspace_layout(None).allocate();
+        Ok(config.build_client(None, clock, workspace))
     }
 
-    /// Creates a client with caller-owned storage for an explicit transport.
-    pub fn with_transport_workspace(
+    /// Creates a mutually authenticated TLS-over-stream client and reserves
+    /// its exact identity flight before construction.
+    pub fn mutual(
         config: config::Config,
+        identity: config::Identity,
+        clock: C,
+    ) -> Result<Self, config::Error> {
+        Self::mutual_with_transport(config, identity, transport::Mode::Tls, clock)
+    }
+
+    /// Creates a mutually authenticated client for the selected transport.
+    pub fn mutual_with_transport(
+        config: config::Config,
+        identity: config::Identity,
         transport_mode: transport::Mode,
         clock: C,
-        workspace: workspace::Scratch,
     ) -> Result<Self, config::Error> {
         let config = config.try_into_prepared_with_transport(transport_mode)?;
-        Ok(Self::with_prepared_workspace(
-            config, None, clock, workspace,
-        ))
+        let identity = identity.try_into_template()?;
+        let workspace = config.workspace_layout(Some(&identity)).allocate();
+        Ok(config.build_client(Some(identity), clock, workspace))
     }
 
-    pub fn with_prepared_workspace(
-        config: config::Prepared,
-        identity: Option<config::IdentityTemplate>,
+    /// Creates a client for the retained ticket's endpoint and transport.
+    pub fn resume(
+        resumption: config::Resumption,
+        enable_early_data: bool,
         clock: C,
-        workspace: workspace::Scratch,
-    ) -> Self {
-        use crate::crypto::hash::Transcript;
-        use crate::crypto::material;
-        use crate::memory::threadbound::ThreadBound;
-        use crate::wire::handshake::reassemblers::HsReassembler;
-        use ring::rand::SystemRandom;
-        use session::Application;
-        use session::Buffers;
-        use session::Credentials;
-        use session::Extensions;
-        use session::Handshake;
-        use session::OfferSettings;
-        use session::Runtime;
-        let config::Prepared {
-            template: config,
-            resumption,
-        } = config;
-        let workspace::Scratch {
-            reassembly,
-            flight,
-            identity: identity_workspace,
-        } = workspace;
-        Self {
-            session: session::Session {
-                offer: OfferSettings {
-                    config,
-                    resumption,
-                    kex_group: kx::KexGroup::X25519,
-                    offered_suites: record::CipherSuite::SUPPORTED.into_iter().collect(),
-                },
-                handshake: Handshake {
-                    state: state::State::initial(),
-                    transcript: Transcript::new(),
-                    eph: None,
-                    client_random: [0u8; handshake::RANDOM_LEN],
-                    session_id: [0; 32],
-                    hrr_done: false,
-                    active_resumption: None,
-                    psk_used: false,
-                },
-                extensions: Extensions {
-                    ee_offered: arrayvec::ArrayVec::new(),
-                    selected_alpn: None,
-                    early_data: session::EarlyData::NotOffered,
-                },
-                credentials: Credentials {
-                    identity,
-                    cert_request: None,
-                },
-                application: Application {
-                    traffic: material::State::default(),
-                    resumption_master: None,
-                    exporter_master: None,
-                },
-                buffers: Buffers {
-                    reasm: HsReassembler::with_buffer(reassembly),
-                    flight,
-                    identity_workspace,
-                },
-                runtime: Runtime {
-                    clock,
-                    rng: SystemRandom::new(),
-                    _thread: ThreadBound::NEW,
-                },
-            },
-        }
+    ) -> Result<Self, config::Error> {
+        let config = config::Prepared::from_retained(resumption, enable_early_data)?;
+        let workspace = config.workspace_layout(None).allocate();
+        Ok(config.build_client(None, clock, workspace))
     }
 
     /// Returns the caller-owned handshake storage after clearing protocol bytes.
-    pub fn into_workspace(mut self) -> workspace::Scratch {
-        workspace::Scratch::from_buffers(
-            self.session.buffers.reasm.release_buffer(),
-            mem::take(&mut self.session.buffers.flight),
-            mem::take(&mut self.session.buffers.identity_workspace),
-        )
+    pub fn into_workspace(self) -> Workspace {
+        self.session.release_workspace()
     }
 
     /// Choose the (EC)DHE group to offer (default X25519). Must be set before
@@ -175,7 +126,9 @@ impl<C: connection::Clock> Client<C> {
         self.session.offer.kex_group = group;
         Ok(())
     }
+}
 
+impl<C: connection::Clock, K: kx::Initiator> Client<C, K> {
     /// Restrict the cipher suites offered (default: all supported, AES-128
     /// first). Must be set before `start`.
     pub fn set_cipher_suites(
@@ -183,10 +136,14 @@ impl<C: connection::Clock> Client<C> {
         suites: &[record::CipherSuite],
     ) -> Result<(), connection::Error> {
         self.session.handshake.require_initial()?;
-        let offered_suites: arrayvec::ArrayVec<_, 3> = record::CipherSuite::SUPPORTED
-            .into_iter()
-            .filter(|suite| suites.contains(suite))
-            .collect();
+        let mut offered_suites = array::CopyInline::<_, 3>::new();
+        for suite in record::CipherSuite::SUPPORTED {
+            if suites.contains(&suite) {
+                offered_suites
+                    .push(suite)
+                    .map_err(|_| connection::Error::BadConfig)?;
+            }
+        }
         if offered_suites.is_empty() {
             return Err(connection::Error::BadConfig);
         }
@@ -194,18 +151,11 @@ impl<C: connection::Clock> Client<C> {
         Ok(())
     }
 
-    /// Present this identity if the server requests client authentication
-    /// (mutual TLS). Must be set before `start`. Without it, a server that only
-    /// *requests* (not requires) client auth gets an empty Certificate.
-    pub fn set_identity(&mut self, source: config::Identity) -> Result<(), connection::Error> {
-        self.session.handshake.require_initial()?;
-        let source = source.try_into_template()?;
-        self.session.credentials.identity = Some(source);
-        Ok(())
-    }
-
     pub fn selected_alpn(&self) -> Option<&[u8]> {
-        self.session.extensions.selected_alpn.as_deref()
+        self.session
+            .extensions
+            .selected_alpn
+            .and_then(|selected| self.session.offer.config.alpn(selected))
     }
 
     /// Suite selected by ServerHello for constructing the record
@@ -243,7 +193,7 @@ impl<C: connection::Clock> Client<C> {
         &mut self,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        self.start_with_workspace(None, events)
+        self.start(events)
     }
 
     /// Processes one record payload and emits events without an intermediate batch.
@@ -253,26 +203,16 @@ impl<C: connection::Clock> Client<C> {
         data: &[u8],
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        self.read_with_workspace(epoch, data, None, events)
+        self.read(epoch, data, events)
     }
 
-    /// Marks application-data progress and resets the KeyUpdate budget.
-    /// Call once per decrypted application record.
-    pub fn note_application_data(&mut self) {
-        self.session.application.traffic.reset_updates();
+    /// Borrows exclusive post-handshake KeyUpdate control.
+    pub fn key_updates(&mut self) -> Updates<'_, C, K> {
+        Updates::new(self)
     }
 
     pub fn is_done(&self) -> bool {
-        self.session.handshake.state.kind() == state::StateKind::Done
-    }
-
-    /// Emits a KeyUpdate directly into `events`.
-    pub fn send_key_update_into<S: connection::EventSink + ?Sized>(
-        &mut self,
-        request_update: bool,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>> {
-        self.send_key_update(request_update, events)
+        matches!(self.session.handshake.state, state::State::Done)
     }
 }
 
@@ -283,9 +223,9 @@ impl<'workspace, C: connection::Clock> Hybrid<'workspace, C> {
         hybrid_workspace: &'workspace mut kx::HybridWorkspace,
     ) -> Result<Self, connection::Error> {
         client.set_kex_group(kx::KexGroup::X25519Mlkem768)?;
+        let session = client.session.with_kx(kx::Workspace::new(hybrid_workspace));
         Ok(Self {
-            client,
-            workspace: hybrid_workspace,
+            client: Client { session },
         })
     }
 
@@ -294,10 +234,6 @@ impl<'workspace, C: connection::Clock> Hybrid<'workspace, C> {
         suites: &[record::CipherSuite],
     ) -> Result<(), connection::Error> {
         self.client.set_cipher_suites(suites)
-    }
-
-    pub fn set_identity(&mut self, source: config::Identity) -> Result<(), connection::Error> {
-        self.client.set_identity(source)
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
@@ -321,13 +257,7 @@ impl<'workspace, C: connection::Clock> Hybrid<'workspace, C> {
         &mut self,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        let result = self
-            .client
-            .start_with_workspace(Some(&mut *self.workspace), events);
-        if result.is_err() {
-            self.workspace.clear();
-        }
-        result
+        self.client.start_into(events)
     }
 
     pub fn read_into<S: connection::EventSink + ?Sized>(
@@ -336,34 +266,19 @@ impl<'workspace, C: connection::Clock> Hybrid<'workspace, C> {
         data: &[u8],
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        let result =
-            self.client
-                .read_with_workspace(epoch, data, Some(&mut *self.workspace), events);
-        if result.is_err() {
-            self.workspace.clear();
-        }
-        result
+        self.client.read_into(epoch, data, events)
     }
 
-    pub fn note_application_data(&mut self) {
-        self.client.note_application_data();
+    pub fn key_updates(&mut self) -> Updates<'_, C, kx::Workspace<'workspace>> {
+        Updates::new(&mut self.client)
     }
 
     pub fn is_done(&self) -> bool {
         self.client.is_done()
     }
 
-    pub fn send_key_update_into<S: connection::EventSink + ?Sized>(
-        &mut self,
-        request_update: bool,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>> {
-        self.client.send_key_update_into(request_update, events)
-    }
-
     /// Clears hybrid private state and returns the ordinary handshake storage.
-    pub fn into_workspace(self) -> workspace::Scratch {
-        self.workspace.clear();
-        self.client.into_workspace()
+    pub fn into_workspace(self) -> Workspace {
+        self.client.session.release_workspace()
     }
 }

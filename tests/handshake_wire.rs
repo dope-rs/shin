@@ -1,12 +1,17 @@
+use shin::crypto::sig::SignatureScheme;
 use shin::wire::codec::Reader;
 use shin::wire::extension::{Extension, Type};
 use shin::wire::handshake;
-use shin::wire::handshake::frame::{Borrowed, Frame};
+use shin::wire::handshake::frame::{
+    CertificateEntryRef, CertificateRef, CertificateVerifyRef, ClientHelloRef,
+    EncryptedExtensionsRef, NewSessionTicketRef, ServerHelloRef,
+};
+use shin::wire::handshake::frame::{Frame, MessageRef};
 use shin::wire::handshake::messages::{
     Certificate, CertificateEntry, CertificateRequest, CertificateVerify, ClientHello,
     EncryptedExtensions, Finished, KeyUpdate, NewSessionTicket, ServerHello,
 };
-use shin::wire::handshake::{RANDOM_LEN, TLS_1_2, TLS_1_3};
+use shin::wire::handshake::{KeyUpdateRequest, RANDOM_LEN, TLS_1_2, TLS_1_3};
 
 fn sample_extensions() -> Vec<Extension> {
     vec![
@@ -54,14 +59,16 @@ fn sample_frames() -> Vec<Frame> {
             }],
         }),
         Frame::CertificateVerify(CertificateVerify {
-            algorithm: 0x0807,
+            algorithm: SignatureScheme::ED25519,
             signature: b"sig".to_vec(),
         }),
         Frame::Finished(Finished {
             verify_data: vec![0; 32],
         }),
         Frame::EndOfEarlyData,
-        Frame::KeyUpdate(KeyUpdate { request_update: 1 }),
+        Frame::KeyUpdate(KeyUpdate {
+            request: KeyUpdateRequest::Requested,
+        }),
         Frame::NewSessionTicket(NewSessionTicket {
             ticket_lifetime: 86_400,
             ticket_age_add: 0x1020_3040,
@@ -73,18 +80,12 @@ fn sample_frames() -> Vec<Frame> {
 }
 
 fn assert_canonical_acceptance(encoded: &[u8]) {
-    let mut borrowed_reader = Reader::new(encoded);
-    let mut owned_reader = Reader::new(encoded);
-    let borrowed = Borrowed::decode(&mut borrowed_reader);
-    let owned = Frame::decode(&mut owned_reader);
-    assert_eq!(
-        borrowed_reader.remaining().len(),
-        owned_reader.remaining().len(),
-    );
-    match (borrowed, owned) {
-        (Ok(borrowed), Ok(owned)) => assert_eq!(borrowed.into_owned(), owned),
-        (Err(borrowed), Err(owned)) => assert_eq!(borrowed, owned),
-        _ => panic!("borrowed and owned acceptance drifted"),
+    let mut reader = Reader::new(encoded);
+    if let Ok(message) = MessageRef::decode_from(&mut reader) {
+        let consumed = encoded.len() - reader.remaining().len();
+        let mut round_trip = Vec::new();
+        message.into_owned().encode(&mut round_trip).unwrap();
+        assert_eq!(round_trip, encoded[..consumed]);
     }
 }
 
@@ -101,7 +102,7 @@ fn client_hello_round_trip() {
     let mut buf = Vec::new();
     ch.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
-    let decoded = ClientHello::decode(&mut r).unwrap();
+    let decoded = ClientHelloRef::decode(&mut r).unwrap().into_owned();
     r.finish().unwrap();
     assert_eq!(decoded, ch);
 }
@@ -119,7 +120,7 @@ fn server_hello_round_trip() {
     let mut buf = Vec::new();
     sh.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
-    let decoded = ServerHello::decode(&mut r).unwrap();
+    let decoded = ServerHelloRef::decode(&mut r).unwrap().into_owned();
     r.finish().unwrap();
     assert_eq!(decoded, sh);
 }
@@ -132,7 +133,7 @@ fn encrypted_extensions_round_trip() {
     let mut buf = Vec::new();
     ee.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
-    let decoded = EncryptedExtensions::decode(&mut r).unwrap();
+    let decoded = EncryptedExtensionsRef::decode(&mut r).unwrap().into_owned();
     r.finish().unwrap();
     assert_eq!(decoded, ee);
 }
@@ -155,23 +156,62 @@ fn certificate_round_trip() {
     let mut buf = Vec::new();
     cert.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
-    let decoded = Certificate::decode(&mut r).unwrap();
+    let decoded = CertificateRef::decode(&mut r).unwrap().into_owned();
     r.finish().unwrap();
     assert_eq!(decoded, cert);
 }
 
 #[test]
+fn nonempty_opaque_vectors_reject_empty_payloads() {
+    let empty_certificate = CertificateEntry {
+        cert_data: Vec::new(),
+        extensions: Vec::new(),
+    };
+    let mut encoded_certificate = Vec::new();
+    empty_certificate.encode(&mut encoded_certificate).unwrap();
+    assert!(CertificateEntryRef::decode(&mut Reader::new(&encoded_certificate)).is_err());
+
+    let empty_ticket = NewSessionTicket {
+        ticket_lifetime: 86_400,
+        ticket_age_add: 0,
+        ticket_nonce: Vec::new(),
+        ticket: Vec::new(),
+        extensions: Vec::new(),
+    };
+    let mut encoded_ticket = Vec::new();
+    empty_ticket.encode(&mut encoded_ticket).unwrap();
+    assert!(NewSessionTicketRef::decode(&mut Reader::new(&encoded_ticket)).is_err());
+}
+
+#[test]
 fn certificate_verify_round_trip() {
     let cv = CertificateVerify {
-        algorithm: 0x0807,
+        algorithm: SignatureScheme::ED25519,
         signature: b"signature-bytes".to_vec(),
     };
     let mut buf = Vec::new();
     cv.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
-    let decoded = CertificateVerify::decode(&mut r).unwrap();
+    let decoded = CertificateVerifyRef::decode(&mut r).unwrap().into_owned();
     r.finish().unwrap();
     assert_eq!(decoded, cv);
+}
+
+#[test]
+fn certificate_verify_preserves_unknown_signature_scheme() {
+    let encoded = [0xfe, 0xfe, 0, 1, 0xa5];
+    let mut reader = Reader::new(&encoded);
+    let decoded = CertificateVerifyRef::decode(&mut reader)
+        .unwrap()
+        .into_owned();
+    reader.finish().unwrap();
+
+    assert_eq!(decoded.algorithm.wire_id(), 0xfefe);
+    assert_eq!(decoded.signature, [0xa5]);
+
+    let mut round_trip = Vec::new();
+    decoded.encode(&mut round_trip).unwrap();
+    assert_eq!(round_trip, encoded);
 }
 
 #[test]
@@ -182,7 +222,9 @@ fn finished_round_trip() {
     let mut buf = Vec::new();
     fin.encode(&mut buf).unwrap();
     let mut r = Reader::new(&buf);
-    let decoded = Finished::decode(&mut r).unwrap();
+    let decoded = Finished {
+        verify_data: r.take_all().to_vec(),
+    };
     r.finish().unwrap();
     assert_eq!(decoded, fin);
 }
@@ -205,7 +247,7 @@ fn handshake_wraps_with_type_and_length() {
     assert_eq!(body_len + 4, buf.len());
 
     let mut r = Reader::new(&buf);
-    let decoded = Frame::decode(&mut r).unwrap();
+    let decoded = MessageRef::decode_from(&mut r).unwrap().into_owned();
     r.finish().unwrap();
     assert_eq!(decoded, hs);
 }
@@ -216,7 +258,7 @@ fn handshake_round_trip_each_variant() {
         let mut buf = Vec::new();
         hs.encode(&mut buf).unwrap();
         let mut r = Reader::new(&buf);
-        let decoded = Frame::decode(&mut r).unwrap();
+        let decoded = MessageRef::decode_from(&mut r).unwrap().into_owned();
         r.finish().unwrap();
         assert_eq!(decoded, hs);
     }
@@ -227,10 +269,7 @@ fn borrowed_and_owned_acceptance_match_for_mutated_corpus() {
     for frame in sample_frames() {
         let mut encoded = Vec::new();
         frame.encode(&mut encoded).unwrap();
-        assert_eq!(
-            Borrowed::decode_exact(&encoded).unwrap().into_owned(),
-            frame
-        );
+        assert_eq!(MessageRef::decode(&encoded).unwrap().into_owned(), frame);
 
         for end in 0..=encoded.len() {
             assert_canonical_acceptance(&encoded[..end]);
@@ -256,7 +295,7 @@ fn handshake_decode_rejects_trailing_bytes_in_body() {
     buf.extend_from_slice(b"trailing");
 
     let mut r = Reader::new(&buf);
-    let _ = Frame::decode(&mut r).unwrap();
+    let _ = MessageRef::decode_from(&mut r).unwrap();
     assert!(r.finish().is_err());
 }
 
@@ -264,5 +303,5 @@ fn handshake_decode_rejects_trailing_bytes_in_body() {
 fn handshake_decode_rejects_unknown_type() {
     let buf = vec![99u8, 0, 0, 0];
     let mut r = Reader::new(&buf);
-    assert!(Frame::decode(&mut r).is_err());
+    assert!(MessageRef::decode_from(&mut r).is_err());
 }

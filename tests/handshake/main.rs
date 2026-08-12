@@ -28,3 +28,10 @@ mod sni;
 mod state_machine;
 mod ticket_rotation;
 mod zero_rtt;
+
+use shin::wire::codec::{DecodeError, Reader};
+use shin::wire::handshake::frame::{Frame, MessageRef};
+
+fn decode_owned<'a>(reader: &mut Reader<'a>) -> Result<Frame, DecodeError> {
+    MessageRef::decode_from(reader).map(MessageRef::into_owned)
+}

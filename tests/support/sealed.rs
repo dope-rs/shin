@@ -53,26 +53,30 @@ fn record_allocation(bytes: usize) {
     });
 }
 
-pub(crate) fn measured(run: impl FnOnce()) -> usize {
-    measured_with_bytes(run).0
-}
+pub(crate) struct AllocationProbe;
 
-pub(crate) fn measured_with_bytes(run: impl FnOnce()) -> (usize, usize) {
-    THREAD_ALLOCATIONS.with(|count| count.set(0));
-    THREAD_ALLOCATED_BYTES.with(|bytes| bytes.set(0));
-    COUNT_THREAD_ALLOCATIONS.with(|active| active.set(true));
-    run();
-    COUNT_THREAD_ALLOCATIONS.with(|active| active.set(false));
-    (
-        THREAD_ALLOCATIONS.with(Cell::get),
-        THREAD_ALLOCATED_BYTES.with(Cell::get),
-    )
-}
+impl AllocationProbe {
+    pub(crate) fn measured(run: impl FnOnce()) -> usize {
+        Self::measured_with_bytes(run).0
+    }
 
-pub(crate) fn reset() {
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-}
+    pub(crate) fn measured_with_bytes(run: impl FnOnce()) -> (usize, usize) {
+        THREAD_ALLOCATIONS.with(|count| count.set(0));
+        THREAD_ALLOCATED_BYTES.with(|bytes| bytes.set(0));
+        COUNT_THREAD_ALLOCATIONS.with(|active| active.set(true));
+        run();
+        COUNT_THREAD_ALLOCATIONS.with(|active| active.set(false));
+        (
+            THREAD_ALLOCATIONS.with(Cell::get),
+            THREAD_ALLOCATED_BYTES.with(Cell::get),
+        )
+    }
 
-pub(crate) fn count() -> usize {
-    ALLOCATIONS.load(Ordering::Relaxed)
+    pub(crate) fn reset() {
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count() -> usize {
+        ALLOCATIONS.load(Ordering::Relaxed)
+    }
 }

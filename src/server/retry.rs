@@ -2,11 +2,13 @@ use crate::connection;
 use crate::crypto::hash;
 use crate::crypto::kx;
 use crate::server;
+use crate::server::negotiation;
 use crate::wire::codec::Encode as _;
 use crate::wire::extension;
 use crate::wire::handshake;
 use crate::wire::handshake::views;
 use crate::wire::protocols;
+use crate::wire::psk;
 
 /// Heap-free snapshot of the parts of ClientHello which RFC 8446 forbids a
 /// client from changing across HelloRetryRequest.
@@ -30,11 +32,12 @@ impl ClientHelloInvariant {
     pub(super) fn validate(
         self,
         hello: views::ClientHelloRef<'_>,
+        kx: negotiation::ClientKx<'_>,
     ) -> Result<(), connection::Error> {
         if hello.extensions.find(extension::Type::EARLY_DATA).is_some() {
             return Err(connection::Error::IllegalParameter);
         }
-        validate_retry_key_share(hello, self.requested_group)?;
+        kx.require_retry(self.requested_group)?;
         if fingerprint(hello)? != self.fingerprint {
             return Err(connection::Error::IllegalParameter);
         }
@@ -103,63 +106,13 @@ fn update_psk_invariant(
     transcript: &mut hash::Transcript,
     encoded: &[u8],
 ) -> Result<(), connection::Error> {
-    use crate::wire::codec::Reader;
-    let mut reader = Reader::new(encoded);
-    let identities = reader.vec_u16()?;
-    let binders = reader.vec_u16()?;
-    reader.finish()?;
-
-    let mut identity_reader = Reader::new(identities);
-    let mut identity_count = 0u32;
-    while !identity_reader.is_empty() {
-        identity_reader.vec_u16()?;
-        identity_reader.u32()?;
-        identity_count = identity_count
-            .checked_add(1)
-            .ok_or(connection::Error::Decode)?;
-    }
-
-    let mut binder_reader = Reader::new(binders);
-    let mut binder_count = 0u32;
-    while !binder_reader.is_empty() {
-        binder_reader.vec_u8()?;
-        binder_count = binder_count
-            .checked_add(1)
-            .ok_or(connection::Error::Decode)?;
-    }
-    if identity_count != binder_count {
-        return Err(connection::Error::Decode);
-    }
-
-    transcript.update(&identity_count.to_be_bytes());
-    update_bytes(transcript, identities);
-    transcript.update(&binder_count.to_be_bytes());
-    let mut binder_reader = Reader::new(binders);
-    while !binder_reader.is_empty() {
-        let binder = binder_reader.vec_u8()?;
+    let offered = psk::OfferedPsks::decode(encoded)?;
+    let count = u32::from(offered.count());
+    transcript.update(&count.to_be_bytes());
+    update_bytes(transcript, offered.encoded_identities());
+    transcript.update(&count.to_be_bytes());
+    for binder in offered.binders() {
         transcript.update(&(binder.len() as u32).to_be_bytes());
-    }
-    Ok(())
-}
-
-fn validate_retry_key_share(
-    hello: views::ClientHelloRef<'_>,
-    requested_group: kx::KexGroup,
-) -> Result<(), connection::Error> {
-    use crate::wire::codec::Reader;
-    let encoded = hello
-        .extensions
-        .find(extension::Type::KEY_SHARE)
-        .ok_or(connection::Error::MissingExtension)?
-        .data;
-    let mut reader = Reader::new(encoded);
-    let mut entries = reader.sub_u16()?;
-    let group = entries.u16()?;
-    entries.vec_u16()?;
-    entries.finish()?;
-    reader.finish()?;
-    if group != requested_group.wire_id() {
-        return Err(connection::Error::IllegalParameter);
     }
     Ok(())
 }
@@ -175,7 +128,7 @@ pub(super) trait Retry {
     ) -> Result<(), connection::DriveError<S::Error>>;
 }
 
-impl<C: connection::Clock> Retry for server::Server<C> {
+impl<C: connection::Clock, const DOMAIN: u8> Retry for server::Server<C, DOMAIN> {
     /// RFC 8446 §4.1.4: ask for a retry (one only) when the ClientHello carried
     /// no usable key_share, rewriting the transcript to `message_hash(CH1)`.
     fn send_hello_retry_request<S: connection::EventSink + ?Sized>(

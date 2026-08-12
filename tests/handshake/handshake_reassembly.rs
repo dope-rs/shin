@@ -37,7 +37,6 @@ fn make_pair() -> Pair {
             },
             transport_params: CLIENT_TP.to_vec(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         Mode::Quic,

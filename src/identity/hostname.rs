@@ -1,4 +1,5 @@
 use core::str;
+use o3::collections::fixed::array;
 
 #[derive(Clone, Copy)]
 pub struct Hostname<'a>(&'a [u8]);
@@ -78,7 +79,7 @@ impl<'a> Hostname<'a> {
         self.parse_ip().is_some()
     }
 
-    pub(crate) fn parse_ip(self) -> Option<arrayvec::ArrayVec<u8, 16>> {
+    pub(crate) fn parse_ip(self) -> Option<array::CopyInline<u8, 16>> {
         let text = str::from_utf8(self.0).ok()?;
         if text.contains(':') {
             Self::parse_ipv6(text)
@@ -87,16 +88,16 @@ impl<'a> Hostname<'a> {
         }
     }
 
-    fn parse_ipv4(text: &str) -> Option<arrayvec::ArrayVec<u8, 16>> {
+    fn parse_ipv4(text: &str) -> Option<array::CopyInline<u8, 16>> {
         let mut parts = text.split('.');
-        let mut out = arrayvec::ArrayVec::new();
+        let mut out = array::CopyInline::new();
         for _ in 0..4 {
             let part = parts.next()?;
             if part.is_empty() || part.len() > 3 || !part.bytes().all(|byte| byte.is_ascii_digit())
             {
                 return None;
             }
-            out.try_push(part.parse::<u8>().ok()?).ok()?;
+            out.push(part.parse::<u8>().ok()?).ok()?;
         }
         if parts.next().is_some() {
             return None;
@@ -104,7 +105,7 @@ impl<'a> Hostname<'a> {
         Some(out)
     }
 
-    fn parse_ipv6(text: &str) -> Option<arrayvec::ArrayVec<u8, 16>> {
+    fn parse_ipv6(text: &str) -> Option<array::CopyInline<u8, 16>> {
         let (head, tail, compressed) = match text.find("::") {
             Some(index) => {
                 if text[index + 2..].contains("::") {
@@ -123,10 +124,10 @@ impl<'a> Hostname<'a> {
             if total >= 8 {
                 return None;
             }
-            let mut out = arrayvec::ArrayVec::new();
+            let mut out = array::CopyInline::new();
             out.try_extend_from_slice(&head_bytes).ok()?;
             for _ in 0..(8 - total) * 2 {
-                out.try_push(0).ok()?;
+                out.push(0).ok()?;
             }
             out.try_extend_from_slice(&tail_bytes).ok()?;
             Some(out)
@@ -137,12 +138,12 @@ impl<'a> Hostname<'a> {
         }
     }
 
-    fn parse_v6_part(part: &str) -> Option<(arrayvec::ArrayVec<u8, 16>, usize)> {
+    fn parse_v6_part(part: &str) -> Option<(array::CopyInline<u8, 16>, usize)> {
         if part.is_empty() {
-            return Some((arrayvec::ArrayVec::new(), 0));
+            return Some((array::CopyInline::new(), 0));
         }
         let mut tokens = part.split(':').peekable();
-        let mut out = arrayvec::ArrayVec::new();
+        let mut out = array::CopyInline::new();
         let mut groups = 0;
         while let Some(token) = tokens.next() {
             if token.contains('.') {

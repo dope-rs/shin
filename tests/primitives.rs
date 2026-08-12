@@ -162,9 +162,10 @@ fn classical_groups_round_trip() {
     for group in [KexGroup::X25519, KexGroup::Secp256r1] {
         let client = EphemeralKey::generate(group, &rng).unwrap();
         let client_share = client.client_share().to_vec();
-        let (server_share, server_ss) = group.respond(&client_share, &rng).unwrap();
-        let client_ss = client.agree(&server_share).unwrap();
-        assert_eq!(client_ss.as_slice(), server_ss.as_slice());
+        let mut output = vec![0; group.server_share_len()];
+        let response = group.respond(&client_share, &rng, &mut output).unwrap();
+        let client_ss = client.agree(response.share()).unwrap();
+        assert_eq!(client_ss.as_slice(), response.shared_secret().as_slice());
         assert_eq!(client_ss.as_slice().len(), 32);
     }
 }
@@ -177,11 +178,20 @@ fn hybrid_round_trips_with_64_byte_secret() {
     let client_share = client.client_share().to_vec();
     assert_eq!(client_share.len(), MLKEM768_EK_LEN + X25519_LEN);
 
-    let (server_share, server_ss) = group.respond(&client_share, &rng).unwrap();
-    assert_eq!(server_share.len(), MLKEM768_CT_LEN + X25519_LEN);
+    let mut short_output = vec![0; group.server_share_len() - 1];
+    assert_eq!(
+        group
+            .respond(&client_share, &rng, &mut short_output)
+            .unwrap_err(),
+        Error::InvalidOutput
+    );
 
-    let client_ss = client.agree(&server_share).unwrap();
-    assert_eq!(client_ss.as_slice(), server_ss.as_slice());
+    let mut output = vec![0; group.server_share_len()];
+    let response = group.respond(&client_share, &rng, &mut output).unwrap();
+    assert_eq!(response.share().len(), MLKEM768_CT_LEN + X25519_LEN);
+
+    let client_ss = client.agree(response.share()).unwrap();
+    assert_eq!(client_ss.as_slice(), response.shared_secret().as_slice());
     assert_eq!(client_ss.as_slice().len(), 64);
 }
 
@@ -189,8 +199,9 @@ fn hybrid_round_trips_with_64_byte_secret() {
 fn hybrid_rejects_malformed_shares() {
     let rng = SystemRandom::new();
     let group = KexGroup::X25519Mlkem768;
+    let mut output = vec![0; group.server_share_len()];
     assert_eq!(
-        group.respond(&[0u8; 10], &rng).unwrap_err(),
+        group.respond(&[0u8; 10], &rng, &mut output).unwrap_err(),
         Error::InvalidPubkey
     );
     let client = EphemeralKey::generate(group, &rng).unwrap();

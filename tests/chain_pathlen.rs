@@ -63,8 +63,8 @@ fn leaf(dns: &str, parent: &Ca) -> Vec<u8> {
 }
 
 fn mid_time(cert: &Cert<'_>) -> UnixTime {
-    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
+    let nb = cert.tbs.validity.not_before;
+    let na = cert.tbs.validity.not_after;
     UnixTime((nb.0 + na.0) / 2)
 }
 
@@ -75,12 +75,12 @@ fn chain_too_long_is_rejected() {
     let leaf_cert = Cert::parse(&leaf_der).unwrap();
     let anchor_cert = Cert::parse(&r.der).unwrap();
     let chain: Vec<Cert<'_>> = (0..shin::identity::chain::MAX_LEN + 1)
-        .map(|_| leaf_cert.clone())
+        .map(|_| leaf_cert)
         .collect();
     let anchors = [TrustAnchor::from_cert(&anchor_cert)];
     let now = mid_time(&leaf_cert);
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
         Error::ChainTooLong
@@ -98,9 +98,9 @@ fn valid_two_level_chain_accepts() {
     let root_cert = Cert::parse(&r.der).unwrap();
     let now = mid_time(&leaf_cert);
 
-    let chain = [leaf_cert.clone(), im_cert];
+    let chain = [leaf_cert, im_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, now, b"host.local")
         .expect("valid 2-level chain");
 }
@@ -119,10 +119,10 @@ fn path_len_zero_intermediate_rejects_extra_intermediate() {
     let root_cert = Cert::parse(&r.der).unwrap();
     let now = mid_time(&leaf_cert);
 
-    let chain = [leaf_cert.clone(), im1_cert, im0_cert];
+    let chain = [leaf_cert, im1_cert, im0_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"host.local")
             .unwrap_err(),
         Error::PathLenExceeded

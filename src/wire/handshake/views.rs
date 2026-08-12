@@ -1,33 +1,39 @@
+use crate::crypto::sig;
 use crate::wire::codec;
 use crate::wire::extension;
 use crate::wire::handshake::messages;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct U16List<'a> {
+pub struct U16List<'a> {
     encoded: &'a [u8],
 }
 
 impl<'a> U16List<'a> {
-    pub(crate) fn decode(encoded: &'a [u8]) -> Result<Self, codec::DecodeError> {
-        let mut reader = codec::Reader::new(encoded);
-        while !reader.is_empty() {
-            reader.u16()?;
-        }
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+        let encoded = codec::FramedVector::<2, 2>::decode_u16(reader)?.as_slice();
         Ok(Self { encoded })
     }
 
-    pub(crate) fn contains(self, needle: u16) -> bool {
+    pub fn contains(self, needle: u16) -> bool {
         self.iter().any(|value| value == needle)
     }
 
-    pub(crate) fn iter(self) -> U16s<'a> {
+    pub fn is_empty(self) -> bool {
+        self.encoded.is_empty()
+    }
+
+    pub fn len(self) -> usize {
+        self.encoded.len() / 2
+    }
+
+    pub fn iter(self) -> U16s<'a> {
         U16s {
             reader: codec::Reader::new(self.encoded),
         }
     }
 }
 
-pub(crate) struct U16s<'a> {
+pub struct U16s<'a> {
     reader: codec::Reader<'a>,
 }
 
@@ -42,23 +48,24 @@ impl Iterator for U16s<'_> {
     }
 }
 
+/// Allocation-free view of a validated ClientHello body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ClientHelloRef<'a> {
-    pub(crate) legacy_version: u16,
-    pub(crate) random: [u8; super::RANDOM_LEN],
-    pub(crate) legacy_session_id: &'a [u8],
-    pub(crate) cipher_suites: U16List<'a>,
-    pub(crate) legacy_compression_methods: &'a [u8],
-    pub(crate) extensions: extension::Extensions<'a>,
+pub struct ClientHelloRef<'a> {
+    pub legacy_version: u16,
+    pub random: [u8; super::RANDOM_LEN],
+    pub legacy_session_id: &'a [u8],
+    pub cipher_suites: U16List<'a>,
+    pub legacy_compression_methods: &'a [u8],
+    pub extensions: extension::Extensions<'a>,
 }
 
 impl<'a> ClientHelloRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         let legacy_version = reader.u16()?;
         let mut random = [0; super::RANDOM_LEN];
         random.copy_from_slice(reader.take(super::RANDOM_LEN)?);
         let legacy_session_id = reader.vec_u8()?;
-        let cipher_suites = U16List::decode(reader.vec_u16()?)?;
+        let cipher_suites = U16List::decode(reader)?;
         let legacy_compression_methods = reader.vec_u8()?;
         let extensions = extension::Extensions::decode(reader)?;
         Ok(Self {
@@ -72,18 +79,19 @@ impl<'a> ClientHelloRef<'a> {
     }
 }
 
+/// Allocation-free view of a validated ServerHello body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ServerHelloRef<'a> {
-    pub(crate) legacy_version: u16,
-    pub(crate) random: [u8; super::RANDOM_LEN],
-    pub(crate) legacy_session_id_echo: &'a [u8],
-    pub(crate) cipher_suite: u16,
-    pub(crate) legacy_compression_method: u8,
-    pub(crate) extensions: extension::Extensions<'a>,
+pub struct ServerHelloRef<'a> {
+    pub legacy_version: u16,
+    pub random: [u8; super::RANDOM_LEN],
+    pub legacy_session_id_echo: &'a [u8],
+    pub cipher_suite: u16,
+    pub legacy_compression_method: u8,
+    pub extensions: extension::Extensions<'a>,
 }
 
 impl<'a> ServerHelloRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         let legacy_version = reader.u16()?;
         let mut random = [0; super::RANDOM_LEN];
         random.copy_from_slice(reader.take(super::RANDOM_LEN)?);
@@ -99,12 +107,12 @@ impl<'a> ServerHelloRef<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EncryptedExtensionsRef<'a> {
-    pub(crate) extensions: extension::Extensions<'a>,
+pub struct EncryptedExtensionsRef<'a> {
+    pub extensions: extension::Extensions<'a>,
 }
 
 impl<'a> EncryptedExtensionsRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
             extensions: extension::Extensions::decode(reader)?,
         })
@@ -112,28 +120,28 @@ impl<'a> EncryptedExtensionsRef<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CertificateEntryRef<'a> {
-    pub(crate) cert_data: &'a [u8],
-    pub(crate) extensions: extension::Extensions<'a>,
+pub struct CertificateEntryRef<'a> {
+    pub cert_data: &'a [u8],
+    pub extensions: extension::Extensions<'a>,
 }
 
 impl<'a> CertificateEntryRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
-            cert_data: reader.vec_u24()?,
+            cert_data: codec::FramedVector::<1, 1>::decode_u24(reader)?.as_slice(),
             extensions: extension::Extensions::decode(reader)?,
         })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CertificateEntries<'a> {
+pub struct CertificateEntries<'a> {
     encoded: &'a [u8],
     len: u8,
 }
 
 impl<'a> CertificateEntries<'a> {
-    fn decode(encoded: &'a [u8]) -> Result<Self, codec::DecodeError> {
+    pub fn decode(encoded: &'a [u8]) -> Result<Self, codec::DecodeError> {
         let mut reader = codec::Reader::new(encoded);
         let mut len = 0usize;
         while !reader.is_empty() {
@@ -150,26 +158,26 @@ impl<'a> CertificateEntries<'a> {
         })
     }
 
-    pub(crate) fn is_empty(self) -> bool {
+    pub fn is_empty(self) -> bool {
         self.len == 0
     }
 
-    pub(crate) fn len(self) -> usize {
+    pub fn len(self) -> usize {
         self.len as usize
     }
 
-    pub(crate) fn first(self) -> Option<CertificateEntryRef<'a>> {
+    pub fn first(self) -> Option<CertificateEntryRef<'a>> {
         self.iter().next()
     }
 
-    pub(crate) fn iter(self) -> CertificateEntryRefs<'a> {
+    pub fn iter(self) -> CertificateEntryRefs<'a> {
         CertificateEntryRefs {
             reader: codec::Reader::new(self.encoded),
         }
     }
 }
 
-pub(crate) struct CertificateEntryRefs<'a> {
+pub struct CertificateEntryRefs<'a> {
     reader: codec::Reader<'a>,
 }
 
@@ -185,13 +193,13 @@ impl<'a> Iterator for CertificateEntryRefs<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CertificateRef<'a> {
-    pub(crate) certificate_request_context: &'a [u8],
-    pub(crate) certificate_list: CertificateEntries<'a>,
+pub struct CertificateRef<'a> {
+    pub certificate_request_context: &'a [u8],
+    pub certificate_list: CertificateEntries<'a>,
 }
 
 impl<'a> CertificateRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
             certificate_request_context: reader.vec_u8()?,
             certificate_list: CertificateEntries::decode(reader.vec_u24()?)?,
@@ -200,13 +208,13 @@ impl<'a> CertificateRef<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CertificateRequestRef<'a> {
-    pub(crate) certificate_request_context: &'a [u8],
-    pub(crate) extensions: extension::Extensions<'a>,
+pub struct CertificateRequestRef<'a> {
+    pub certificate_request_context: &'a [u8],
+    pub extensions: extension::Extensions<'a>,
 }
 
 impl<'a> CertificateRequestRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
             certificate_request_context: reader.vec_u8()?,
             extensions: extension::Extensions::decode(reader)?,
@@ -215,43 +223,44 @@ impl<'a> CertificateRequestRef<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CertificateVerifyRef<'a> {
-    pub(crate) algorithm: u16,
-    pub(crate) signature: &'a [u8],
+pub struct CertificateVerifyRef<'a> {
+    pub algorithm: sig::SignatureScheme,
+    pub signature: &'a [u8],
 }
 
 impl<'a> CertificateVerifyRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
-            algorithm: reader.u16()?,
+            algorithm: sig::SignatureScheme::from_wire_id(reader.u16()?),
             signature: reader.vec_u16()?,
         })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NewSessionTicketRef<'a> {
-    pub(crate) ticket_lifetime: u32,
-    pub(crate) ticket_age_add: u32,
-    pub(crate) ticket_nonce: &'a [u8],
-    pub(crate) ticket: &'a [u8],
-    pub(crate) extensions: extension::Extensions<'a>,
+pub struct NewSessionTicketRef<'a> {
+    pub ticket_lifetime: u32,
+    pub ticket_age_add: u32,
+    pub ticket_nonce: &'a [u8],
+    pub ticket: &'a [u8],
+    pub extensions: extension::Extensions<'a>,
 }
 
 impl<'a> NewSessionTicketRef<'a> {
-    pub(crate) fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    pub fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
             ticket_lifetime: reader.u32()?,
             ticket_age_add: reader.u32()?,
             ticket_nonce: reader.vec_u8()?,
-            ticket: reader.vec_u16()?,
+            ticket: codec::FramedVector::<1, 1>::decode_u16(reader)?.as_slice(),
             extensions: extension::Extensions::decode(reader)?,
         })
     }
 }
 
+/// Allocation-free view of one validated framed handshake message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessageRef<'a> {
+pub enum MessageRef<'a> {
     ClientHello(ClientHelloRef<'a>),
     ServerHello(ServerHelloRef<'a>),
     EncryptedExtensions(EncryptedExtensionsRef<'a>),
@@ -265,14 +274,16 @@ pub(crate) enum MessageRef<'a> {
 }
 
 impl<'a> MessageRef<'a> {
-    pub(crate) fn decode(raw: &'a [u8]) -> Result<Self, codec::DecodeError> {
+    /// Decodes exactly one complete message without allocating or copying.
+    pub fn decode(raw: &'a [u8]) -> Result<Self, codec::DecodeError> {
         let mut reader = codec::Reader::new(raw);
         let message = Self::decode_from(&mut reader)?;
         reader.finish()?;
         Ok(message)
     }
 
-    pub(crate) fn decode_from(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+    /// Decodes one message and leaves subsequent messages in `reader`.
+    pub fn decode_from(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         use crate::wire::handshake::Type;
         let ty = Type::from_u8(reader.u8()?)?;
         let mut body = reader.sub_u24()?;
@@ -299,5 +310,20 @@ impl<'a> MessageRef<'a> {
         };
         body.finish()?;
         Ok(message)
+    }
+
+    pub fn msg_type(self) -> super::Type {
+        match self {
+            Self::ClientHello(_) => super::Type::ClientHello,
+            Self::ServerHello(_) => super::Type::ServerHello,
+            Self::EncryptedExtensions(_) => super::Type::EncryptedExtensions,
+            Self::CertificateRequest(_) => super::Type::CertificateRequest,
+            Self::Certificate(_) => super::Type::Certificate,
+            Self::CertificateVerify(_) => super::Type::CertificateVerify,
+            Self::Finished(_) => super::Type::Finished,
+            Self::EndOfEarlyData => super::Type::EndOfEarlyData,
+            Self::KeyUpdate(_) => super::Type::KeyUpdate,
+            Self::NewSessionTicket(_) => super::Type::NewSessionTicket,
+        }
     }
 }

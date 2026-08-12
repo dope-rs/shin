@@ -1,7 +1,10 @@
+use crate::identity;
 use crate::identity::asn1;
 
 use ring::signature;
 
+pub mod algorithm;
+pub mod dn;
 pub mod ext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +13,9 @@ pub enum Error {
     BadVersion,
     BadValidity,
     BadAlgorithm,
+    BadSerial,
+    BadName,
+    DuplicateExtension,
     TooManyEntries,
 }
 
@@ -19,7 +25,7 @@ impl From<asn1::DerError> for Error {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Cert<'a> {
     pub tbs_der: &'a [u8],
     pub tbs: Tbs<'a>,
@@ -28,31 +34,25 @@ pub struct Cert<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Signature<'a> {
-    pub algorithm: AlgorithmIdentifier<'a>,
     pub bytes: &'a [u8],
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AlgorithmIdentifier<'a> {
-    pub oid: &'a [u8],
-    pub parameters: &'a [u8],
+#[derive(Clone, Copy)]
+pub(crate) struct Signed<'a> {
+    tbs_der: &'a [u8],
+    algorithm: algorithm::Signature,
+    signature: &'a [u8],
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Validity<'a> {
-    pub not_before: TimeValue<'a>,
-    pub not_after: TimeValue<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TimeValue<'a> {
-    pub tag: asn1::Tag,
-    pub bytes: &'a [u8],
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Validity {
+    pub not_before: identity::UnixTime,
+    pub not_after: identity::UnixTime,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct SubjectPublicKeyInfo<'a> {
-    pub algorithm: AlgorithmIdentifier<'a>,
+    pub algorithm: algorithm::PublicKey,
     pub subject_public_key: &'a [u8],
     pub raw_der: &'a [u8],
 }
@@ -60,13 +60,19 @@ pub struct SubjectPublicKeyInfo<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Tbs<'a> {
     pub version: u8,
-    pub serial: &'a [u8],
-    pub signature_alg: AlgorithmIdentifier<'a>,
-    pub issuer_der: &'a [u8],
-    pub validity: Validity<'a>,
-    pub subject_der: &'a [u8],
+    pub serial: asn1::Uint<'a>,
+    pub signature_alg: algorithm::Signature,
+    pub names: Names<'a>,
+    pub validity: Validity,
     pub spki: SubjectPublicKeyInfo<'a>,
     pub extensions_der: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Names<'a> {
+    pub issuer: dn::DistinguishedName<'a>,
+    pub subject: dn::DistinguishedName<'a>,
+    pub(crate) issuer_key: dn::NameKey,
 }
 
 impl<'a> SubjectPublicKeyInfo<'a> {
@@ -75,15 +81,11 @@ impl<'a> SubjectPublicKeyInfo<'a> {
         let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
         r.finish()?;
         let mut sr = asn1::Reader::new(inner);
-        let alg_inner = sr.read_tagged(asn1::Tag::SEQUENCE)?;
-        let mut ar = asn1::Reader::new(alg_inner);
-        let oid = ar.read_tagged(asn1::Tag::OID)?;
-        let parameters = ar.bytes_remaining();
-        let bit = sr.read_tagged(asn1::Tag::BIT_STRING)?;
-        let subject_public_key = asn1::Tlv::bit_string(bit)?;
+        let algorithm = algorithm::PublicKey::parse(algorithm::RawIdentifier::parse(&mut sr)?)?;
+        let subject_public_key = sr.read_bit_string()?.octets()?;
         sr.finish()?;
         Ok(Self {
-            algorithm: AlgorithmIdentifier { oid, parameters },
+            algorithm,
             subject_public_key,
             raw_der: spki_der,
         })
@@ -93,9 +95,8 @@ impl<'a> SubjectPublicKeyInfo<'a> {
         let raw_der = Self::peek_full_tlv(r)?;
         let inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
         let mut sr = asn1::Reader::new(inner);
-        let algorithm = AlgorithmIdentifier::parse(&mut sr)?;
-        let bit = sr.read_tagged(asn1::Tag::BIT_STRING)?;
-        let subject_public_key = asn1::Tlv::bit_string(bit)?;
+        let algorithm = algorithm::PublicKey::parse(algorithm::RawIdentifier::parse(&mut sr)?)?;
+        let subject_public_key = sr.read_bit_string()?.octets()?;
         sr.finish()?;
         Ok(Self {
             algorithm,
@@ -134,40 +135,31 @@ impl<'a> Cert<'a> {
         let consumed = (after_ptr as usize) - (start_ptr as usize);
         let tbs_der = &outer.contents[..consumed];
 
-        let tbs = Self::parse_tbs(tbs_tlv.contents)?;
+        let (tbs, inner_signature_alg) = Self::parse_tbs(tbs_tlv.contents)?;
 
-        let outer_signature_alg = AlgorithmIdentifier::parse(&mut top)?;
+        let outer_signature_alg = algorithm::RawIdentifier::parse(&mut top)?;
 
-        if tbs.signature_alg.oid != outer_signature_alg.oid
-            || tbs.signature_alg.parameters != outer_signature_alg.parameters
-        {
+        if inner_signature_alg != outer_signature_alg {
             return Err(Error::BadAlgorithm);
         }
 
-        let sig_tlv = top.read_tlv()?;
-        if sig_tlv.tag != asn1::Tag::BIT_STRING {
-            return Err(Error::Der(asn1::DerError::Mismatch));
-        }
-        let signature = asn1::Tlv::bit_string(sig_tlv.contents)?;
+        let signature = top.read_bit_string()?.octets()?;
 
         top.finish()?;
 
         Ok(Self {
             tbs_der,
             tbs,
-            signature: Signature {
-                algorithm: outer_signature_alg,
-                bytes: signature,
-            },
+            signature: Signature { bytes: signature },
         })
     }
 
-    fn parse_tbs(tbs: &'a [u8]) -> Result<Tbs<'a>, Error> {
+    fn parse_tbs(tbs: &'a [u8]) -> Result<(Tbs<'a>, algorithm::RawIdentifier<'a>), Error> {
         let mut r = asn1::Reader::new(tbs);
 
         let version = if let Some(ver_inner) = r.read_optional(asn1::Tag::context(0, true))? {
             let mut vr = asn1::Reader::new(ver_inner);
-            let v = asn1::Tlv::integer_u64(vr.read_tagged(asn1::Tag::INTEGER)?)?;
+            let v = vr.read_uint()?.to_u64()?;
             vr.finish()?;
             if v > 2 {
                 return Err(Error::BadVersion);
@@ -180,15 +172,25 @@ impl<'a> Cert<'a> {
             1
         };
 
-        let serial = r.read_tagged(asn1::Tag::INTEGER)?;
-        let signature_alg = AlgorithmIdentifier::parse(&mut r)?;
+        let serial = r.read_uint()?;
+        if serial.is_zero() || serial.as_bytes().len() > 20 {
+            return Err(Error::BadSerial);
+        }
+        let raw_signature_alg = algorithm::RawIdentifier::parse(&mut r)?;
+        let signature_alg = algorithm::Signature::parse(raw_signature_alg)?;
         let issuer_der = r.read_tagged(asn1::Tag::SEQUENCE)?;
+        let (issuer, issuer_key) = dn::DistinguishedName::prepared(issuer_der)?;
         let validity = Validity::parse(r.read_tagged(asn1::Tag::SEQUENCE)?)?;
         let subject_der = r.read_tagged(asn1::Tag::SEQUENCE)?;
+        let subject = dn::DistinguishedName::parse(subject_der)?;
         let spki = SubjectPublicKeyInfo::parse_inline(&mut r)?;
 
-        let issuer_uid = r.read_optional(asn1::Tag::context(1, false))?.is_some();
-        let subject_uid = r.read_optional(asn1::Tag::context(2, false))?.is_some();
+        let issuer_uid = r
+            .read_optional_bit_string(asn1::Tag::context(1, false))?
+            .is_some();
+        let subject_uid = r
+            .read_optional_bit_string(asn1::Tag::context(2, false))?
+            .is_some();
 
         let extensions_der =
             if let Some(ext_outer) = r.read_optional(asn1::Tag::context(3, true))? {
@@ -208,56 +210,39 @@ impl<'a> Cert<'a> {
         }
 
         r.finish()?;
-        Ok(Tbs {
-            version,
-            serial,
-            signature_alg,
-            issuer_der,
-            validity,
-            subject_der,
-            spki,
-            extensions_der,
-        })
+        Ok((
+            Tbs {
+                version,
+                serial,
+                signature_alg,
+                names: Names {
+                    issuer,
+                    subject,
+                    issuer_key,
+                },
+                validity,
+                spki,
+                extensions_der,
+            },
+            raw_signature_alg,
+        ))
     }
 }
 
-impl<'a> AlgorithmIdentifier<'a> {
-    fn parse(r: &mut asn1::Reader<'a>) -> Result<Self, Error> {
-        let alg_inner = r.read_tagged(asn1::Tag::SEQUENCE)?;
-        let mut ar = asn1::Reader::new(alg_inner);
-        let oid = ar.read_tagged(asn1::Tag::OID)?;
-        let parameters = ar.bytes_remaining();
-        Ok(Self { oid, parameters })
-    }
-}
-
-impl AlgorithmIdentifier<'_> {
-    pub fn oid_eq(&self, expected: &[u8]) -> bool {
-        self.oid == expected
-    }
-}
-
-impl<'a> Validity<'a> {
-    fn parse(inner: &'a [u8]) -> Result<Self, Error> {
+impl Validity {
+    fn parse(inner: &[u8]) -> Result<Self, Error> {
         let mut r = asn1::Reader::new(inner);
         let nb = r.read_tlv()?;
-        if nb.tag != asn1::Tag::UTC_TIME && nb.tag != asn1::Tag::GENERALIZED_TIME {
-            return Err(Error::BadValidity);
-        }
         let na = r.read_tlv()?;
-        if na.tag != asn1::Tag::UTC_TIME && na.tag != asn1::Tag::GENERALIZED_TIME {
+        r.finish()?;
+        let not_before = identity::UnixTime::from_x509(nb.tag, nb.contents)?;
+        let not_after = identity::UnixTime::from_x509(na.tag, na.contents)?;
+        if not_before > not_after {
             return Err(Error::BadValidity);
         }
-        r.finish()?;
         Ok(Self {
-            not_before: TimeValue {
-                tag: nb.tag,
-                bytes: nb.contents,
-            },
-            not_after: TimeValue {
-                tag: na.tag,
-                bytes: na.contents,
-            },
+            not_before,
+            not_after,
         })
     }
 }
@@ -268,16 +253,9 @@ pub const OID_SHA512_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x0
 pub const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 pub const OID_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 pub const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
-
 pub const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
-
 pub const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 pub const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
-
-const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
-const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
-
 pub const OID_P256_CURVE: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 pub const OID_P384_CURVE: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
 
@@ -286,15 +264,7 @@ pub enum VerifyError {
     UnsupportedAlgorithm,
     AlgorithmMismatch,
     UnsupportedCurve,
-    BadCurveParam,
     Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PssHash {
-    Sha256,
-    Sha384,
-    Sha512,
 }
 
 impl Cert<'_> {
@@ -302,123 +272,63 @@ impl Cert<'_> {
         &self,
         issuer_spki: &SubjectPublicKeyInfo<'_>,
     ) -> Result<(), VerifyError> {
-        let sig_oid = self.tbs.signature_alg.oid;
-        let pk_oid = issuer_spki.algorithm.oid;
+        self.signed().verify_signature(issuer_spki)
+    }
+}
 
-        match (sig_oid, pk_oid) {
-            (a, p) if a == OID_SHA256_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                self.verify_with(issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA256)
-            }
-            (a, p) if a == OID_SHA384_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                self.verify_with(issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA384)
-            }
-            (a, p) if a == OID_SHA512_WITH_RSA && p == OID_RSA_ENCRYPTION => {
-                self.verify_with(issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA512)
-            }
-            (a, p) if a == OID_ECDSA_SHA256 && p == OID_EC_PUBLIC_KEY => {
-                Self::check_named_curve(issuer_spki, OID_P256_CURVE)?;
-                self.verify_with(issuer_spki, &signature::ECDSA_P256_SHA256_ASN1)
-            }
-            (a, p) if a == OID_ECDSA_SHA384 && p == OID_EC_PUBLIC_KEY => {
-                Self::check_named_curve(issuer_spki, OID_P384_CURVE)?;
-                self.verify_with(issuer_spki, &signature::ECDSA_P384_SHA384_ASN1)
-            }
-            (a, p) if a == OID_ED25519 && p == OID_ED25519 => {
-                self.verify_with(issuer_spki, &signature::ED25519)
-            }
-            (a, p) if a == OID_RSA_PSS && (p == OID_RSA_ENCRYPTION || p == OID_RSA_PSS) => {
-                match Self::pss_hash(self.tbs.signature_alg.parameters)? {
-                    PssHash::Sha256 => {
-                        self.verify_with(issuer_spki, &signature::RSA_PSS_2048_8192_SHA256)
-                    }
-                    PssHash::Sha384 => {
-                        self.verify_with(issuer_spki, &signature::RSA_PSS_2048_8192_SHA384)
-                    }
-                    PssHash::Sha512 => {
-                        self.verify_with(issuer_spki, &signature::RSA_PSS_2048_8192_SHA512)
-                    }
-                }
-            }
-            (a, p) if Self::known_sig(a) && Self::known_pk(p) => {
-                Err(VerifyError::AlgorithmMismatch)
-            }
-            _ => Err(VerifyError::UnsupportedAlgorithm),
+impl<'a> Cert<'a> {
+    pub(crate) fn signed(&self) -> Signed<'a> {
+        Signed {
+            tbs_der: self.tbs_der,
+            algorithm: self.tbs.signature_alg,
+            signature: self.signature.bytes,
         }
     }
+}
 
-    fn verify_with<A: signature::VerificationAlgorithm>(
-        &self,
+impl Signed<'_> {
+    pub(crate) fn verify_signature(
+        self,
         issuer_spki: &SubjectPublicKeyInfo<'_>,
-        alg: &'static A,
     ) -> Result<(), VerifyError> {
-        use ring::signature::UnparsedPublicKey;
-        UnparsedPublicKey::new(alg, issuer_spki.subject_public_key)
-            .verify(self.tbs_der, self.signature.bytes)
-            .map_err(|_| VerifyError::Failed)
-    }
-
-    fn known_sig(oid: &[u8]) -> bool {
-        matches!(
-            oid,
-            x if x == OID_SHA256_WITH_RSA
-                || x == OID_SHA384_WITH_RSA
-                || x == OID_SHA512_WITH_RSA
-                || x == OID_ECDSA_SHA256
-                || x == OID_ECDSA_SHA384
-                || x == OID_ED25519
-                || x == OID_RSA_PSS
-        )
-    }
-
-    fn known_pk(oid: &[u8]) -> bool {
-        matches!(
-            oid,
-            x if x == OID_RSA_ENCRYPTION
-                || x == OID_EC_PUBLIC_KEY
-                || x == OID_ED25519
-                || x == OID_RSA_PSS
-        )
-    }
-
-    /// Message digest from RSASSA-PSS-params (RFC 4055 §3.1). Only the standard
-    /// MGF1-same-hash, salt = digest-length profile; SHA-1 default is rejected.
-    fn pss_hash(params: &[u8]) -> Result<PssHash, VerifyError> {
-        let mut r = asn1::Reader::new(params);
-        let inner = r
-            .read_tagged(asn1::Tag::SEQUENCE)
-            .map_err(|_| VerifyError::Failed)?;
-        let mut sr = asn1::Reader::new(inner);
-        let hash_field = sr
-            .read_optional(asn1::Tag::context(0, true))
-            .map_err(|_| VerifyError::Failed)?
-            .ok_or(VerifyError::UnsupportedAlgorithm)?;
-        let mut hr = asn1::Reader::new(hash_field);
-        let alg = hr
-            .read_tagged(asn1::Tag::SEQUENCE)
-            .map_err(|_| VerifyError::Failed)?;
-        let mut ar = asn1::Reader::new(alg);
-        let oid = ar
-            .read_tagged(asn1::Tag::OID)
-            .map_err(|_| VerifyError::Failed)?;
-        match oid {
-            x if x == OID_SHA256 => Ok(PssHash::Sha256),
-            x if x == OID_SHA384 => Ok(PssHash::Sha384),
-            x if x == OID_SHA512 => Ok(PssHash::Sha512),
-            _ => Err(VerifyError::UnsupportedAlgorithm),
+        fn verify_with<A: signature::VerificationAlgorithm>(
+            signed: Signed<'_>,
+            issuer_spki: &SubjectPublicKeyInfo<'_>,
+            algorithm: &'static A,
+        ) -> Result<(), VerifyError> {
+            signature::UnparsedPublicKey::new(algorithm, issuer_spki.subject_public_key)
+                .verify(signed.tbs_der, signed.signature)
+                .map_err(|_| VerifyError::Failed)
         }
-    }
 
-    fn check_named_curve(
-        spki: &SubjectPublicKeyInfo<'_>,
-        expected_curve: &[u8],
-    ) -> Result<(), VerifyError> {
-        let mut r = asn1::Reader::new(spki.algorithm.parameters);
-        let oid = r
-            .read_tagged(asn1::Tag::OID)
-            .map_err(|_| VerifyError::BadCurveParam)?;
-        if oid != expected_curve {
-            return Err(VerifyError::UnsupportedCurve);
+        match self.algorithm.verification_profile(issuer_spki.algorithm)? {
+            algorithm::VerificationProfile::RsaPkcs1Sha256 => {
+                verify_with(self, issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA256)
+            }
+            algorithm::VerificationProfile::RsaPkcs1Sha384 => {
+                verify_with(self, issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA384)
+            }
+            algorithm::VerificationProfile::RsaPkcs1Sha512 => {
+                verify_with(self, issuer_spki, &signature::RSA_PKCS1_2048_8192_SHA512)
+            }
+            algorithm::VerificationProfile::RsaPssSha256 => {
+                verify_with(self, issuer_spki, &signature::RSA_PSS_2048_8192_SHA256)
+            }
+            algorithm::VerificationProfile::RsaPssSha384 => {
+                verify_with(self, issuer_spki, &signature::RSA_PSS_2048_8192_SHA384)
+            }
+            algorithm::VerificationProfile::RsaPssSha512 => {
+                verify_with(self, issuer_spki, &signature::RSA_PSS_2048_8192_SHA512)
+            }
+            algorithm::VerificationProfile::EcdsaP256Sha256 => {
+                verify_with(self, issuer_spki, &signature::ECDSA_P256_SHA256_ASN1)
+            }
+            algorithm::VerificationProfile::EcdsaP384Sha384 => {
+                verify_with(self, issuer_spki, &signature::ECDSA_P384_SHA384_ASN1)
+            }
+            algorithm::VerificationProfile::Ed25519 => {
+                verify_with(self, issuer_spki, &signature::ED25519)
+            }
         }
-        Ok(())
     }
 }

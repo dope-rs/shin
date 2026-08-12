@@ -1,6 +1,7 @@
 use crate::identity::cert;
 use crate::memory::threadbound;
 use alloc::vec;
+use o3::collections::fixed::array;
 use ring::rand;
 use ring::signature::KeyPair as _;
 
@@ -12,6 +13,31 @@ pub const SEED_LEN: usize = 32;
 pub const ECDSA_P256_PUBKEY_LEN: usize = 65;
 pub const ECDSA_P384_PUBKEY_LEN: usize = 97;
 pub(crate) const MAX_SIGNATURE_LEN: usize = 1024;
+
+/// A TLS SignatureScheme code point with a private outbound representation.
+/// Wire decoding preserves unknown registry entries for policy validation.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureScheme(u16);
+
+impl SignatureScheme {
+    pub const ECDSA_SECP256R1_SHA256: Self = Self(0x0403);
+    pub const ECDSA_SECP384R1_SHA384: Self = Self(0x0503);
+    pub const RSA_PSS_RSAE_SHA256: Self = Self(0x0804);
+    pub const RSA_PSS_RSAE_SHA384: Self = Self(0x0805);
+    pub const RSA_PSS_RSAE_SHA512: Self = Self(0x0806);
+    pub const ED25519: Self = Self(0x0807);
+
+    pub const fn wire_id(self) -> u16 {
+        self.0
+    }
+
+    pub(crate) const fn from_wire_id(id: u16) -> Self {
+        Self(id)
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<SignatureScheme>() == core::mem::size_of::<u16>());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -148,11 +174,11 @@ impl SigningKey {
     pub(crate) fn sign_fixed(
         &self,
         msg: &[u8],
-    ) -> Result<arrayvec::ArrayVec<u8, MAX_SIGNATURE_LEN>, Error> {
+    ) -> Result<array::CopyInline<u8, MAX_SIGNATURE_LEN>, Error> {
         match &self.inner {
             SigningKeyInner::Ed25519(k) => {
                 let signature = k.inner.sign(msg);
-                let mut out = arrayvec::ArrayVec::new();
+                let mut out = array::CopyInline::new();
                 out.try_extend_from_slice(signature.as_ref())
                     .map_err(|_| Error::InvalidKey)?;
                 Ok(out)
@@ -160,7 +186,7 @@ impl SigningKey {
             SigningKeyInner::EcdsaP256(k) => {
                 let rng = rand::SystemRandom::new();
                 let signature = k.inner.sign(&rng, msg).map_err(|_| Error::InvalidKey)?;
-                let mut out = arrayvec::ArrayVec::new();
+                let mut out = array::CopyInline::new();
                 out.try_extend_from_slice(signature.as_ref())
                     .map_err(|_| Error::InvalidKey)?;
                 Ok(out)
@@ -168,7 +194,7 @@ impl SigningKey {
             SigningKeyInner::EcdsaP384(k) => {
                 let rng = rand::SystemRandom::new();
                 let signature = k.inner.sign(&rng, msg).map_err(|_| Error::InvalidKey)?;
-                let mut out = arrayvec::ArrayVec::new();
+                let mut out = array::CopyInline::new();
                 out.try_extend_from_slice(signature.as_ref())
                     .map_err(|_| Error::InvalidKey)?;
                 Ok(out)
@@ -180,9 +206,9 @@ impl SigningKey {
                 if signature_len > MAX_SIGNATURE_LEN {
                     return Err(Error::InvalidKey);
                 }
-                let mut sig = arrayvec::ArrayVec::new();
+                let mut sig = array::CopyInline::new();
                 for _ in 0..signature_len {
-                    sig.try_push(0).map_err(|_| Error::InvalidKey)?;
+                    sig.push(0).map_err(|_| Error::InvalidKey)?;
                 }
                 k.inner
                     .sign(&RSA_PSS_SHA256, &rng, msg, sig.as_mut_slice())
@@ -192,12 +218,21 @@ impl SigningKey {
         }
     }
 
-    pub fn sig_scheme(&self) -> u16 {
+    pub fn sig_scheme(&self) -> SignatureScheme {
         match &self.inner {
-            SigningKeyInner::Ed25519(_) => 0x0807,
-            SigningKeyInner::EcdsaP256(_) => 0x0403,
-            SigningKeyInner::EcdsaP384(_) => 0x0503,
-            SigningKeyInner::Rsa(_) => 0x0804,
+            SigningKeyInner::Ed25519(_) => SignatureScheme::ED25519,
+            SigningKeyInner::EcdsaP256(_) => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            SigningKeyInner::EcdsaP384(_) => SignatureScheme::ECDSA_SECP384R1_SHA384,
+            SigningKeyInner::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
+        }
+    }
+
+    pub(crate) fn signature_len_upper_bound(&self) -> usize {
+        match &self.inner {
+            SigningKeyInner::Ed25519(_) => ED25519_SIGNATURE_LEN,
+            SigningKeyInner::EcdsaP256(_) => 72,
+            SigningKeyInner::EcdsaP384(_) => 104,
+            SigningKeyInner::Rsa(key) => key.inner.public().modulus_len(),
         }
     }
 
@@ -206,25 +241,23 @@ impl SigningKey {
     }
 
     pub(crate) fn matches_spki(&self, spki: &cert::SubjectPublicKeyInfo<'_>) -> bool {
-        use crate::identity::cert::OID_EC_PUBLIC_KEY;
+        use cert::algorithm::NamedCurve;
+        use cert::algorithm::PublicKey;
         match &self.inner {
             SigningKeyInner::Ed25519(key) => {
-                use crate::identity::cert::OID_ED25519;
-                spki.algorithm.oid == OID_ED25519
+                spki.algorithm == PublicKey::Ed25519
                     && spki.subject_public_key == key.pubkey.as_slice()
             }
             SigningKeyInner::EcdsaP256(key) => {
-                spki.algorithm.oid == OID_EC_PUBLIC_KEY
+                spki.algorithm == PublicKey::Ec(NamedCurve::P256)
                     && spki.subject_public_key == key.pubkey_uncompressed
             }
             SigningKeyInner::EcdsaP384(key) => {
-                spki.algorithm.oid == OID_EC_PUBLIC_KEY
+                spki.algorithm == PublicKey::Ec(NamedCurve::P384)
                     && spki.subject_public_key == key.pubkey_uncompressed
             }
             SigningKeyInner::Rsa(key) => {
-                use crate::identity::cert::OID_RSA_ENCRYPTION;
-                spki.algorithm.oid == OID_RSA_ENCRYPTION
-                    && spki.subject_public_key == key.public_key_der
+                spki.algorithm == PublicKey::Rsa && spki.subject_public_key == key.public_key_der
             }
         }
     }

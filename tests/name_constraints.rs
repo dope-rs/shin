@@ -78,8 +78,8 @@ fn leaf(san: &str, parent: &Ca) -> Vec<u8> {
 }
 
 fn mid_time(cert: &Cert<'_>) -> UnixTime {
-    let nb = UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let na = UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
+    let nb = cert.tbs.validity.not_before;
+    let na = cert.tbs.validity.not_after;
     UnixTime((nb.0 + na.0) / 2)
 }
 
@@ -93,9 +93,9 @@ fn run(im_nc: NameConstraints, san: &str, host: &[u8]) -> Result<(), Error> {
     let root_cert = Cert::parse(&r.der).unwrap();
     let now = mid_time(&leaf_cert);
 
-    let chain = [leaf_cert.clone(), im_cert];
+    let chain = [leaf_cert, im_cert];
     let anchors = [TrustAnchor::from_cert(&root_cert)];
-    Chain::new(&chain).validate(&anchors, now, host)
+    Chain::new(chain).validate(&anchors, now, host)
 }
 
 fn permit(subtrees: Vec<GeneralSubtree>) -> NameConstraints {
@@ -179,7 +179,7 @@ fn certificate_derived_anchor_constraints_reject_leaf_outside_subtree() {
     let anchors = [TrustAnchor::from_cert(&root_cert)];
 
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"evil.example")
             .unwrap_err(),
         Error::NameConstraintViolation,
@@ -202,7 +202,7 @@ fn anchor_constraints_cover_every_subordinate_certificate() {
     let anchors = [TrustAnchor::from_cert(&root_cert)];
 
     assert_eq!(
-        Chain::new(&chain)
+        Chain::new(chain)
             .validate(&anchors, now, b"host.corp.example")
             .unwrap_err(),
         Error::NameConstraintViolation,
@@ -223,11 +223,11 @@ fn unconstrained_anchor_construction_is_explicit() {
     let now = mid_time(&leaf_cert);
     let chain = [leaf_cert, im_cert];
     let anchors = [TrustAnchor::unconstrained(
-        root_cert.tbs.subject_der,
+        root_cert.tbs.names.subject.as_der(),
         root_cert.tbs.spki,
     )];
 
-    Chain::new(&chain)
+    Chain::new(chain)
         .validate(&anchors, now, b"evil.example")
         .expect("explicit out-of-band anchor has no certificate constraints");
 }

@@ -1,8 +1,9 @@
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use shin::identity::cert::Cert;
+use shin::identity::cert::ext::scope::{GeneralName, GeneralNames, NameConstraints};
 use shin::identity::cert::ext::{
-    BasicConstraints, ExtensionIter, GeneralName, KeyUsage, OID_BASIC_CONSTRAINTS,
+    BasicConstraints, ExtendedKeyUsages, ExtensionIter, KeyUsage, OID_BASIC_CONSTRAINTS,
     OID_EKU_CLIENT_AUTH, OID_EKU_SERVER_AUTH, OID_EXTENDED_KEY_USAGE, OID_KEY_USAGE,
     OID_SUBJECT_ALT_NAME,
 };
@@ -12,6 +13,10 @@ fn make_cert(setup: impl FnOnce(&mut CertificateParams)) -> Vec<u8> {
     let mut params = CertificateParams::new(vec!["host.local".into()]).unwrap();
     setup(&mut params);
     params.self_signed(&key).unwrap().der().to_vec()
+}
+
+fn extension(oid: u8) -> Vec<u8> {
+    vec![0x30, 0x05, 0x06, 0x01, oid, 0x04, 0x00]
 }
 
 #[test]
@@ -25,8 +30,8 @@ fn iter_walks_all_entries() {
         .map(|e| e.unwrap())
         .collect();
     assert!(!exts.is_empty());
-    assert!(exts.iter().any(|e| e.oid == OID_BASIC_CONSTRAINTS));
-    assert!(exts.iter().any(|e| e.oid == OID_KEY_USAGE));
+    assert!(exts.iter().any(|e| e.oid.is(OID_BASIC_CONSTRAINTS)));
+    assert!(exts.iter().any(|e| e.oid.is(OID_KEY_USAGE)));
 }
 
 #[test]
@@ -97,6 +102,13 @@ fn key_usage_rejects_overlong_content() {
 }
 
 #[test]
+fn key_usage_rejects_empty_nonminimal_and_unknown_bits() {
+    assert!(KeyUsage::parse(&[0x03, 0x01, 0x00]).is_err());
+    assert!(KeyUsage::parse(&[0x03, 0x02, 0x00, 0x80]).is_err());
+    assert!(KeyUsage::parse(&[0x03, 0x03, 0x06, 0x00, 0x40]).is_err());
+}
+
+#[test]
 fn key_usage_decipher_only_bit_honored() {
     // BIT STRING, 7 unused, content {0x00, 0x80}: only bit 8 (decipherOnly) set.
     let value = [0x03u8, 0x03, 0x07, 0x00, 0x80];
@@ -150,9 +162,55 @@ fn extended_key_usage_lists_purposes() {
     let (_, val) = ExtensionIter::find(cert.tbs.extensions_der.unwrap(), OID_EXTENDED_KEY_USAGE)
         .unwrap()
         .expect("EKU present");
-    let oids = KeyUsage::parse_extended(val).unwrap();
-    assert!(oids.contains(&OID_EKU_SERVER_AUTH));
-    assert!(oids.contains(&OID_EKU_CLIENT_AUTH));
+    let oids = ExtendedKeyUsages::parse(val).unwrap();
+    assert!(oids.iter().any(|oid| oid.unwrap().is(OID_EKU_SERVER_AUTH)));
+    assert!(oids.iter().any(|oid| oid.unwrap().is(OID_EKU_CLIENT_AUTH)));
+}
+
+#[test]
+fn extended_key_usage_rejects_empty_sequence() {
+    assert!(ExtendedKeyUsages::parse(&[0x30, 0x00]).is_err());
+    assert!(ExtendedKeyUsages::parse(&[0x30, 0x02, 0x06, 0x00]).is_err());
+}
+
+#[test]
+fn extension_rejects_malformed_oid_and_explicit_default_critical() {
+    let malformed_oid = [0x30, 0x05, 0x06, 0x00, 0x04, 0x01, 0x00];
+    assert!(ExtensionIter::new(&malformed_oid).next().unwrap().is_err());
+
+    let explicit_false = [0x30, 0x08, 0x06, 0x01, 0x2a, 0x01, 0x01, 0x00, 0x04, 0x00];
+    assert!(ExtensionIter::new(&explicit_false).next().unwrap().is_err());
+}
+
+#[test]
+fn extension_iterator_bounds_and_exactly_rejects_duplicates() {
+    let mut distinct = Vec::new();
+    for oid in 0..63 {
+        distinct.extend_from_slice(&extension(oid));
+    }
+    // OIDs 0 and 64 share this implementation's filter bit. Exact replay
+    // must distinguish them rather than turning a filter collision into an error.
+    distinct.extend_from_slice(&extension(64));
+    assert_eq!(
+        ExtensionIter::new(&distinct)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    distinct.extend_from_slice(&extension(63));
+    assert_eq!(
+        ExtensionIter::new(&distinct).last().unwrap().unwrap_err(),
+        shin::identity::cert::Error::TooManyEntries
+    );
+
+    let mut duplicate = extension(42);
+    duplicate.extend_from_slice(&extension(42));
+    assert_eq!(
+        ExtensionIter::new(&duplicate).last().unwrap().unwrap_err(),
+        shin::identity::cert::Error::DuplicateExtension
+    );
 }
 
 #[test]
@@ -165,14 +223,54 @@ fn subject_alt_name_dns_entries() {
     let (_, val) = ExtensionIter::find(cert.tbs.extensions_der.unwrap(), OID_SUBJECT_ALT_NAME)
         .unwrap()
         .expect("SAN present");
-    let names = GeneralName::parse_alt_names(val).unwrap();
+    let names = GeneralNames::parse(val).unwrap();
     let dns: Vec<&[u8]> = names
         .iter()
-        .filter_map(|n| match n {
-            GeneralName::DnsName(d) => Some(*d),
+        .filter_map(|name| match name.unwrap() {
+            GeneralName::DnsName(dns) => Some(dns),
             _ => None,
         })
         .collect();
     assert!(dns.contains(&&b"primary.example"[..]));
     assert!(dns.contains(&&b"alt.example"[..]));
+}
+
+#[test]
+fn name_constraints_reject_distance_fields_in_general_subtree() {
+    // permittedSubtrees { dNSName "example.com", minimum 1 }
+    let mut value = vec![
+        0x30, 0x14, 0xa0, 0x12, 0x30, 0x10, 0x82, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+        b'.', b'c', b'o', b'm', 0x80, 0x01, 0x01,
+    ];
+    assert!(NameConstraints::parse(&value).is_err());
+
+    // maximum is also unsupported by the RFC 5280 profile and cannot be ignored.
+    value[19] = 0x81;
+    assert!(NameConstraints::parse(&value).is_err());
+}
+
+#[test]
+fn name_constraints_reject_empty_sequences_and_subtree_sets() {
+    assert!(NameConstraints::parse(&[0x30, 0x00]).is_err());
+    assert!(NameConstraints::parse(&[0x30, 0x02, 0xa0, 0x00]).is_err());
+}
+
+#[test]
+fn name_constraints_reject_invalid_ip_networks() {
+    // An IPv4 constraint is address || mask and therefore exactly eight octets.
+    let short = [0x30, 0x0a, 0xa0, 0x08, 0x30, 0x06, 0x87, 0x04, 10, 0, 0, 0];
+    assert!(NameConstraints::parse(&short).is_err());
+
+    // CIDR masks are contiguous; FF:00:FF:00 cannot describe a subtree.
+    let non_contiguous = [
+        0x30, 0x0e, 0xa0, 0x0c, 0x30, 0x0a, 0x87, 0x08, 10, 0, 0, 0, 0xff, 0x00, 0xff, 0x00,
+    ];
+    assert!(NameConstraints::parse(&non_contiguous).is_err());
+}
+
+#[test]
+fn subject_alt_name_rejects_empty_or_malformed_general_names() {
+    assert!(GeneralNames::parse(&[0x30, 0x00]).is_err());
+    assert!(GeneralNames::parse(&[0x30, 0x07, 0x87, 0x05, 127, 0, 0, 1, 0]).is_err());
+    assert!(GeneralNames::parse(&[0x30, 0x03, 0x04, 0x01, 0x00]).is_err());
 }

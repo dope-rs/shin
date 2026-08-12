@@ -28,6 +28,6 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let anchors: Vec<TrustAnchor<'_>> = certs.iter().map(TrustAnchor::from_cert).collect();
-    let chain = Chain::new(&certs);
+    let chain = Chain::new(certs);
     let _ = chain.validate(&anchors, UnixTime(1_700_000_000), b"example.com");
 });

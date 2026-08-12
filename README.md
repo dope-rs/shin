@@ -5,32 +5,34 @@ protocol state machine and cryptography; the embedder owns sockets, scheduling,
 TLS record transport (or QUIC CRYPTO frames), buffers, timers, and policy.
 
 The public transport choice is explicit. `Client::new` and `Server::new` are
-TLS-over-stream constructors. QUIC integrations must use
+fallible TLS-over-stream constructors, so invalid configuration never becomes
+runtime state. QUIC integrations must use
 `new_with_transport(..., Mode::Quic, ...)`; empty transport parameters
-do not imply TLS. See the [architecture and production guide](docs/architecture.md)
-before integrating either mode.
+do not imply TLS.
 
 ## Sans-I/O driving
 
-The state machine emits events synchronously. Bytes in `Send`, `PeerExtension`,
-and `NewSessionTicket`, as well as secret-bearing event values, borrow
-protocol-owned/input storage. Consume them inside `EventSink::event`; make an
-explicit copy into suitable owned, zeroizing storage only when retention is
-required.
+The state machine emits events synchronously. Bytes in `Send` and
+`PeerExtension`, the fields of the client-side `Ticket`, and secret-bearing event values
+borrow protocol-owned/input storage. Consume them inside `EventSink::event`.
+Ignoring a session ticket performs no PSK derivation or allocation;
+`Ticket::try_retain` derives the PSK, copies the opaque identity once,
+and returns an owned resumption bound to the endpoint that issued it.
 
 ```rust
-use core::convert::Infallible;
 use shin::client::Client;
+use shin::client::config::{self, Resumption};
 use shin::connection::{Clock, DriveError, Epoch, Event, EventContext, EventSink};
 
 #[derive(Default)]
 struct ReactorEvents {
     outbound: Vec<(Epoch, Vec<u8>)>,
+    resumption: Option<Resumption>,
     done: bool,
 }
 
 impl EventSink for ReactorEvents {
-    type Error = Infallible;
+    type Error = config::Error;
 
     fn event(
         &mut self,
@@ -41,6 +43,9 @@ impl EventSink for ReactorEvents {
             Event::Send { epoch, data } => {
                 // `data` is borrowed only for this callback.
                 self.outbound.push((epoch, data.to_vec()));
+            }
+            Event::NewSessionTicket(ticket) => {
+                self.resumption = Some(ticket.try_retain()?);
             }
             Event::Done => self.done = true,
             // A production sink also installs KeysReady/KeyUpdate secrets,
@@ -54,7 +59,7 @@ impl EventSink for ReactorEvents {
 fn start<C: Clock>(
     client: &mut Client<C>,
     events: &mut ReactorEvents,
-) -> Result<(), DriveError<Infallible>> {
+) -> Result<(), DriveError<config::Error>> {
     client.start_into(events)
 }
 
@@ -63,10 +68,21 @@ fn feed_decrypted_handshake<C: Clock>(
     epoch: Epoch,
     bytes: &[u8],
     events: &mut ReactorEvents,
-) -> Result<(), DriveError<Infallible>> {
+) -> Result<(), DriveError<config::Error>> {
     client.read_into(epoch, bytes, events)
 }
 ```
+
+Pass a retained value to `Client::resume` for the next connection; it reuses
+the validated endpoint and transport automatically. For persistence,
+`Ticket::try_psk` derives the PSK while the ticket identity, ALPN, suite, mode,
+and timing remain borrowed for direct serialization. Loading constructs a
+`config::Restore`, explicitly supplies the issuing connection's exact ALPN
+(`NegotiatedAlpn::Absent` is authoritative), then calls `Template::restore`.
+That boundary moves an owned ticket without copying, resolves borrowed or owned
+ALPN bytes to a compact endpoint-local ID, and drops only 0-RTT authority when
+the stored profile does not fit the current endpoint. `Config` contains reusable
+policy only; unresolved persistence state cannot enter a `Client` directly.
 
 For TLS, frame/protect each `Send` with the record API and pass decrypted record
 payloads back to `read_into`. For QUIC, map epochs to QUIC encryption levels and
@@ -88,8 +104,5 @@ the following `KeyUpdate { direction: Write, .. }` secret.
 API entry points are in [the client module](src/client/mod.rs),
 [the server module](src/server/mod.rs), [connection events](src/connection.rs),
 [transport mode](src/transport.rs), and [the record layer](src/wire/record/mod.rs).
-Operational invariants, memory profiles, 0-RTT replay requirements, limits, and
-verification commands are collected in the
-[architecture and production guide](docs/architecture.md).
 
 © 2026 inkyu

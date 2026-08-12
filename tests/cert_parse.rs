@@ -1,13 +1,18 @@
-use shin::identity::asn1::Tag;
+use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256, SerialNumber};
+use shin::identity::asn1::{DerError, Tag};
 use shin::identity::cert::Cert;
-
-const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
-const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
-const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+use shin::identity::cert::algorithm::{PublicKey, Signature};
 
 fn gen_self_signed(name: &str) -> Vec<u8> {
     let cert = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
     cert.cert.der().to_vec()
+}
+
+fn cert_with_serial(serial: &[u8]) -> Vec<u8> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec!["serial.local".into()]).unwrap();
+    params.serial_number = Some(SerialNumber::from_slice(serial));
+    params.self_signed(&key).unwrap().der().to_vec()
 }
 
 #[test]
@@ -15,13 +20,10 @@ fn parses_rcgen_self_signed_cert() {
     let der = gen_self_signed("example.local");
     let cert = Cert::parse(&der).expect("parse cert");
     assert_eq!(cert.tbs.version, 3);
-    assert!(!cert.tbs.serial.is_empty());
-    assert_eq!(cert.tbs.signature_alg.oid, cert.signature.algorithm.oid);
+    assert!(!cert.tbs.serial.is_zero());
+    assert_ne!(cert.tbs.signature_alg, Signature::Unsupported);
     assert!(!cert.signature.bytes.is_empty());
-    assert!(matches!(
-        cert.tbs.validity.not_before.tag,
-        t if t == Tag::UTC_TIME || t == Tag::GENERALIZED_TIME
-    ));
+    assert!(cert.tbs.validity.not_before <= cert.tbs.validity.not_after);
     assert!(!cert.tbs.spki.subject_public_key.is_empty());
     assert!(cert.tbs.extensions_der.is_some());
 }
@@ -36,13 +38,13 @@ fn tbs_der_slice_round_trips_when_re_parsed() {
 }
 
 #[test]
-fn spki_algorithm_oid_matches_one_of_known_set() {
+fn spki_algorithm_is_typed_during_parsing() {
     let der = gen_self_signed("kx.local");
     let cert = Cert::parse(&der).expect("parse cert");
-    let oid = cert.tbs.spki.algorithm.oid;
     assert!(
-        oid == OID_RSA_ENCRYPTION || oid == OID_EC_PUBLIC_KEY || oid == OID_ED25519,
-        "unexpected SPKI algorithm OID: {oid:02x?}"
+        !matches!(cert.tbs.spki.algorithm, PublicKey::Unsupported),
+        "unexpected SPKI algorithm: {:?}",
+        cert.tbs.spki.algorithm,
     );
 }
 
@@ -84,7 +86,7 @@ fn rejects_signature_algorithm_substitution() {
     // `signatureAlgorithm` AlgorithmIdentifiers disagree (RFC 5280 4.1.1.2).
     let der = gen_self_signed("sigalg.local");
     let cert = Cert::parse(&der).expect("baseline parses");
-    assert_eq!(cert.tbs.signature_alg.oid, OID_ECDSA_SHA256);
+    assert_eq!(cert.tbs.signature_alg, Signature::EcdsaSha256);
 
     // Flip the last byte of the outer signatureAlgorithm OID (last occurrence).
     let mut tampered = der.clone();
@@ -118,4 +120,47 @@ fn rejects_explicit_default_version() {
         Cert::parse(&tampered).unwrap_err(),
         shin::identity::cert::Error::BadVersion
     );
+}
+
+#[test]
+fn rejects_zero_and_overlong_serial_numbers() {
+    assert_eq!(
+        Cert::parse(&cert_with_serial(&[0])).unwrap_err(),
+        shin::identity::cert::Error::BadSerial
+    );
+    assert_eq!(
+        Cert::parse(&cert_with_serial(&[1; 21])).unwrap_err(),
+        shin::identity::cert::Error::BadSerial
+    );
+}
+
+#[test]
+fn rejects_noncanonical_serial_number() {
+    let der = gen_self_signed("serial-der.local");
+    let cert = Cert::parse(&der).unwrap();
+    let offset = cert.tbs.serial.as_bytes().as_ptr() as usize - der.as_ptr() as usize;
+    let mut tampered = der.clone();
+    tampered[offset] = 0;
+    tampered[offset + 1] &= 0x7f;
+    assert_eq!(
+        Cert::parse(&tampered).unwrap_err(),
+        shin::identity::cert::Error::Der(DerError::BadInteger)
+    );
+}
+
+#[test]
+fn rejects_malformed_name_and_algorithm_oids() {
+    let der = gen_self_signed("oid.local");
+    for oid in [&[0x55, 0x04, 0x03][..], OID_ECDSA_SHA256] {
+        let position = der
+            .windows(oid.len())
+            .position(|candidate| candidate == oid)
+            .unwrap();
+        let mut tampered = der.clone();
+        tampered[position] = 0x80;
+        assert_eq!(
+            Cert::parse(&tampered).unwrap_err(),
+            shin::identity::cert::Error::Der(DerError::BadOid)
+        );
+    }
 }

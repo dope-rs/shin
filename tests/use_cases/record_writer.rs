@@ -8,7 +8,7 @@ const TEST_SECRET: [u8; 32] = [
 
 #[test]
 fn tls_record_writes_directly_to_a_safe_o3_transaction() {
-    let pool = buffer::pool::Pool::try_new(1, 128).unwrap();
+    let pool = buffer::Pool::try_new(1, 128).unwrap();
     let mut output = pool.try_acquire_buffer().unwrap();
     let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
 

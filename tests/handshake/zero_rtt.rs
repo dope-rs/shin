@@ -1,10 +1,11 @@
 use shin::client::Client;
-use shin::client::config::{Config, Resumption, Verifier};
+use shin::client::config::{Config, Restore, Verifier};
 use shin::connection::{Clock, Epoch};
 use shin::crypto::hash::Digest;
 use shin::crypto::sig::SigningKey;
 use shin::server::{config::CertSource, config::EarlyDataGuard};
 use shin::transport::Mode;
+use shin::wire::handshake::KeyUpdateRequest;
 
 use crate::common::CollectEvents;
 use crate::common::Event;
@@ -92,7 +93,7 @@ fn server_with_transport_params(
             },
             transport_params,
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET).unwrap()),
             accept_early_data: accept,
         },
         transport_mode,
@@ -101,39 +102,43 @@ fn server_with_transport_params(
     )
 }
 
-fn client(resumption: Option<Resumption>, enable_early_data: bool) -> Client<fn() -> u64> {
-    client_with_transport(resumption, enable_early_data, Mode::Tls)
+fn client(restore: Option<Restore<'_>>, enable_early_data: bool) -> Client<fn() -> u64> {
+    client_with_transport(restore, enable_early_data, Mode::Tls)
 }
 
 fn client_with_transport(
-    resumption: Option<Resumption>,
+    restore: Option<Restore<'_>>,
     enable_early_data: bool,
     transport_mode: Mode,
 ) -> Client<fn() -> u64> {
-    Client::new_with_transport(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: *signing_key().pubkey().unwrap(),
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption,
-            enable_early_data,
+    let template = Config {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: *signing_key().pubkey().unwrap(),
         },
-        transport_mode,
-        (|| 0) as fn() -> u64,
-    )
-    .unwrap()
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        enable_early_data,
+    }
+    .try_into_template_with_transport(transport_mode)
+    .unwrap();
+    let prepared = match restore {
+        Some(restore) => template.restore(restore).unwrap(),
+        None => template.without_resumption(),
+    };
+    let workspace = prepared.workspace_layout(None).allocate();
+    prepared
+        .try_into_client_with_workspace(None, (|| 0) as fn() -> u64, workspace)
+        .unwrap()
 }
 
-fn issue_ticket() -> Resumption {
+fn issue_ticket() -> Restore<'static> {
     issue_ticket_with_transport(Mode::Tls, true).0
 }
 
 fn issue_ticket_with_transport(
     transport_mode: Mode,
     advertise_early_data: bool,
-) -> (Resumption, Option<u32>) {
+) -> (Restore<'static>, Option<u32>) {
     let mut s = server_with_transport(advertise_early_data, transport_mode);
     let mut c = client_with_transport(None, false, transport_mode);
     let c1 = c.start().unwrap();
@@ -148,33 +153,15 @@ fn issue_ticket_with_transport(
     let nst = find_send(&s2, Epoch::Application).unwrap();
     let extra = c.read(Epoch::Application, &nst).unwrap();
 
-    let mut psk = None;
-    let mut tkt = None;
-    let mut maximum = None;
-    for e in extra {
-        match e {
-            Event::ResumptionSecret { psk: p } => psk = Some(p),
-            Event::NewSessionTicket {
-                ticket_age_add,
-                ticket,
-                max_early_data,
-                ..
-            } => {
-                tkt = Some((ticket_age_add, ticket));
-                maximum = max_early_data;
-            }
-            _ => {}
-        }
-    }
-    let (age_add, ticket) = tkt.unwrap();
-    let psk = psk.unwrap();
-    let resumption = match maximum {
-        Some(maximum) => {
-            Resumption::new_with_early_data(psk, ticket, age_add, 0, maximum, transport_mode)
-        }
-        None => Resumption::new(psk, ticket, age_add, 0),
+    let ticket = extra
+        .into_iter()
+        .find(|event| matches!(event, Event::NewSessionTicket { .. }))
+        .unwrap();
+    let maximum = match &ticket {
+        Event::NewSessionTicket { max_early_data, .. } => *max_early_data,
+        _ => None,
     };
-    (resumption, maximum)
+    (ticket.into_restore().unwrap(), maximum)
 }
 
 #[test]
@@ -185,7 +172,7 @@ fn full_zero_rtt_handshake_completes_via_end_of_early_data() {
     let c1 = c.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let client_cets = c1.iter().find_map(|e| match e {
-        Event::ZeroRttKeysReady { secret } => Some(*secret),
+        Event::ZeroRttKeysReady { secret, .. } => Some(*secret),
         _ => None,
     });
     assert!(client_cets.is_some(), "client must emit 0-RTT keys");
@@ -289,7 +276,7 @@ fn quic_zero_rtt_uses_sentinel_and_omits_end_of_early_data() {
     let mut server_advertised_early_data = false;
     while !encoded.is_empty() {
         if let shin::wire::handshake::frame::Frame::EncryptedExtensions(extensions) =
-            shin::wire::handshake::frame::Frame::decode(&mut encoded).unwrap()
+            crate::decode_owned(&mut encoded).unwrap()
         {
             server_advertised_early_data = extensions
                 .extensions
@@ -335,13 +322,15 @@ fn quic_zero_rtt_uses_sentinel_and_omits_end_of_early_data() {
     }
 
     assert!(matches!(
-        c.send_key_update_into(false, &mut Ignore),
+        c.key_updates()
+            .send_into(KeyUpdateRequest::NotRequested, &mut Ignore),
         Err(shin::connection::DriveError::Protocol(
             shin::connection::Error::UnexpectedMessage
         ))
     ));
     assert!(matches!(
-        s.send_key_update_into(false, &mut Ignore),
+        s.key_updates()
+            .send_into(KeyUpdateRequest::NotRequested, &mut Ignore),
         Err(shin::connection::DriveError::Protocol(
             shin::connection::Error::UnexpectedMessage
         ))
@@ -387,7 +376,7 @@ fn changed_server_transport_params_reject_zero_rtt_but_keep_psk_resumption() {
     let mut reader = shin::wire::codec::Reader::new(&handshake);
     let mut saw_certificate = false;
     while !reader.is_empty() {
-        let frame = shin::wire::handshake::frame::Frame::decode(&mut reader).unwrap();
+        let frame = crate::decode_owned(&mut reader).unwrap();
         saw_certificate |= frame.msg_type() == shin::wire::handshake::Type::Certificate;
     }
     assert!(!saw_certificate, "PSK 1-RTT resumption should remain valid");
@@ -406,7 +395,7 @@ fn client_does_not_offer_quic_entitlement_in_tls_mode() {
     let hello = find_send(&events, Epoch::Plaintext).unwrap();
     let mut reader = shin::wire::codec::Reader::new(&hello);
     let shin::wire::handshake::frame::Frame::ClientHello(hello) =
-        shin::wire::handshake::frame::Frame::decode(&mut reader).unwrap()
+        crate::decode_owned(&mut reader).unwrap()
     else {
         panic!("expected ClientHello")
     };

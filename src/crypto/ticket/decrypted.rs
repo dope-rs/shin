@@ -1,15 +1,17 @@
 use crate::crypto::material;
 use crate::crypto::ticket;
 use crate::memory::threadbound;
+use crate::wire::record;
 use core::fmt;
+use o3::collections::fixed::array;
 
 #[derive(PartialEq, Eq)]
 pub struct Decrypted {
     pub psk: material::ResumptionPsk,
     pub age_add: u32,
     pub issued_at_ms: u64,
-    pub suite: u16,
-    pub alpn: arrayvec::ArrayVec<u8, { ticket::MAX_ALPN_LEN }>,
+    pub suite: record::CipherSuite,
+    pub alpn: array::CopyInline<u8, { ticket::MAX_ALPN_LEN }>,
     pub context: ticket::Context,
     pub(super) _thread: threadbound::ThreadBound,
 }

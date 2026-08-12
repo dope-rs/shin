@@ -3,6 +3,7 @@ use crate::crypto::kdf;
 use crate::wire::codec;
 use crate::wire::codec::Encode as _;
 use alloc::vec;
+use core::mem;
 use zeroize::Zeroize as _;
 
 use ring::hmac;
@@ -38,19 +39,30 @@ impl KxModes {
         modes.finish()?;
         Ok(out)
     }
+}
 
-    pub fn decode(data: &[u8]) -> Result<Self, codec::DecodeError> {
-        let mut r = codec::Reader::new(data);
-        let modes = r.vec_u8()?.to_vec();
-        r.finish()?;
+/// Allocation-free view of a validated `psk_key_exchange_modes` body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KxModesRef<'a>(&'a [u8]);
+
+impl<'a> KxModesRef<'a> {
+    pub fn decode(data: &'a [u8]) -> Result<Self, codec::DecodeError> {
+        let mut reader = codec::Reader::new(data);
+        let modes = codec::FramedVector::<1, 1>::decode_u8(&mut reader)?.as_slice();
+        reader.finish()?;
         Ok(Self(modes))
     }
 
-    pub(crate) fn contains(data: &[u8], mode: u8) -> Result<bool, codec::DecodeError> {
-        let mut reader = codec::Reader::new(data);
-        let modes = reader.vec_u8()?;
-        reader.finish()?;
-        Ok(modes.contains(&mode))
+    pub fn as_slice(self) -> &'a [u8] {
+        self.0
+    }
+
+    pub fn contains(self, mode: u8) -> bool {
+        self.0.contains(&mode)
+    }
+
+    pub fn into_owned(self) -> KxModes {
+        KxModes(self.0.to_vec())
     }
 }
 
@@ -59,6 +71,191 @@ pub(crate) struct OfferRef<'a> {
     pub(crate) identity: &'a [u8],
     pub(crate) obfuscated_ticket_age: u32,
     pub(crate) binder: &'a [u8],
+}
+
+/// Allocation-free view of a validated `pre_shared_key` offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferedPsks<'a> {
+    encoded: &'a [u8],
+    identities: &'a [u8],
+    binders: &'a [u8],
+    first: OfferRef<'a>,
+    count: u16,
+    binders_wire_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityRef<'a> {
+    pub identity: &'a [u8],
+    pub obfuscated_ticket_age: u32,
+}
+
+pub struct IdentityRefs<'a> {
+    reader: codec::Reader<'a>,
+}
+
+pub struct BinderRefs<'a> {
+    reader: codec::Reader<'a>,
+}
+
+/// A syntactically valid PSK offer proven to be the final ClientHello
+/// extension. Every slice is bounded by the borrowed ClientHello.
+#[derive(Clone, Copy)]
+pub(crate) struct Tail<'a> {
+    first: OfferRef<'a>,
+    transcript_prefix: &'a [u8],
+}
+
+const _: () = assert!(mem::size_of::<Tail<'_>>() <= 64);
+
+impl<'a> OfferedPsks<'a> {
+    pub fn decode(data: &'a [u8]) -> Result<Self, codec::DecodeError> {
+        let mut reader = codec::Reader::new(data);
+        let identities = codec::FramedVector::<7, 1>::decode_u16(&mut reader)?.as_slice();
+        let mut identity_reader = codec::Reader::new(identities);
+        let mut first_identity = None;
+        let mut identity_count = 0usize;
+        while !identity_reader.is_empty() {
+            let identity =
+                codec::FramedVector::<1, 1>::decode_u16(&mut identity_reader)?.as_slice();
+            let obfuscated_ticket_age = identity_reader.u32()?;
+            if first_identity.is_none() {
+                first_identity = Some((identity, obfuscated_ticket_age));
+            }
+            identity_count = identity_count
+                .checked_add(1)
+                .ok_or(codec::DecodeError::InvalidEnum)?;
+        }
+
+        let binders_wire_len = reader.remaining().len();
+        let binders = codec::FramedVector::<33, 1>::decode_u16(&mut reader)?.as_slice();
+        reader.finish()?;
+        let mut binder_reader = codec::Reader::new(binders);
+        let mut first_binder = None;
+        let mut binder_count = 0usize;
+        while !binder_reader.is_empty() {
+            let binder =
+                codec::FramedVector::<{ hash::SHA256_LEN }, 1>::decode_u8(&mut binder_reader)?
+                    .as_slice();
+            if first_binder.is_none() {
+                first_binder = Some(binder);
+            }
+            binder_count = binder_count
+                .checked_add(1)
+                .ok_or(codec::DecodeError::InvalidEnum)?;
+        }
+        if identity_count == 0 || identity_count != binder_count {
+            return Err(codec::DecodeError::Trailing);
+        }
+        let count = u16::try_from(identity_count).map_err(|_| codec::DecodeError::InvalidEnum)?;
+        let ((identity, obfuscated_ticket_age), binder) = first_identity
+            .zip(first_binder)
+            .ok_or(codec::DecodeError::Trailing)?;
+        Ok(Self {
+            encoded: data,
+            identities,
+            binders,
+            first: OfferRef {
+                identity,
+                obfuscated_ticket_age,
+                binder,
+            },
+            count,
+            binders_wire_len,
+        })
+    }
+
+    pub fn count(self) -> u16 {
+        self.count
+    }
+
+    pub(crate) fn encoded_identities(self) -> &'a [u8] {
+        self.identities
+    }
+
+    pub fn identities(self) -> IdentityRefs<'a> {
+        IdentityRefs {
+            reader: codec::Reader::new(self.identities),
+        }
+    }
+
+    pub fn binders(self) -> BinderRefs<'a> {
+        BinderRefs {
+            reader: codec::Reader::new(self.binders),
+        }
+    }
+
+    pub(crate) fn bind_tail(self, client_hello: &'a [u8]) -> Result<Tail<'a>, codec::DecodeError> {
+        if !client_hello.ends_with(self.encoded) {
+            return Err(codec::DecodeError::Trailing);
+        }
+        let prefix_len = client_hello
+            .len()
+            .checked_sub(self.binders_wire_len)
+            .ok_or(codec::DecodeError::Underflow)?;
+        Ok(Tail {
+            first: self.first,
+            transcript_prefix: &client_hello[..prefix_len],
+        })
+    }
+
+    pub fn into_owned(self) -> Offer {
+        let identities = self
+            .identities()
+            .map(|identity| Identity {
+                identity: identity.identity.to_vec(),
+                obfuscated_ticket_age: identity.obfuscated_ticket_age,
+            })
+            .collect();
+        let binders = self.binders().map(<[u8]>::to_vec).collect();
+        Offer {
+            identities,
+            binders,
+        }
+    }
+}
+
+impl<'a> Iterator for IdentityRefs<'a> {
+    type Item = IdentityRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reader.is_empty() {
+            return None;
+        }
+        Some(IdentityRef {
+            identity: self.reader.vec_u16().ok()?,
+            obfuscated_ticket_age: self.reader.u32().ok()?,
+        })
+    }
+}
+
+impl<'a> Iterator for BinderRefs<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reader.is_empty() {
+            return None;
+        }
+        self.reader.vec_u8().ok()
+    }
+}
+
+impl<'a> Tail<'a> {
+    pub(crate) fn identity(self) -> &'a [u8] {
+        self.first.identity
+    }
+
+    pub(crate) fn obfuscated_ticket_age(self) -> u32 {
+        self.first.obfuscated_ticket_age
+    }
+
+    pub(crate) fn binder(self) -> &'a [u8] {
+        self.first.binder
+    }
+
+    pub(crate) fn transcript_prefix(self) -> &'a [u8] {
+        self.transcript_prefix
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,87 +290,6 @@ impl Offer {
         }
         binders.finish()?;
         Ok(out)
-    }
-
-    pub fn decode(data: &[u8]) -> Result<Self, codec::DecodeError> {
-        let mut r = codec::Reader::new(data);
-        let mut id_sub = r.sub_u16()?;
-        let mut identities = vec::Vec::new();
-        while !id_sub.is_empty() {
-            let identity = id_sub.vec_u16()?.to_vec();
-            let obfuscated_ticket_age = id_sub.u32()?;
-            identities.push(Identity {
-                identity,
-                obfuscated_ticket_age,
-            });
-        }
-        let mut bs_sub = r.sub_u16()?;
-        let mut binders = vec::Vec::new();
-        while !bs_sub.is_empty() {
-            binders.push(bs_sub.vec_u8()?.to_vec());
-        }
-        r.finish()?;
-        if identities.len() != binders.len() {
-            return Err(codec::DecodeError::Trailing);
-        }
-        Ok(Self {
-            identities,
-            binders,
-        })
-    }
-
-    pub(crate) fn decode_first(data: &[u8]) -> Result<Option<OfferRef<'_>>, codec::DecodeError> {
-        let mut reader = codec::Reader::new(data);
-        let mut identities = reader.sub_u16()?;
-        let mut identity_count = 0usize;
-        let mut first_identity = None;
-        while !identities.is_empty() {
-            let identity = identities.vec_u16()?;
-            let obfuscated_ticket_age = identities.u32()?;
-            if first_identity.is_none() {
-                first_identity = Some((identity, obfuscated_ticket_age));
-            }
-            identity_count = identity_count
-                .checked_add(1)
-                .ok_or(codec::DecodeError::InvalidEnum)?;
-        }
-
-        let mut binders = reader.sub_u16()?;
-        let mut binder_count = 0usize;
-        let mut first_binder = None;
-        while !binders.is_empty() {
-            let binder = binders.vec_u8()?;
-            if first_binder.is_none() {
-                first_binder = Some(binder);
-            }
-            binder_count = binder_count
-                .checked_add(1)
-                .ok_or(codec::DecodeError::InvalidEnum)?;
-        }
-        reader.finish()?;
-        if identity_count != binder_count {
-            return Err(codec::DecodeError::Trailing);
-        }
-        Ok(first_identity
-            .zip(first_binder)
-            .map(|((identity, obfuscated_ticket_age), binder)| OfferRef {
-                identity,
-                obfuscated_ticket_age,
-                binder,
-            }))
-    }
-
-    /// ClientHello prefix covered by a single resumption binder.
-    pub(crate) fn binder_transcript_prefix(
-        encoded_client_hello: &[u8],
-        binder_len: usize,
-    ) -> Option<&[u8]> {
-        const BINDER_LIST_LENGTH_BYTES: usize = 2;
-        const BINDER_LENGTH_BYTES: usize = 1;
-        let field_len = BINDER_LIST_LENGTH_BYTES
-            .checked_add(BINDER_LENGTH_BYTES)?
-            .checked_add(binder_len)?;
-        encoded_client_hello.get(..encoded_client_hello.len().checked_sub(field_len)?)
     }
 }
 

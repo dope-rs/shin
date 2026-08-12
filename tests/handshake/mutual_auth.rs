@@ -16,7 +16,9 @@ use shin::server::{
 };
 
 use crate::common::CollectEvents;
-use crate::common::{Server, ServerConfig, find_send, has_done};
+use crate::common::{
+    FixedClock, Server, ServerConfig, cert_validity_midpoint, find_send, has_done,
+};
 
 const SERVER_NAME: &str = "server.local";
 const CLIENT_NAME: &str = "client.local";
@@ -36,13 +38,6 @@ fn self_signed_der(key: &KeyPair, name: &str) -> Vec<u8> {
     params.is_ca = IsCa::NoCa;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.self_signed(key).unwrap().der().to_vec()
-}
-
-fn now_inside(cert_der: &[u8]) -> u64 {
-    let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let na = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
-    (nb.0 + na.0) / 2
 }
 
 fn anchor(cert_der: &[u8]) -> OwnedTrustAnchor {
@@ -87,20 +82,17 @@ fn drive<V: ClientCertVerifier + 'static>(
         mode,
         verifier,
     );
-    let mut client = Client::new(
-        Config {
-            verifier: client_verifier,
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption: None,
-            enable_early_data: false,
-        },
-        move || clock,
-    )
-    .unwrap();
-    if let Some(identity) = identity {
-        client.set_identity(identity)?;
+    let config = Config {
+        verifier: client_verifier,
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        enable_early_data: false,
+    };
+    let mut client = match identity {
+        Some(identity) => Client::mutual(config, identity, FixedClock(clock)),
+        None => Client::new(config, FixedClock(clock)),
     }
+    .map_err(Error::from)?;
 
     let c1 = client.start()?;
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
@@ -125,7 +117,7 @@ enum ServerAuth<V> {
 fn x509_p256_mutual_auth_succeeds() {
     let (server_der, server_key) = ecdsa_p256_self_signed(SERVER_NAME);
     let (client_der, client_key) = ecdsa_p256_self_signed(CLIENT_NAME);
-    let now = now_inside(&server_der);
+    let now = cert_validity_midpoint(&server_der);
 
     drive(
         CertSource::X509 {
@@ -135,6 +127,7 @@ fn x509_p256_mutual_auth_succeeds() {
         Verifier::X509 {
             anchors: vec![anchor(&server_der)],
             hostname: SERVER_NAME.as_bytes().to_vec(),
+            certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
         },
         Some(Identity::X509 {
             chain_der: vec![client_der.clone()],
@@ -173,7 +166,7 @@ fn rpk_ed25519_mutual_auth_succeeds() {
 #[test]
 fn requested_anonymous_client_succeeds() {
     let (server_der, server_key) = ecdsa_p256_self_signed(SERVER_NAME);
-    let now = now_inside(&server_der);
+    let now = cert_validity_midpoint(&server_der);
 
     drive(
         CertSource::X509 {
@@ -183,6 +176,7 @@ fn requested_anonymous_client_succeeds() {
         Verifier::X509 {
             anchors: vec![anchor(&server_der)],
             hostname: SERVER_NAME.as_bytes().to_vec(),
+            certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
         },
         None,                                            // client presents no certificate
         ServerAuth::Requested(Pinned(vec![0xde, 0xad])), // never consulted
@@ -194,7 +188,7 @@ fn requested_anonymous_client_succeeds() {
 #[test]
 fn required_empty_client_cert_rejected() {
     let (server_der, server_key) = ecdsa_p256_self_signed(SERVER_NAME);
-    let now = now_inside(&server_der);
+    let now = cert_validity_midpoint(&server_der);
 
     let err = drive(
         CertSource::X509 {
@@ -204,6 +198,7 @@ fn required_empty_client_cert_rejected() {
         Verifier::X509 {
             anchors: vec![anchor(&server_der)],
             hostname: SERVER_NAME.as_bytes().to_vec(),
+            certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
         },
         None, // client has no identity → empty Certificate
         ServerAuth::Required(Pinned(vec![0x00])),
@@ -218,7 +213,7 @@ fn unauthorized_client_key_rejected() {
     let (server_der, server_key) = ecdsa_p256_self_signed(SERVER_NAME);
     let (client_der, client_key) = ecdsa_p256_self_signed(CLIENT_NAME);
     let (other_der, _) = ecdsa_p256_self_signed("other.local");
-    let now = now_inside(&server_der);
+    let now = cert_validity_midpoint(&server_der);
 
     let err = drive(
         CertSource::X509 {
@@ -228,6 +223,7 @@ fn unauthorized_client_key_rejected() {
         Verifier::X509 {
             anchors: vec![anchor(&server_der)],
             hostname: SERVER_NAME.as_bytes().to_vec(),
+            certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
         },
         Some(Identity::X509 {
             chain_der: vec![client_der.clone()],
@@ -246,7 +242,7 @@ fn mismatched_client_certificate_key_is_bad_config() {
     let (server_der, server_key) = ecdsa_p256_self_signed(SERVER_NAME);
     let (client_der, _k1) = ecdsa_p256_self_signed(CLIENT_NAME);
     let (_decoy, k2) = ecdsa_p256_self_signed(CLIENT_NAME);
-    let now = now_inside(&server_der);
+    let now = cert_validity_midpoint(&server_der);
 
     let err = drive(
         CertSource::X509 {
@@ -256,6 +252,7 @@ fn mismatched_client_certificate_key_is_bad_config() {
         Verifier::X509 {
             anchors: vec![anchor(&server_der)],
             hostname: SERVER_NAME.as_bytes().to_vec(),
+            certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
         },
         Some(Identity::X509 {
             chain_der: vec![client_der.clone()],

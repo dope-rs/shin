@@ -43,19 +43,21 @@ fuzz_target!(|data: &[u8]| {
         None => return,
     };
 
-    let mut server = Server::new(
+    let server = Server::new(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
-    );
+    )
+    .unwrap();
     let mut shard = Shard::new(config::Config {
         source: CertSource::RawPublicKey {
             signing_key: signing,
         },
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-    });
+    })
+    .unwrap();
     let mut client = Client::new(
         Config {
             verifier: Verifier::RawPublicKey {
@@ -63,13 +65,13 @@ fuzz_target!(|data: &[u8]| {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         || 0,
     ).unwrap();
     let mut events = IgnoreEvents;
     let _ = client.start_into(&mut events);
+    let mut server = shard.bind(server).unwrap();
 
     let mut r = data;
     while r.len() >= 2 {
@@ -81,7 +83,7 @@ fuzz_target!(|data: &[u8]| {
         r = rest;
         let ep = epoch(hdr);
         if hdr & 0b100 == 0 {
-            let _ = server.read_into(ep, chunk, &mut shard, &mut events);
+            let _ = server.read_into(ep, chunk, &mut events);
         } else {
             let _ = client.read_into(ep, chunk, &mut events);
         }

@@ -7,11 +7,10 @@ use shin::client::Client;
 use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
-use shin::identity::cert::Cert;
 use shin::server::config::CertSource;
 
 use crate::common::CollectEvents;
-use crate::common::{Server, ServerConfig, find_send, has_done};
+use crate::common::{Server, ServerConfig, cert_validity_midpoint, find_send, has_done};
 
 const HOSTNAME: &str = "rsa.local";
 
@@ -36,19 +35,12 @@ fn rsa_self_signed() -> (Vec<u8>, SigningKey) {
     (cert.der().to_vec(), signing)
 }
 
-fn now_inside(cert_der: &[u8]) -> u64 {
-    let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let na = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
-    (nb.0 + na.0) / 2
-}
-
 #[test]
 fn handshake_with_rsa_pss_x509_chain() {
     let (cert_der, signing) = rsa_self_signed();
 
     let anchor = OwnedTrustAnchor::from_cert_der(&cert_der).unwrap();
-    let now = now_inside(&cert_der);
+    let now = cert_validity_midpoint(&cert_der);
 
     let server = Server::new(
         ServerConfig {
@@ -68,10 +60,10 @@ fn handshake_with_rsa_pss_x509_chain() {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now * 1000,

@@ -13,7 +13,6 @@ use shin::connection::Epoch;
 use shin::crypto::hash::Digest;
 use shin::crypto::sig::SigningKey;
 use shin::identity::asn1::{Reader, Tag};
-use shin::identity::cert::Cert;
 use shin::server::config::CertSource;
 use shin::transport::Mode;
 use shin::wire::extension;
@@ -21,7 +20,7 @@ use shin::wire::record::{CipherSuite, ContentType, Opener, Plaintext, Sealer};
 
 use crate::common::CollectEvents;
 use crate::common::Event;
-use crate::common::{Server, ServerConfig};
+use crate::common::{Server, ServerConfig, cert_validity_midpoint};
 
 const HOSTNAME: &str = "host.local";
 
@@ -29,7 +28,7 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     let mut r = Reader::new(pkcs8);
     let inner = r.read_tagged(Tag::SEQUENCE).ok()?;
     let mut ir = Reader::new(inner);
-    let _version = ir.read_tagged(Tag::INTEGER).ok()?;
+    let _version = ir.read_uint().ok()?;
     let _alg = ir.read_tagged(Tag::SEQUENCE).ok()?;
     let outer_oct = ir.read_tagged(Tag::OCTET_STRING).ok()?;
     let mut or = Reader::new(outer_oct);
@@ -62,10 +61,7 @@ fn gen_ed25519_cert() -> TestCert {
     let cert = params.self_signed(&key).unwrap();
     let cert_der = cert.der().to_vec();
 
-    let parsed = Cert::parse(&cert_der).unwrap();
-    let nb = shin::identity::UnixTime::from_time_value(&parsed.tbs.validity.not_before).unwrap();
-    let na = shin::identity::UnixTime::from_time_value(&parsed.tbs.validity.not_after).unwrap();
-    let now_ms = ((nb.0 + na.0) / 2) * 1000;
+    let now_ms = cert_validity_midpoint(&cert_der) * 1000;
 
     TestCert {
         cert_der,
@@ -343,10 +339,10 @@ fn shin_client(suite: CipherSuite, cert: &TestCert) -> Client<impl Fn() -> u64> 
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now_ms,
@@ -368,10 +364,10 @@ fn shin_quic_client(
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: transport_params.to_vec(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         Mode::Quic,

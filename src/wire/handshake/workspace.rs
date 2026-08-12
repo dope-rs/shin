@@ -15,13 +15,9 @@ impl Default for BoundedBuffer {
 }
 
 impl BoundedBuffer {
-    fn with_capacity(limit: usize) -> Self {
-        Self::with_reservation(limit, limit)
-    }
-
-    fn with_reservation(limit: usize, reservation: usize) -> Self {
+    pub(crate) fn with_capacity(limit: usize) -> Self {
         Self {
-            bytes: vec::Vec::with_capacity(reservation.min(limit)),
+            bytes: vec::Vec::with_capacity(limit),
             limit,
             overflowed: false,
         }
@@ -137,6 +133,17 @@ impl codec::Encode for BoundedBuffer {
     }
 }
 
+impl codec::Reserve for BoundedBuffer {
+    fn reserve_slice(&mut self, len: usize) -> Result<&mut [u8], codec::EncodeError> {
+        if !self.reserve_encoded(len) {
+            return Err(codec::EncodeError::Capacity);
+        }
+        let start = self.bytes.len();
+        self.bytes.resize(start + len, 0);
+        Ok(&mut self.bytes[start..])
+    }
+}
+
 /// Recyclable bounded storage for input, flights, and peer identity.
 pub struct Scratch {
     pub(crate) reassembly: BoundedBuffer,
@@ -147,9 +154,9 @@ pub struct Scratch {
 impl Scratch {
     const DEFAULT_RESERVATION: usize = record::MAX_PLAINTEXT_BODY;
 
-    /// Creates a workspace whose logical limits are fully reserved up front.
-    /// This is the strict no-allocation profile for callers that know their
-    /// maximum handshake sizes.
+    /// Creates fully reserved, strict no-allocation handshake storage.
+    /// On clients, `outbound_flight_capacity` also bounds the phase-disjoint
+    /// X.509 peer-key lease.
     pub fn new(
         fragmented_message_capacity: usize,
         outbound_flight_capacity: usize,
@@ -162,57 +169,22 @@ impl Scratch {
         }
     }
 
-    pub fn for_client() -> Self {
-        Self::with_reservations(
-            super::MAX_SIZE,
-            super::MAX_SIZE,
-            0,
-            Self::DEFAULT_RESERVATION,
-            Self::DEFAULT_RESERVATION,
-            0,
-        )
-    }
-
     pub fn for_server() -> Self {
-        Self::with_reservations(
-            super::MAX_SIZE,
-            super::MAX_SIZE,
-            super::MAX_SIZE,
+        Self::new(
             Self::DEFAULT_RESERVATION,
             Self::DEFAULT_RESERVATION,
-            0,
+            Self::DEFAULT_RESERVATION,
         )
-    }
-
-    fn with_reservations(
-        fragmented_message_capacity: usize,
-        outbound_flight_capacity: usize,
-        peer_identity_capacity: usize,
-        fragmented_message_reservation: usize,
-        outbound_flight_reservation: usize,
-        peer_identity_reservation: usize,
-    ) -> Self {
-        Self {
-            reassembly: BoundedBuffer::with_reservation(
-                fragmented_message_capacity,
-                fragmented_message_reservation,
-            ),
-            flight: BoundedBuffer::with_reservation(
-                outbound_flight_capacity,
-                outbound_flight_reservation,
-            ),
-            identity: BoundedBuffer::with_reservation(
-                peer_identity_capacity,
-                peer_identity_reservation,
-            ),
-        }
     }
 
     pub(crate) fn from_buffers(
-        reassembly: BoundedBuffer,
-        flight: BoundedBuffer,
-        identity: BoundedBuffer,
+        mut reassembly: BoundedBuffer,
+        mut flight: BoundedBuffer,
+        mut identity: BoundedBuffer,
     ) -> Self {
+        reassembly.clear();
+        flight.clear();
+        identity.clear();
         Self {
             reassembly,
             flight,

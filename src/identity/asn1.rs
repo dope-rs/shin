@@ -1,5 +1,3 @@
-use alloc::vec;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DerError {
     Underflow,
@@ -53,6 +51,21 @@ pub struct Tlv<'a> {
     pub contents: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Oid<'a> {
+    bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Uint<'a> {
+    encoded: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitString<'a> {
+    contents: &'a [u8],
+}
+
 pub struct Reader<'a> {
     bytes: &'a [u8],
 }
@@ -88,6 +101,35 @@ impl<'a> Reader<'a> {
         Ok(tlv.contents)
     }
 
+    pub fn read_oid(&mut self) -> Result<Oid<'a>, DerError> {
+        Oid::from_bytes(self.read_tagged(Tag::OID)?)
+    }
+
+    pub fn read_uint(&mut self) -> Result<Uint<'a>, DerError> {
+        Uint::from_bytes(self.read_tagged(Tag::INTEGER)?)
+    }
+
+    pub fn read_bool(&mut self) -> Result<bool, DerError> {
+        match self.read_tagged(Tag::BOOLEAN)? {
+            [0x00] => Ok(false),
+            [0xff] => Ok(true),
+            _ => Err(DerError::BadBool),
+        }
+    }
+
+    pub fn read_bit_string(&mut self) -> Result<BitString<'a>, DerError> {
+        BitString::from_bytes(self.read_tagged(Tag::BIT_STRING)?)
+    }
+
+    pub fn read_optional_bit_string(
+        &mut self,
+        tag: Tag,
+    ) -> Result<Option<BitString<'a>>, DerError> {
+        self.read_optional(tag)?
+            .map(BitString::from_bytes)
+            .transpose()
+    }
+
     pub fn peek_tag(&self) -> Option<Tag> {
         self.bytes.first().copied().map(Tag)
     }
@@ -105,9 +147,108 @@ impl<'a> Reader<'a> {
     }
 }
 
+impl<'a> Oid<'a> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, DerError> {
+        if bytes.is_empty() {
+            return Err(DerError::BadOid);
+        }
+        let mut subidentifier_start = true;
+        for byte in bytes {
+            if subidentifier_start && *byte == 0x80 {
+                return Err(DerError::BadOid);
+            }
+            subidentifier_start = byte & 0x80 == 0;
+        }
+        if !subidentifier_start {
+            return Err(DerError::BadOid);
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn is(self, expected: &[u8]) -> bool {
+        self.bytes == expected
+    }
+}
+
+impl<'a> Uint<'a> {
+    pub fn from_bytes(encoded: &'a [u8]) -> Result<Self, DerError> {
+        if encoded.is_empty()
+            || encoded[0] & 0x80 != 0
+            || encoded.len() >= 2 && encoded[0] == 0 && encoded[1] & 0x80 == 0
+        {
+            return Err(DerError::BadInteger);
+        }
+        Ok(Self { encoded })
+    }
+
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.encoded
+    }
+
+    pub fn magnitude(self) -> &'a [u8] {
+        match self.encoded {
+            [0, rest @ ..] if !rest.is_empty() => rest,
+            encoded => encoded,
+        }
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.encoded == [0]
+    }
+
+    pub fn to_u64(&self) -> Result<u64, DerError> {
+        let bytes = self.magnitude();
+        if bytes.len() > 8 {
+            return Err(DerError::BadInteger);
+        }
+        Ok(bytes
+            .iter()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)))
+    }
+}
+
+impl<'a> BitString<'a> {
+    pub fn from_bytes(contents: &'a [u8]) -> Result<Self, DerError> {
+        let (&unused_bits, bytes) = contents.split_first().ok_or(DerError::BadBitString)?;
+        if unused_bits > 7
+            || bytes.is_empty() && unused_bits != 0
+            || unused_bits != 0
+                && bytes
+                    .last()
+                    .is_some_and(|last| last & ((1 << unused_bits) - 1) != 0)
+        {
+            return Err(DerError::BadBitString);
+        }
+        Ok(Self { contents })
+    }
+
+    pub fn as_bytes(&self) -> &'a [u8] {
+        &self.contents[1..]
+    }
+
+    pub fn unused_bits(self) -> u8 {
+        self.contents[0]
+    }
+
+    pub fn octets(self) -> Result<&'a [u8], DerError> {
+        if self.unused_bits() == 0 {
+            Ok(self.as_bytes())
+        } else {
+            Err(DerError::BadBitString)
+        }
+    }
+}
+
 impl<'a> Tlv<'a> {
     pub fn parse_one(input: &'a [u8]) -> Result<(Self, &'a [u8]), DerError> {
         let &tag_byte = input.first().ok_or(DerError::Underflow)?;
+        if tag_byte == 0 || tag_byte & 0x1f == 0x1f {
+            return Err(DerError::BadTag);
+        }
         let tag = Tag(tag_byte);
         let after_tag = &input[1..];
         let (length, after_length) = Self::parse_length(after_tag)?;
@@ -147,92 +288,5 @@ impl<'a> Tlv<'a> {
             return Err(DerError::BadLength);
         }
         Ok((len, rest))
-    }
-
-    pub fn integer_be(contents: &[u8]) -> Result<&[u8], DerError> {
-        if contents.is_empty() {
-            return Err(DerError::BadInteger);
-        }
-        if contents.len() >= 2 && contents[0] == 0 && contents[1] & 0x80 == 0 {
-            return Err(DerError::BadInteger);
-        }
-        if contents[0] & 0x80 != 0 {
-            return Err(DerError::BadInteger);
-        }
-        if contents.len() > 1 && contents[0] == 0 {
-            Ok(&contents[1..])
-        } else {
-            Ok(contents)
-        }
-    }
-
-    pub fn integer_u64(contents: &[u8]) -> Result<u64, DerError> {
-        let bytes = Self::integer_be(contents)?;
-        if bytes.len() > 8 {
-            return Err(DerError::BadInteger);
-        }
-        let mut v = 0u64;
-        for &b in bytes {
-            v = (v << 8) | (b as u64);
-        }
-        Ok(v)
-    }
-
-    pub fn bit_string(contents: &[u8]) -> Result<&[u8], DerError> {
-        let &unused = contents.first().ok_or(DerError::BadBitString)?;
-        if unused > 7 {
-            return Err(DerError::BadBitString);
-        }
-        if unused != 0 {
-            return Err(DerError::BadBitString);
-        }
-        Ok(&contents[1..])
-    }
-
-    pub fn oid(contents: &[u8]) -> Result<vec::Vec<u32>, DerError> {
-        if contents.is_empty() {
-            return Err(DerError::BadOid);
-        }
-        let mut out = vec::Vec::with_capacity(8);
-        let first = contents[0] as u32;
-        out.push(first / 40);
-        out.push(first % 40);
-        let mut i = 1;
-        while i < contents.len() {
-            if contents[i] == 0x80 {
-                return Err(DerError::BadOid);
-            }
-            let mut value: u32 = 0;
-            let mut bits = 0u32;
-            loop {
-                let b = contents[i];
-                i += 1;
-                bits += 7;
-                if bits > 32 {
-                    return Err(DerError::BadOid);
-                }
-                value = (value << 7) | ((b & 0x7f) as u32);
-                if b & 0x80 == 0 {
-                    break;
-                }
-                if i >= contents.len() {
-                    return Err(DerError::BadOid);
-                }
-            }
-            out.push(value);
-        }
-        Ok(out)
-    }
-
-    pub fn oid_eq(contents: &[u8], expected: &[u8]) -> bool {
-        contents == expected
-    }
-
-    pub fn boolean(contents: &[u8]) -> Result<bool, DerError> {
-        match contents {
-            [0x00] => Ok(false),
-            [0xff] => Ok(true),
-            _ => Err(DerError::BadBool),
-        }
     }
 }

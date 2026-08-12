@@ -7,15 +7,58 @@ pub mod spki;
 
 pub use hostname::Hostname;
 
+/// A certificate representation selected by TLS certificate-type negotiation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateType {
+    X509 = 0,
+    RawPublicKey = 2,
+}
+
+impl CertificateType {
+    pub const fn wire_id(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) const fn from_wire_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::X509),
+            2 => Some(Self::RawPublicKey),
+            _ => None,
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<CertificateType>() == 1);
+const _: () = assert!(core::mem::size_of::<Option<CertificateType>>() == 1);
+
+/// Signed UNIX seconds, including pre-epoch X.509 validity bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct UnixTime(pub u64);
+pub struct UnixTime(pub i64);
 
 impl UnixTime {
-    pub fn from_time_value(tv: &cert::TimeValue<'_>) -> Result<Self, cert::Error> {
+    /// Converts non-negative seconds, saturating beyond the signed domain.
+    pub const fn from_secs(seconds: u64) -> Self {
+        if seconds > i64::MAX as u64 {
+            Self(i64::MAX)
+        } else {
+            Self(seconds as i64)
+        }
+    }
+
+    pub const fn as_secs(&self) -> Option<u64> {
+        if self.0 < 0 {
+            None
+        } else {
+            Some(self.0 as u64)
+        }
+    }
+
+    pub(crate) fn from_x509(tag: asn1::Tag, bytes: &[u8]) -> Result<Self, cert::Error> {
         use crate::identity::asn1::Tag;
-        match tv.tag {
-            Tag::UTC_TIME => Self::from_utc(tv.bytes),
-            Tag::GENERALIZED_TIME => Self::from_generalized(tv.bytes),
+        match tag {
+            Tag::UTC_TIME => Self::from_utc(bytes),
+            Tag::GENERALIZED_TIME => Self::from_generalized(bytes),
             _ => Err(cert::Error::BadValidity),
         }
     }
@@ -31,7 +74,7 @@ impl UnixTime {
         let hour = Self::digit2(&bytes[6..8])?;
         let min = Self::digit2(&bytes[8..10])?;
         let sec = Self::digit2(&bytes[10..12])?;
-        Self::to_unix(year, month, day, hour, min, sec).map(Self)
+        Self::from_components(year, month, day, hour, min, sec)
     }
 
     fn from_generalized(bytes: &[u8]) -> Result<Self, cert::Error> {
@@ -39,12 +82,15 @@ impl UnixTime {
             return Err(cert::Error::BadValidity);
         }
         let year = Self::digit4(&bytes[0..4])?;
+        if year < 2050 {
+            return Err(cert::Error::BadValidity);
+        }
         let month = Self::digit2(&bytes[4..6])?;
         let day = Self::digit2(&bytes[6..8])?;
         let hour = Self::digit2(&bytes[8..10])?;
         let min = Self::digit2(&bytes[10..12])?;
         let sec = Self::digit2(&bytes[12..14])?;
-        Self::to_unix(year, month, day, hour, min, sec).map(Self)
+        Self::from_components(year, month, day, hour, min, sec)
     }
 
     fn digit2(b: &[u8]) -> Result<u32, cert::Error> {
@@ -65,15 +111,15 @@ impl UnixTime {
         Ok(v)
     }
 
-    fn to_unix(
+    fn from_components(
         year: u32,
         month: u32,
         day: u32,
         hour: u32,
         min: u32,
         sec: u32,
-    ) -> Result<u64, cert::Error> {
-        if !(1970..=9999).contains(&year)
+    ) -> Result<Self, cert::Error> {
+        if !(1950..=9999).contains(&year)
             || !(1..=12).contains(&month)
             || day < 1
             || hour > 23
@@ -90,28 +136,27 @@ impl UnixTime {
         if day > month_days {
             return Err(cert::Error::BadValidity);
         }
-        let mut days: u64 = 0;
-        for y in 1970..year {
-            days += if Self::is_leap(y) { 366 } else { 365 };
+
+        const DAYS_BEFORE_MONTH: [i64; 12] =
+            [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        let years = i64::from(year) - 1970;
+        let mut days = years * 365 + Self::leaps_before(year) - Self::leaps_before(1970);
+        days += DAYS_BEFORE_MONTH[(month - 1) as usize];
+        if month > 2 && Self::is_leap(year) {
+            days += 1;
         }
-        let mom = [31u64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for (i, d) in mom.iter().enumerate() {
-            if (i as u32) + 1 < month {
-                days += d;
-                if i == 1 && Self::is_leap(year) {
-                    days += 1;
-                }
-            }
-        }
-        if day == 0 {
-            return Err(cert::Error::BadValidity);
-        }
-        days += (day as u64) - 1;
-        let secs = days * 86_400 + (hour as u64) * 3_600 + (min as u64) * 60 + (sec as u64);
-        Ok(secs)
+        days += i64::from(day - 1);
+        Ok(Self(
+            days * 86_400 + i64::from(hour) * 3_600 + i64::from(min) * 60 + i64::from(sec),
+        ))
     }
 
     fn is_leap(y: u32) -> bool {
         (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+    }
+
+    fn leaps_before(year: u32) -> i64 {
+        let year = year - 1;
+        i64::from(year / 4 - year / 100 + year / 400)
     }
 }

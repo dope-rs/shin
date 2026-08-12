@@ -13,12 +13,16 @@ pub use plaintext::Plaintext;
 
 pub const PROTOCOL_VERSION: u16 = 0x0303;
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CipherSuite {
     Aes128GcmSha256,
     ChaCha20Poly1305Sha256,
     Aes256GcmSha384,
 }
+
+const _: () = assert!(core::mem::size_of::<CipherSuite>() == 1);
+const _: () = assert!(core::mem::size_of::<Option<CipherSuite>>() == 1);
 
 impl CipherSuite {
     /// Server preference order (AES-128 first keeps embedders that hardcode it

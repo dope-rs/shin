@@ -27,7 +27,7 @@ fn server() -> Server<FixedClock> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET).unwrap()),
             accept_early_data: false,
         },
         FixedClock(1_000_000),
@@ -42,7 +42,6 @@ fn client(suites: &[CipherSuite]) -> Client<fn() -> u64> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         (|| 0) as fn() -> u64,
@@ -99,11 +98,6 @@ fn sha384_session_emits_no_ticket() {
             .any(|e| matches!(e, Event::NewSessionTicket { .. })),
         "SHA-384 sessions are not resumable; the server must issue no ticket",
     );
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, Event::ResumptionSecret { .. })),
-    );
 }
 
 #[test]
@@ -138,12 +132,18 @@ fn client_rejects_server_hello_with_unoffered_suite() {
     );
 }
 
-fn strip_key_share(ch_bytes: &[u8]) -> Vec<u8> {
+fn empty_key_share(ch_bytes: &[u8]) -> Vec<u8> {
     let mut r = Reader::new(ch_bytes);
-    let Frame::ClientHello(mut ch) = Frame::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(mut ch) = crate::decode_owned(&mut r).unwrap() else {
         panic!("not a ClientHello");
     };
-    ch.extensions.retain(|e| e.ty != Type::KEY_SHARE);
+    let key_share = ch
+        .extensions
+        .iter_mut()
+        .find(|extension| extension.ty == Type::KEY_SHARE)
+        .expect("ClientHello has key_share");
+    key_share.data.clear();
+    key_share.data.extend_from_slice(&0u16.to_be_bytes());
     let mut out = Vec::new();
     Frame::ClientHello(ch).encode(&mut out).unwrap();
     out
@@ -151,7 +151,7 @@ fn strip_key_share(ch_bytes: &[u8]) -> Vec<u8> {
 
 fn server_hello_random(blob: &[u8]) -> [u8; 32] {
     let mut r = Reader::new(blob);
-    let Frame::ServerHello(sh) = Frame::decode(&mut r).unwrap() else {
+    let Frame::ServerHello(sh) = crate::decode_owned(&mut r).unwrap() else {
         panic!("not a ServerHello");
     };
     sh.random
@@ -163,12 +163,12 @@ fn server_hrr_then_recovers_under_sha384() {
     let mut c = client(&[CipherSuite::Aes256GcmSha384]);
     let ch = send(&c.start().unwrap(), Epoch::Plaintext);
 
-    let hrr_events = s.read(Epoch::Plaintext, &strip_key_share(&ch)).unwrap();
+    let hrr_events = s.read(Epoch::Plaintext, &empty_key_share(&ch)).unwrap();
     let hrr = send(&hrr_events, Epoch::Plaintext);
     assert_eq!(
         server_hello_random(&hrr),
         HELLO_RETRY_REQUEST_RANDOM,
-        "key_share-less ClientHello must draw an HRR even under SHA-384",
+        "an empty key_share vector must draw an HRR even under SHA-384",
     );
 
     let retry = s.read(Epoch::Plaintext, &ch).unwrap();

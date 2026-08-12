@@ -1,9 +1,11 @@
+use crate::client;
 use crate::crypto::material;
 use crate::crypto::{hash, kdf};
 use crate::wire::alert;
 use crate::wire::codec;
+use crate::wire::handshake;
 use crate::wire::record;
-use core::fmt;
+use core::{fmt, marker};
 
 use crate::identity::cert;
 use crate::identity::chain;
@@ -69,6 +71,7 @@ pub enum Error {
     BadCertificateVerify,
     ClientCertRequired,
     AccessDenied,
+    BadPskBinder,
     BadFinished,
     Kx,
     Sig,
@@ -112,7 +115,9 @@ impl Error {
             Self::BadCertificateChain(_) => Description::BadCertificate,
             Self::ClientCertRequired => Description::CertificateRequired,
             Self::AccessDenied => Description::AccessDenied,
-            Self::BadCertificateVerify | Self::BadFinished => Description::DecryptError,
+            Self::BadCertificateVerify | Self::BadPskBinder | Self::BadFinished => {
+                Description::DecryptError
+            }
             Self::Kx => Description::IllegalParameter,
             Self::Sig
             | Self::Spki
@@ -192,18 +197,11 @@ pub enum Event<'a> {
         direction: KeyDirection,
         secret: &'a material::TrafficSecret,
     },
-    NewSessionTicket {
-        ticket_lifetime: u32,
-        ticket_age_add: u32,
-        ticket_nonce: &'a [u8],
-        ticket: &'a [u8],
-        max_early_data: Option<u32>,
-    },
-    ResumptionSecret {
-        psk: &'a material::ResumptionPsk,
-    },
+    NewSessionTicket(client::Ticket<'a>),
     ZeroRttKeysReady {
         secret: &'a material::TrafficSecret,
+        max_early_data: u32,
+        alpn: Option<&'a [u8]>,
     },
     EarlyDataAccepted,
     EarlyDataRejected,
@@ -214,11 +212,15 @@ pub enum Event<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EventContext {
     cipher_suite: Option<record::CipherSuite>,
+    key_update_response_requested: bool,
 }
 
 impl EventContext {
     pub(crate) fn new(cipher_suite: Option<record::CipherSuite>) -> Self {
-        Self { cipher_suite }
+        Self {
+            cipher_suite,
+            key_update_response_requested: false,
+        }
     }
 
     pub(crate) fn emit<S: EventSink + ?Sized>(
@@ -230,9 +232,32 @@ impl EventContext {
             .map_err(DriveError::Sink)
     }
 
-    /// The negotiated record-protection suite, when negotiation has completed.
+    /// The record-protection suite negotiated for the connection or authorized
+    /// by a resumption ticket for this 0-RTT event.
     pub fn cipher_suite(self) -> Option<record::CipherSuite> {
         self.cipher_suite
+    }
+
+    /// Whether this KeyUpdate event came from a peer request that requires a
+    /// reciprocal update.
+    pub fn key_update_response_requested(self) -> bool {
+        self.key_update_response_requested
+    }
+
+    fn emit_key_update<S: EventSink + ?Sized>(
+        sink: &mut S,
+        cipher_suite: Option<record::CipherSuite>,
+        event: Event<'_>,
+        response_requested: bool,
+    ) -> Result<(), DriveError<S::Error>> {
+        sink.event(
+            event,
+            Self {
+                cipher_suite,
+                key_update_response_requested: response_requested,
+            },
+        )
+        .map_err(DriveError::Sink)
     }
 }
 
@@ -275,6 +300,96 @@ pub trait EventSink {
     fn event(&mut self, event: Event<'_>, context: EventContext) -> Result<(), Self::Error>;
 }
 
+pub(crate) trait KeyUpdateRole {
+    const READ_SIDE: material::Side;
+    const WRITE_SIDE: material::Side;
+}
+
+pub(crate) struct ClientRole;
+
+impl KeyUpdateRole for ClientRole {
+    const READ_SIDE: material::Side = material::Side::Server;
+    const WRITE_SIDE: material::Side = material::Side::Client;
+}
+
+pub(crate) struct ServerRole;
+
+impl KeyUpdateRole for ServerRole {
+    const READ_SIDE: material::Side = material::Side::Client;
+    const WRITE_SIDE: material::Side = material::Side::Server;
+}
+
+pub(crate) struct KeyUpdateCore<'traffic, R> {
+    traffic: &'traffic mut material::State,
+    role: marker::PhantomData<R>,
+}
+
+impl<'traffic, R: KeyUpdateRole> KeyUpdateCore<'traffic, R> {
+    pub(crate) fn new(traffic: &'traffic mut material::State) -> Self {
+        Self {
+            traffic,
+            role: marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn receive<S: EventSink + ?Sized>(
+        &mut self,
+        request: handshake::KeyUpdateRequest,
+        events: &mut S,
+    ) -> Result<(), DriveError<S::Error>> {
+        if !self.traffic.consume_update() {
+            return Err(Error::UnexpectedMessage.into());
+        }
+        let suite = self.traffic.suite();
+        let secret = self.traffic.advance(R::READ_SIDE)?;
+        EventContext::emit_key_update(
+            events,
+            suite,
+            Event::KeyUpdate {
+                direction: KeyDirection::Read,
+                secret,
+            },
+            request == handshake::KeyUpdateRequest::Requested,
+        )?;
+        if request == handshake::KeyUpdateRequest::Requested {
+            self.traffic.request_key_update_response();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send<S: EventSink + ?Sized>(
+        &mut self,
+        request: handshake::KeyUpdateRequest,
+        events: &mut S,
+    ) -> Result<(), DriveError<S::Error>> {
+        use crate::wire::handshake::messages::KeyUpdate;
+
+        let suite = self.traffic.suite();
+        let bytes = KeyUpdate { request }.encode_framed();
+        EventContext::emit(
+            events,
+            suite,
+            Event::Send {
+                epoch: Epoch::Application,
+                data: &bytes,
+            },
+        )?;
+        let secret = self.traffic.advance(R::WRITE_SIDE)?;
+        EventContext::emit(
+            events,
+            suite,
+            Event::KeyUpdate {
+                direction: KeyDirection::Write,
+                secret,
+            },
+        )?;
+        if request == handshake::KeyUpdateRequest::NotRequested {
+            self.traffic.clear_key_update_response();
+        }
+        Ok(())
+    }
+}
+
 /// Redacts secret material from logs as required by RFC 8446 §C.2.
 impl fmt::Debug for Event<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -301,25 +416,16 @@ impl fmt::Debug for Event<'_> {
                 .field("direction", direction)
                 .field("secret", &REDACTED)
                 .finish(),
-            Self::NewSessionTicket {
-                ticket_lifetime,
-                ticket_age_add,
+            Self::NewSessionTicket(ticket) => ticket.fmt(f),
+            Self::ZeroRttKeysReady {
                 max_early_data,
+                alpn,
                 ..
             } => f
-                .debug_struct("NewSessionTicket")
-                .field("ticket_lifetime", ticket_lifetime)
-                .field("ticket_age_add", ticket_age_add)
-                .field("max_early_data", max_early_data)
-                .field("ticket", &REDACTED)
-                .finish(),
-            Self::ResumptionSecret { .. } => f
-                .debug_struct("ResumptionSecret")
-                .field("psk", &REDACTED)
-                .finish(),
-            Self::ZeroRttKeysReady { .. } => f
                 .debug_struct("ZeroRttKeysReady")
                 .field("secret", &REDACTED)
+                .field("max_early_data", max_early_data)
+                .field("alpn", alpn)
                 .finish(),
             Self::EarlyDataAccepted => f.write_str("EarlyDataAccepted"),
             Self::EarlyDataRejected => f.write_str("EarlyDataRejected"),

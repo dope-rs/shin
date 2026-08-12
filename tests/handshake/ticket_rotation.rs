@@ -1,6 +1,6 @@
 use ring::rand::SystemRandom;
 use shin::client::Client;
-use shin::client::config::{Config, Resumption, Verifier};
+use shin::client::config::{Config, Restore, Verifier};
 use shin::connection::Epoch;
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::{Keys, Rotator};
@@ -31,20 +31,25 @@ fn server_with(keys: Option<Keys>, now_ms: u64) -> Server<FixedClock> {
     )
 }
 
-fn fresh_client(resumption: Option<Resumption>) -> Client<fn() -> u64> {
-    Client::new(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: *signing_key().pubkey().unwrap(),
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption,
-            enable_early_data: false,
+fn fresh_client(restore: Option<Restore<'_>>) -> Client<fn() -> u64> {
+    let template = Config {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: *signing_key().pubkey().unwrap(),
         },
-        (|| 0) as fn() -> u64,
-    )
-    .unwrap()
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        enable_early_data: false,
+    }
+    .try_into_template()
+    .unwrap();
+    let prepared = match restore {
+        Some(restore) => template.restore(restore).unwrap(),
+        None => template.without_resumption(),
+    };
+    let workspace = prepared.workspace_layout(None).allocate();
+    prepared
+        .try_into_client_with_workspace(None, (|| 0) as fn() -> u64, workspace)
+        .unwrap()
 }
 
 fn full_handshake(client: &mut Client<fn() -> u64>, server: &mut Server<FixedClock>) -> Vec<Event> {
@@ -69,30 +74,29 @@ fn full_handshake(client: &mut Client<fn() -> u64>, server: &mut Server<FixedClo
     client_events
 }
 
-fn ticket_from(events: &[Event]) -> Option<Resumption> {
-    let mut psk = None;
+fn ticket_from(events: &[Event]) -> Option<Restore<'static>> {
     for e in events {
-        if let Event::ResumptionSecret { psk: p } = e {
-            psk = Some(*p);
-        }
         if let Event::NewSessionTicket {
+            psk,
+            ticket_lifetime,
             ticket_age_add,
             ticket,
             ..
         } = e
         {
-            return Some(Resumption::new(psk?, ticket.clone(), *ticket_age_add, 0));
+            return Restore::try_new(*psk, ticket.clone(), *ticket_age_add, 0, *ticket_lifetime)
+                .ok();
         }
     }
     None
 }
 
-fn server_resumed(server: &mut Server<FixedClock>, resumption: Resumption) -> bool {
+fn server_resumed(server: &mut Server<FixedClock>, restore: Restore<'_>) -> bool {
     use shin::wire::codec::Reader;
     use shin::wire::handshake::Type;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::frame::MessageRef;
 
-    let mut client = fresh_client(Some(resumption));
+    let mut client = fresh_client(Some(restore));
     let c1 = client.start().unwrap();
     let ch = find_send(&c1, Epoch::Plaintext).unwrap();
     let s1 = server.read(Epoch::Plaintext, &ch).unwrap();
@@ -101,7 +105,7 @@ fn server_resumed(server: &mut Server<FixedClock>, resumption: Resumption) -> bo
     let mut r = Reader::new(&s_hs);
     let mut saw_cert = false;
     while !r.is_empty() {
-        let m = Frame::decode(&mut r).unwrap();
+        let m = MessageRef::decode_from(&mut r).unwrap();
         if m.msg_type() == Type::Certificate {
             saw_cert = true;
         }
@@ -113,25 +117,31 @@ fn server_resumed(server: &mut Server<FixedClock>, resumption: Resumption) -> bo
 #[test]
 fn expired_ticket_is_rejected_even_without_early_data_guard() {
     const ISSUE_MS: u64 = 1_000_000;
-    let mut issuing = server_with(Some(Keys::single(TICKET_SECRET)), ISSUE_MS);
+    let mut issuing = server_with(Some(Keys::single(TICKET_SECRET).unwrap()), ISSUE_MS);
     let mut client = fresh_client(None);
     let events = full_handshake(&mut client, &mut issuing);
     let stale_resumption = ticket_from(&events).expect("ticket issued");
 
-    let mut issuing = server_with(Some(Keys::single(TICKET_SECRET)), ISSUE_MS);
+    let mut issuing = server_with(Some(Keys::single(TICKET_SECRET).unwrap()), ISSUE_MS);
     let mut client = fresh_client(None);
     let events = full_handshake(&mut client, &mut issuing);
     let fresh_resumption = ticket_from(&events).expect("second ticket issued");
 
     // Past lifetime (7200s) plus skew -> must not resume.
-    let mut stale = server_with(Some(Keys::single(TICKET_SECRET)), ISSUE_MS + 7_300_000);
+    let mut stale = server_with(
+        Some(Keys::single(TICKET_SECRET).unwrap()),
+        ISSUE_MS + 7_300_000,
+    );
     assert!(
         !server_resumed(&mut stale, stale_resumption),
         "expired ticket must force a full handshake",
     );
 
     // Well inside lifetime -> resumes.
-    let mut fresh = server_with(Some(Keys::single(TICKET_SECRET)), ISSUE_MS + 60_000);
+    let mut fresh = server_with(
+        Some(Keys::single(TICKET_SECRET).unwrap()),
+        ISSUE_MS + 60_000,
+    );
     assert!(
         server_resumed(&mut fresh, fresh_resumption),
         "fresh ticket must resume",

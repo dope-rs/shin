@@ -28,7 +28,7 @@ impl Rotator {
         let mut current = [0u8; 32];
         rng.fill(&mut current).map_err(|_| ticket::Error::BadKey)?;
         Ok(Self {
-            current: ticket::Secret::new(current),
+            current: ticket::Secret::new(current)?,
             previous: None,
             schedule: Schedule {
                 current_since_ms: now_ms,
@@ -65,7 +65,8 @@ impl Rotator {
     fn rotate(&mut self, rng: &impl rand::SecureRandom, now_ms: u64) -> Result<(), ticket::Error> {
         let mut next = [0u8; 32];
         rng.fill(&mut next).map_err(|_| ticket::Error::BadKey)?;
-        self.previous = Some(mem::replace(&mut self.current, ticket::Secret::new(next)));
+        let next = ticket::Secret::new(next)?;
+        self.previous = Some(mem::replace(&mut self.current, next));
         self.schedule.current_since_ms = now_ms;
         self.schedule.issued_under_current = 0;
         Ok(())

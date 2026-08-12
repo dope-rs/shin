@@ -1,20 +1,21 @@
 use std::convert::Infallible;
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::OnceLock;
 
 use ring::rand::{SecureRandom, SystemRandom};
 
+use shin::client::config::{NegotiatedAlpn, Restore};
 use shin::connection::{
     self, Clock, DriveError, Epoch, Error, EventContext, EventSink, KeyDirection,
 };
 use shin::crypto::hash::Digest;
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::Keys;
+use shin::identity::cert::Cert;
 use shin::server::{
     self, ReplayDomain, Shard, config, config::CertSource, config::ClientAuth,
-    config::ClientCertVerifier, config::Connection, config::EarlyDataGuard, config::NoClientAuth,
-    config::NoGuard,
+    config::ClientAuthVerifier, config::ClientCertVerifier, config::Connection,
+    config::EarlyDataGuard, config::NoClientAuth, config::NoGuard,
 };
 use shin::transport::Mode;
 
@@ -24,6 +25,16 @@ pub fn replay_domain() -> ReplayDomain {
     REPLAY_DOMAIN
         .get_or_init(|| ReplayDomain::random().expect("test replay domain"))
         .clone()
+}
+
+pub fn cert_validity_midpoint(cert_der: &[u8]) -> u64 {
+    let validity = Cert::parse(cert_der)
+        .expect("test certificate parses")
+        .tbs
+        .validity;
+    shin::identity::UnixTime((validity.not_before.0 + validity.not_after.0) / 2)
+        .as_secs()
+        .expect("test certificate validity is after the UNIX epoch")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,19 +59,53 @@ pub enum Event {
     NewSessionTicket {
         ticket_lifetime: u32,
         ticket_age_add: u32,
-        ticket_nonce: Vec<u8>,
         ticket: Vec<u8>,
-        max_early_data: Option<u32>,
-    },
-    ResumptionSecret {
         psk: [u8; 32],
+        max_early_data: Option<u32>,
+        suite: shin::wire::record::CipherSuite,
+        transport_mode: shin::transport::Mode,
+        alpn: Option<Vec<u8>>,
     },
     ZeroRttKeysReady {
         secret: Digest,
+        max_early_data: u32,
+        alpn: Option<Vec<u8>>,
     },
     EarlyDataAccepted,
     EarlyDataRejected,
     Done,
+}
+
+impl Event {
+    pub fn into_restore(self) -> Option<Restore<'static>> {
+        let Self::NewSessionTicket {
+            ticket_lifetime,
+            ticket_age_add,
+            ticket,
+            psk,
+            max_early_data,
+            suite,
+            transport_mode,
+            alpn,
+        } = self
+        else {
+            return None;
+        };
+        let restore = Restore::try_new(psk, ticket, ticket_age_add, 0, ticket_lifetime).ok()?;
+        match max_early_data {
+            Some(maximum) => restore
+                .try_with_early_data(
+                    maximum,
+                    suite,
+                    transport_mode,
+                    alpn.map_or(NegotiatedAlpn::Absent, |protocol| {
+                        NegotiatedAlpn::Protocol(protocol.into())
+                    }),
+                )
+                .ok(),
+            None => Some(restore),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -96,24 +141,30 @@ impl EventSink for Events {
                 direction,
                 secret: Digest::try_from_slice(secret.as_slice()).unwrap(),
             },
-            connection::Event::NewSessionTicket {
-                ticket_lifetime,
-                ticket_age_add,
-                ticket_nonce,
-                ticket,
+            connection::Event::NewSessionTicket(ticket) => {
+                let suite = ticket.cipher_suite();
+                let transport_mode = ticket.transport_mode();
+                let alpn = ticket.alpn().map(<[u8]>::to_vec);
+                let resumption = ticket.try_retain().unwrap();
+                Event::NewSessionTicket {
+                    ticket_lifetime: resumption.ticket_lifetime_secs(),
+                    ticket_age_add: resumption.ticket_age_add(),
+                    ticket: resumption.ticket().to_vec(),
+                    psk: *resumption.psk().as_array(),
+                    max_early_data: resumption.max_early_data(),
+                    suite,
+                    transport_mode,
+                    alpn,
+                }
+            }
+            connection::Event::ZeroRttKeysReady {
+                secret,
                 max_early_data,
-            } => Event::NewSessionTicket {
-                ticket_lifetime,
-                ticket_age_add,
-                ticket_nonce: ticket_nonce.to_vec(),
-                ticket: ticket.to_vec(),
-                max_early_data,
-            },
-            connection::Event::ResumptionSecret { psk } => Event::ResumptionSecret {
-                psk: *psk.as_array(),
-            },
-            connection::Event::ZeroRttKeysReady { secret } => Event::ZeroRttKeysReady {
+                alpn,
+            } => Event::ZeroRttKeysReady {
                 secret: Digest::try_from_slice(secret.as_slice()).unwrap(),
+                max_early_data,
+                alpn: alpn.map(<[u8]>::to_vec),
             },
             connection::Event::EarlyDataAccepted => Event::EarlyDataAccepted,
             connection::Event::EarlyDataRejected => Event::EarlyDataRejected,
@@ -150,28 +201,29 @@ impl<C: Clock> CollectEvents for shin::client::Client<C> {
     }
 }
 
-pub trait CollectServerEvents<G: EarlyDataGuard, V: ClientCertVerifier> {
-    fn read(
-        &mut self,
-        epoch: Epoch,
-        data: &[u8],
-        shard: &mut Shard<G, V>,
-    ) -> Result<Vec<Event>, Error>;
+pub trait CollectServerEvents {
+    fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error>;
 }
 
-impl<C, G, V> CollectServerEvents<G, V> for server::Server<C>
+impl<C, G, V, const DOMAIN: u8> CollectServerEvents for server::Connection<'_, C, G, V, DOMAIN>
 where
     C: Clock,
     G: EarlyDataGuard,
     V: ClientCertVerifier,
 {
-    fn read(
-        &mut self,
-        epoch: Epoch,
-        data: &[u8],
-        shard: &mut Shard<G, V>,
-    ) -> Result<Vec<Event>, Error> {
-        collect(|events| self.read_into(epoch, data, shard, events))
+    fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
+        collect(|events| self.read_into(epoch, data, events))
+    }
+}
+
+impl<C, G, V, const DOMAIN: u8> CollectServerEvents for server::OwnedConnection<C, G, V, DOMAIN>
+where
+    C: Clock,
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
+        collect(|events| self.read_into(epoch, data, events))
     }
 }
 
@@ -238,19 +290,17 @@ impl ServerConfig {
     }
 }
 
-trait Policy<C: Clock> {
-    fn read(
-        &mut self,
-        connection: &mut server::Server<C>,
-        epoch: Epoch,
-        data: &[u8],
-        events: &mut Events,
-    ) -> Result<(), DriveError<Infallible>>;
+enum Policy<C, G, V>
+where
+    C: Clock,
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    Configured(server::OwnedConnection<C, G, V>),
+    Default(server::OwnedConnection<C>),
 }
 
-struct OwnedShard<G: EarlyDataGuard, V: ClientCertVerifier>(Shard<G, V>);
-
-impl<C, G, V> Policy<C> for OwnedShard<G, V>
+impl<C, G, V> Policy<C, G, V>
 where
     C: Clock,
     G: EarlyDataGuard,
@@ -258,19 +308,52 @@ where
 {
     fn read(
         &mut self,
-        connection: &mut server::Server<C>,
         epoch: Epoch,
         data: &[u8],
         events: &mut Events,
     ) -> Result<(), DriveError<Infallible>> {
-        connection.read_into(epoch, data, &mut self.0, events)
+        match self {
+            Self::Configured(connection) => connection.read_into(epoch, data, events),
+            Self::Default(connection) => connection.read_into(epoch, data, events),
+        }
+    }
+
+    fn server(&self) -> &server::Server<C> {
+        match self {
+            Self::Configured(connection) => connection,
+            Self::Default(connection) => connection,
+        }
+    }
+
+    fn note_early_data(&mut self, len: usize) -> Result<(), Error> {
+        match self {
+            Self::Configured(connection) => connection.note_early_data(len),
+            Self::Default(connection) => connection.note_early_data(len),
+        }
+    }
+
+    fn key_updates(&mut self) -> server::Updates<'_, C, 0> {
+        match self {
+            Self::Configured(connection) => connection.key_updates(),
+            Self::Default(connection) => connection.key_updates(),
+        }
+    }
+
+    fn selected_alpn(&self) -> Option<&[u8]> {
+        match self {
+            Self::Configured(connection) => connection.selected_alpn(),
+            Self::Default(connection) => connection.selected_alpn(),
+        }
     }
 }
 
-pub struct Server<C: Clock, G = NoGuard, V = NoClientAuth> {
-    connection: server::Server<C>,
-    policy: Box<dyn Policy<C>>,
-    _types: PhantomData<fn() -> (G, V)>,
+pub struct Server<C, G = NoGuard, V = NoClientAuth>
+where
+    C: Clock,
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    policy: Policy<C, G, V>,
 }
 
 impl<C: Clock> Server<C> {
@@ -280,11 +363,11 @@ impl<C: Clock> Server<C> {
 
     pub fn new_with_transport(config: ServerConfig, transport_mode: Mode, clock: C) -> Self {
         let (shard_config, connection_config, _) = config.split();
-        Self::build(
+        Self::configured(
             connection_config,
             transport_mode,
             clock,
-            OwnedShard(Shard::new(shard_config)),
+            Shard::new(shard_config).unwrap(),
         )
     }
 }
@@ -292,7 +375,7 @@ impl<C: Clock> Server<C> {
 impl<C, G> Server<C, G>
 where
     C: Clock,
-    G: EarlyDataGuard + 'static,
+    G: EarlyDataGuard,
 {
     pub fn with_early_data_guard(config: ServerConfig, clock: C, guard: G) -> Self {
         Self::with_early_data_guard_and_transport(config, Mode::Tls, clock, guard)
@@ -305,72 +388,107 @@ where
         guard: G,
     ) -> Self {
         let (shard_config, connection_config, accept_early_data) = config.split();
-        let connection =
-            server::Server::new_with_transport(connection_config, transport_mode, clock);
-        let policy: Box<dyn Policy<C>> = if accept_early_data {
-            Box::new(OwnedShard(Shard::with_early_data_guard_in_replay_domain(
-                shard_config,
-                replay_domain(),
-                guard,
-            )))
+        let policy = if accept_early_data {
+            Self::bind_configured(
+                connection_config,
+                transport_mode,
+                clock,
+                Shard::with_early_data_guard_in_replay_domain(shard_config, replay_domain(), guard)
+                    .unwrap(),
+            )
         } else {
-            Box::new(OwnedShard(Shard::new(shard_config)))
+            Self::bind_default(
+                connection_config,
+                transport_mode,
+                clock,
+                Shard::new(shard_config).unwrap(),
+            )
         };
-        Self {
-            connection,
-            policy,
-            _types: PhantomData,
-        }
+        Self { policy }
     }
 }
 
-impl<C, V> Server<C, NoGuard, V>
+impl<C, V> Server<C, NoGuard, ClientAuthVerifier<V>>
 where
     C: Clock,
-    V: ClientCertVerifier + 'static,
+    V: ClientCertVerifier,
 {
     pub fn with_client_auth(config: ServerConfig, clock: C, mode: ClientAuth, verifier: V) -> Self {
         let (shard_config, connection_config, _) = config.split();
-        Self::build(
+        Self::configured(
             connection_config,
             Mode::Tls,
             clock,
-            OwnedShard(Shard::with_client_auth(shard_config, mode, verifier)),
+            Shard::with_client_auth(shard_config, mode, verifier).unwrap(),
         )
     }
 }
 
-impl<C: Clock, G, V> Server<C, G, V> {
-    fn build<P>(connection_config: Connection, transport_mode: Mode, clock: C, policy: P) -> Self
-    where
-        P: Policy<C> + 'static,
-    {
+impl<C, G, V> Server<C, G, V>
+where
+    C: Clock,
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    fn bind_configured(
+        connection_config: Connection,
+        transport_mode: Mode,
+        clock: C,
+        shard: Shard<G, V>,
+    ) -> Policy<C, G, V> {
+        let server =
+            server::Server::new_with_transport(connection_config, transport_mode, clock).unwrap();
+        Policy::Configured(server::OwnedConnection::new(server, shard).unwrap())
+    }
+
+    fn bind_default(
+        connection_config: Connection,
+        transport_mode: Mode,
+        clock: C,
+        shard: Shard,
+    ) -> Policy<C, G, V> {
+        let server =
+            server::Server::new_with_transport(connection_config, transport_mode, clock).unwrap();
+        Policy::Default(server::OwnedConnection::new(server, shard).unwrap())
+    }
+
+    fn configured(
+        connection_config: Connection,
+        transport_mode: Mode,
+        clock: C,
+        shard: Shard<G, V>,
+    ) -> Self {
         Self {
-            connection: server::Server::new_with_transport(
-                connection_config,
-                transport_mode,
-                clock,
-            ),
-            policy: Box::new(policy),
-            _types: PhantomData,
+            policy: Self::bind_configured(connection_config, transport_mode, clock, shard),
         }
     }
 
     pub fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, Error> {
-        collect(|events| self.policy.read(&mut self.connection, epoch, data, events))
+        collect(|events| self.policy.read(epoch, data, events))
+    }
+
+    pub fn selected_alpn(&self) -> Option<&[u8]> {
+        self.policy.selected_alpn()
+    }
+
+    pub fn note_early_data(&mut self, len: usize) -> Result<(), Error> {
+        self.policy.note_early_data(len)
+    }
+
+    pub fn key_updates(&mut self) -> server::Updates<'_, C, 0> {
+        self.policy.key_updates()
     }
 }
 
-impl<C: Clock, G, V> Deref for Server<C, G, V> {
+impl<C, G, V> Deref for Server<C, G, V>
+where
+    C: Clock,
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
     type Target = server::Server<C>;
 
     fn deref(&self) -> &Self::Target {
-        &self.connection
-    }
-}
-
-impl<C: Clock, G, V> DerefMut for Server<C, G, V> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.connection
+        self.policy.server()
     }
 }

@@ -21,6 +21,45 @@ pub struct Reader<'a> {
     buf: &'a [u8],
 }
 
+/// A zero-copy TLS vector whose wire prefix, minimum payload length, and
+/// fixed-width element alignment have already been validated.
+#[derive(Clone, Copy)]
+pub(crate) struct FramedVector<'a, const MINIMUM: usize, const ALIGNMENT: usize> {
+    encoded: &'a [u8],
+}
+
+const _: () =
+    assert!(core::mem::size_of::<FramedVector<'_, 1, 1>>() == core::mem::size_of::<&[u8]>());
+
+impl<'a, const MINIMUM: usize, const ALIGNMENT: usize> FramedVector<'a, MINIMUM, ALIGNMENT> {
+    fn validate(encoded: &'a [u8]) -> Result<Self, DecodeError> {
+        if ALIGNMENT == 0 || encoded.len() < MINIMUM || !encoded.len().is_multiple_of(ALIGNMENT) {
+            return Err(DecodeError::InvalidEnum);
+        }
+        Ok(Self { encoded })
+    }
+
+    pub(crate) fn decode_u8(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        Self::validate(reader.vec_u8()?)
+    }
+
+    pub(crate) fn decode_u16(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        Self::validate(reader.vec_u16()?)
+    }
+
+    pub(crate) fn decode_u24(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        Self::validate(reader.vec_u24()?)
+    }
+
+    pub(crate) fn as_slice(&self) -> &'a [u8] {
+        self.encoded
+    }
+
+    pub(crate) fn reader(self) -> Reader<'a> {
+        Reader::new(self.encoded)
+    }
+}
+
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         Self { buf }
@@ -148,6 +187,10 @@ pub trait Encode {
     fn status(&self) -> Result<(), EncodeError>;
 }
 
+pub(crate) trait Reserve: Encode {
+    fn reserve_slice(&mut self, len: usize) -> Result<&mut [u8], EncodeError>;
+}
+
 /// A checked length-prefixed scope: dropping it rolls back, while
 /// [`finish`](Self::finish) reports wire-length overflow.
 #[must_use]
@@ -240,6 +283,12 @@ impl<E: Encode> Encode for LengthFrame<'_, E> {
 
     fn status(&self) -> Result<(), EncodeError> {
         self.target.status()
+    }
+}
+
+impl<E: Reserve> Reserve for LengthFrame<'_, E> {
+    fn reserve_slice(&mut self, len: usize) -> Result<&mut [u8], EncodeError> {
+        self.target.reserve_slice(len)
     }
 }
 

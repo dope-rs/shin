@@ -1,4 +1,6 @@
+use crate::connection;
 use crate::transport;
+use crate::wire::protocols;
 use alloc::rc;
 use alloc::vec;
 use core::mem;
@@ -6,15 +8,22 @@ use core::mem;
 mod error;
 mod identity;
 mod owned;
-mod resumption;
+mod restore;
+pub(crate) mod resumption;
+mod ticket;
+mod truststore;
 mod verifier;
 
 pub use error::Error;
 pub use identity::Identity;
 pub use identity::template::IdentityTemplate;
 pub use owned::trust::anchor::OwnedTrustAnchor;
+pub use restore::Restore;
+pub use restore::alpn::NegotiatedAlpn;
 pub use resumption::Resumption;
-pub use verifier::Verifier;
+pub use ticket::Ticket;
+pub use truststore::TrustStore;
+pub use verifier::{CertificateLimit, Verifier};
 
 pub const MAX_TRUST_ANCHORS: usize = 256;
 
@@ -22,13 +31,10 @@ pub struct Config {
     pub verifier: Verifier,
     pub transport_params: vec::Vec<u8>,
     pub alpn_protocols: vec::Vec<vec::Vec<u8>>,
-    pub resumption: Option<Resumption>,
     pub enable_early_data: bool,
 }
 
-/// Immutable, cheaply cloned client configuration shared by connections that
-/// use the same endpoint policy. Resumption remains connection-local and is
-/// deliberately split out when a [`Config`] becomes a template.
+/// Immutable, cheaply cloned endpoint policy shared by connections.
 #[derive(Clone)]
 pub struct Template {
     inner: rc::Rc<Shared>,
@@ -38,14 +44,15 @@ pub struct Template {
 /// Construction proves the pair fits the initial TLS record.
 pub struct Prepared {
     pub(super) template: Template,
-    pub(super) resumption: Option<Resumption>,
+    pub(super) resumption: Option<resumption::Active>,
+    pub(super) enable_early_data: bool,
 }
 
 struct Shared {
     verifier: Verifier,
     transport_mode: transport::Mode,
     transport_params: vec::Vec<u8>,
-    alpn_protocols: vec::Vec<vec::Vec<u8>>,
+    alpn_protocols: protocols::PreparedAlpn,
     enable_early_data: bool,
 }
 
@@ -60,28 +67,33 @@ impl Config {
 
     /// Reject unusable settings for the explicitly selected transport.
     pub fn validate_with_transport(&self, transport_mode: transport::Mode) -> Result<(), Error> {
-        if let Verifier::X509 { anchors, hostname } = &self.verifier {
-            use crate::identity::Hostname;
-            if anchors.is_empty() {
-                return Err(Error::MissingTrustAnchors);
-            }
-            if anchors.len() > MAX_TRUST_ANCHORS {
-                return Err(Error::TooManyTrustAnchors {
-                    count: anchors.len(),
-                    maximum: MAX_TRUST_ANCHORS,
-                });
-            }
-            for (index, anchor) in anchors.iter().enumerate() {
-                if anchor.view().is_err() {
-                    return Err(Error::MalformedTrustAnchor { index });
+        match &self.verifier {
+            Verifier::X509 {
+                anchors, hostname, ..
+            } => {
+                if anchors.is_empty() {
+                    return Err(Error::MissingTrustAnchors);
                 }
+                if anchors.len() > MAX_TRUST_ANCHORS {
+                    return Err(Error::TooManyTrustAnchors {
+                        count: anchors.len(),
+                        maximum: MAX_TRUST_ANCHORS,
+                    });
+                }
+                for (index, anchor) in anchors.iter().enumerate() {
+                    if anchor.view().is_err() {
+                        return Err(Error::MalformedTrustAnchor { index });
+                    }
+                }
+                validate_hostname(hostname)?;
             }
-            if hostname.is_empty() {
-                return Err(Error::MissingServerName);
+            Verifier::X509Store {
+                roots, hostname, ..
+            } => {
+                debug_assert!(!roots.is_empty());
+                validate_hostname(hostname)?;
             }
-            if !Hostname::new(hostname).is_valid_reference() {
-                return Err(Error::InvalidServerName);
-            }
+            Verifier::RawPublicKey { .. } => {}
         }
         if self.transport_params.len() > u16::MAX as usize {
             return Err(Error::TransportParametersTooLong {
@@ -116,30 +128,29 @@ impl Config {
                 maximum: u16::MAX as usize,
             });
         }
-        validate_resumption(self.resumption.as_ref())?;
         validate_initial_hello(
             transport_mode,
             &self.verifier,
             &self.transport_params,
             &self.alpn_protocols,
-            self.resumption.as_ref(),
+            None,
         )?;
         Ok(())
     }
 
-    /// Validates reusable endpoint policy once, then splits it from the
-    /// single-use resumption ticket in TLS-over-stream mode.
-    pub fn try_into_template(self) -> Result<(Template, Option<Resumption>), Error> {
+    /// Validates reusable endpoint policy once in TLS-over-stream mode.
+    pub fn try_into_template(self) -> Result<Template, Error> {
         self.try_into_template_with_transport(transport::Mode::Tls)
     }
 
     /// Validates reusable endpoint policy for an explicit transport.
     pub fn try_into_template_with_transport(
-        self,
+        mut self,
         transport_mode: transport::Mode,
-    ) -> Result<(Template, Option<Resumption>), Error> {
+    ) -> Result<Template, Error> {
+        self.verifier = self.verifier.prepare()?;
         self.validate_with_transport(transport_mode)?;
-        Ok(self.split_template(transport_mode))
+        self.into_template(transport_mode)
     }
 
     /// Validates the exact first-connection configuration once in
@@ -154,52 +165,68 @@ impl Config {
         self,
         transport_mode: transport::Mode,
     ) -> Result<Prepared, Error> {
-        self.validate_with_transport(transport_mode)?;
-        let (template, resumption) = self.split_template(transport_mode);
-        Ok(Prepared {
-            template,
-            resumption,
-        })
+        Ok(self
+            .try_into_template_with_transport(transport_mode)?
+            .without_resumption())
     }
 
-    fn split_template(mut self, transport_mode: transport::Mode) -> (Template, Option<Resumption>) {
-        let resumption = self.resumption.take();
+    fn into_template(self, transport_mode: transport::Mode) -> Result<Template, Error> {
         let inner = Shared {
             verifier: self.verifier,
             transport_mode,
             transport_params: self.transport_params,
-            alpn_protocols: self.alpn_protocols,
+            alpn_protocols: protocols::PreparedAlpn::prepare(self.alpn_protocols)
+                .map_err(|()| Error::ClientHelloEncodingOverflow)?,
             enable_early_data: self.enable_early_data,
         };
-        (
-            Template {
-                inner: rc::Rc::new(inner),
-            },
-            resumption,
-        )
+        Ok(Template {
+            inner: rc::Rc::new(inner),
+        })
     }
 }
 
+fn validate_hostname(hostname: &[u8]) -> Result<(), Error> {
+    use crate::identity::Hostname;
+    if hostname.is_empty() {
+        return Err(Error::MissingServerName);
+    }
+    if !Hostname::new(hostname).is_valid_reference() {
+        return Err(Error::InvalidServerName);
+    }
+    Ok(())
+}
+
 impl Template {
-    /// Attaches connection-local state while preserving the encoded-size proof.
-    pub fn with_resumption(self, resumption: Option<Resumption>) -> Result<Prepared, Error> {
-        validate_resumption(resumption.as_ref())?;
+    /// Returns the exact reusable workspace plan for this endpoint policy.
+    pub fn workspace_layout(&self, identity: Option<&IdentityTemplate>) -> super::WorkspaceLayout {
+        super::WorkspaceLayout::prepared(
+            self.inner.verifier.certificate_limit().get(),
+            identity.map_or(0, IdentityTemplate::outbound_flight_capacity),
+        )
+    }
+
+    /// Resolves persisted endpoint metadata once, then moves only compact,
+    /// validated resumption state into the handshake.
+    pub fn restore(self, restore: Restore<'_>) -> Result<Prepared, Error> {
+        let resumption = restore.bind(&self);
         validate_initial_hello(
             self.inner.transport_mode,
             &self.inner.verifier,
             &self.inner.transport_params,
-            &self.inner.alpn_protocols,
-            resumption.as_ref(),
+            self.inner.alpn_protocols.preferred(),
+            Some(&resumption),
         )?;
         Ok(Prepared {
+            enable_early_data: self.inner.enable_early_data,
             template: self,
-            resumption,
+            resumption: Some(resumption),
         })
     }
 
     /// Removing resumption can only reduce a previously validated ClientHello.
     pub fn without_resumption(self) -> Prepared {
         Prepared {
+            enable_early_data: self.inner.enable_early_data,
             template: self,
             resumption: None,
         }
@@ -218,35 +245,133 @@ impl Template {
     }
 
     pub(crate) fn alpn_protocols(&self) -> &[vec::Vec<u8>] {
-        &self.inner.alpn_protocols
+        self.inner.alpn_protocols.preferred()
     }
 
-    pub(crate) fn enable_early_data(&self) -> bool {
-        self.inner.enable_early_data
+    pub(crate) fn find_alpn(&self, protocol: &[u8]) -> Option<protocols::AlpnId> {
+        self.inner.alpn_protocols.find(protocol)
+    }
+
+    pub(crate) fn alpn(&self, id: protocols::AlpnId) -> Option<&[u8]> {
+        self.inner.alpn_protocols.get(id)
     }
 }
 
 impl Prepared {
+    /// Returns the exact workspace plan for this prepared connection.
+    pub fn workspace_layout(&self, identity: Option<&IdentityTemplate>) -> super::WorkspaceLayout {
+        self.template.workspace_layout(identity)
+    }
+
     /// Returns the validated reusable policy without exposing resumption state.
     pub fn template(&self) -> Template {
         self.template.clone()
     }
-}
 
-fn validate_resumption(resumption: Option<&Resumption>) -> Result<(), Error> {
-    let Some(resumption) = resumption else {
-        return Ok(());
-    };
-    if resumption.ticket.is_empty() {
-        return Err(Error::EmptyResumptionTicket);
+    /// Admits caller-owned storage before creating a client.
+    pub fn try_into_client_with_workspace<C: connection::Clock>(
+        self,
+        identity: Option<IdentityTemplate>,
+        clock: C,
+        storage: super::Workspace,
+    ) -> Result<super::Client<C>, super::WorkspaceRejection> {
+        let layout = self.workspace_layout(identity.as_ref());
+        let storage = layout.admit(storage)?;
+        Ok(self.build_client(identity, clock, storage))
     }
-    if resumption.ticket.len() > u16::MAX as usize {
-        return Err(Error::ResumptionTicketTooLong {
-            len: resumption.ticket.len(),
-            maximum: u16::MAX as usize,
-        });
+
+    pub(in crate::client) fn build_client<C: connection::Clock>(
+        self,
+        identity: Option<IdentityTemplate>,
+        clock: C,
+        storage: super::Workspace,
+    ) -> super::Client<C> {
+        use crate::client::session;
+        use crate::client::state;
+        use crate::crypto::hash::Transcript;
+        use crate::crypto::kx;
+        use crate::crypto::material;
+        use crate::memory::threadbound::ThreadBound;
+        use crate::wire::handshake;
+        use crate::wire::handshake::reassemblers::HsReassembler;
+        use crate::wire::record;
+        use o3::collections::fixed::array;
+        use ring::rand::SystemRandom;
+        use session::Application;
+        use session::Buffers;
+        use session::Credentials;
+        use session::Extensions;
+        use session::Handshake;
+        use session::OfferSettings;
+        use session::Runtime;
+        let Self {
+            template: config,
+            resumption,
+            enable_early_data,
+        } = self;
+        let super::Workspace { reassembly, flight } = storage;
+        super::Client {
+            session: session::Session {
+                offer: OfferSettings {
+                    config,
+                    enable_early_data,
+                    kex_group: kx::KexGroup::X25519,
+                    offered_suites: array::CopyInline::from_array(record::CipherSuite::SUPPORTED),
+                },
+                handshake: Handshake {
+                    state: state::State::initial(),
+                    transcript: Transcript::new(),
+                    client_random: [0u8; handshake::RANDOM_LEN],
+                    session_id: [0; 32],
+                    hrr_done: false,
+                    resumption,
+                    psk_used: false,
+                },
+                kx: kx::Owned::new(),
+                extensions: Extensions {
+                    selected_alpn: None,
+                    early_data: session::EarlyData::NotOffered,
+                },
+                credentials: Credentials {
+                    identity,
+                    certificate_response: None,
+                },
+                application: Application {
+                    traffic: material::State::default(),
+                    resumption_master: None,
+                    exporter_master: None,
+                },
+                buffers: Buffers {
+                    reasm: HsReassembler::with_buffer(reassembly),
+                    flight,
+                },
+                runtime: Runtime {
+                    clock,
+                    rng: SystemRandom::new(),
+                    _thread: ThreadBound::NEW,
+                },
+            },
+        }
     }
-    Ok(())
+
+    pub(crate) fn from_retained(
+        resumption: Resumption,
+        enable_early_data: bool,
+    ) -> Result<Self, Error> {
+        let (template, resumption) = resumption.into_parts();
+        validate_initial_hello(
+            template.inner.transport_mode,
+            &template.inner.verifier,
+            &template.inner.transport_params,
+            template.inner.alpn_protocols.preferred(),
+            Some(&resumption),
+        )?;
+        Ok(Self {
+            template,
+            resumption: Some(resumption),
+            enable_early_data,
+        })
+    }
 }
 
 fn validate_initial_hello(
@@ -254,11 +379,11 @@ fn validate_initial_hello(
     verifier: &Verifier,
     transport_params: &[u8],
     alpn_protocols: &[vec::Vec<u8>],
-    resumption: Option<&Resumption>,
+    resumption: Option<&resumption::Active>,
 ) -> Result<(), Error> {
-    use crate::client::offer::Hello;
+    use crate::client::offer::Offer;
     use crate::wire::record::MAX_PLAINTEXT_BODY;
-    let len = Hello::maximum_initial_len(
+    let len = Offer::maximum_initial_len(
         transport_mode,
         verifier,
         transport_params,

@@ -1,28 +1,46 @@
-use shin::client::Client;
-use shin::client::config::{Config, Resumption, Verifier};
+use shin::client::config::{Config, Restore, Verifier};
 use shin::connection::Epoch;
 use shin::wire::codec::Reader;
 use shin::wire::extension::Type;
 use shin::wire::handshake::frame::Frame;
 use shin::wire::handshake::messages::ClientHello;
-use shin::wire::psk::{KX_MODE_DHE, KxModes, Offer};
+use shin::wire::psk::{KX_MODE_DHE, KxModesRef, OfferedPsks};
+use shin::wire::record::CipherSuite;
 
 use crate::common::{CollectEvents, Event};
 
-fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
-    let mut c = Client::new(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: [0x42u8; 32],
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption,
-            enable_early_data: false,
+fn restored(psk: [u8; 32], ticket: Vec<u8>, age_add: u32) -> Restore<'static> {
+    Restore::try_new(psk, ticket, age_add, 0, 7_200).unwrap()
+}
+
+fn drive_ch(restore: Option<Restore<'static>>, suites: &[CipherSuite]) -> ClientHello {
+    drive_ch_at(restore, suites, 0)
+}
+
+fn drive_ch_at(
+    restore: Option<Restore<'static>>,
+    suites: &[CipherSuite],
+    now_ms: u64,
+) -> ClientHello {
+    let template = Config {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: [0x42u8; 32],
         },
-        || 0,
-    )
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        enable_early_data: false,
+    }
+    .try_into_template()
     .unwrap();
+    let prepared = match restore {
+        Some(restore) => template.restore(restore).unwrap(),
+        None => template.without_resumption(),
+    };
+    let workspace = prepared.workspace_layout(None).allocate();
+    let mut c = prepared
+        .try_into_client_with_workspace(None, move || now_ms, workspace)
+        .unwrap();
+    c.set_cipher_suites(suites).unwrap();
     let evs = c.start().unwrap();
     let ch_bytes = evs
         .into_iter()
@@ -35,7 +53,7 @@ fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
         })
         .unwrap();
     let mut r = Reader::new(&ch_bytes);
-    match Frame::decode(&mut r).unwrap() {
+    match crate::decode_owned(&mut r).unwrap() {
         Frame::ClientHello(ch) => ch,
         _ => panic!(),
     }
@@ -43,7 +61,7 @@ fn drive_ch(resumption: Option<Resumption>) -> ClientHello {
 
 #[test]
 fn no_resumption_omits_psk_extensions() {
-    let ch = drive_ch(None);
+    let ch = drive_ch(None, &CipherSuite::SUPPORTED);
     assert!(!ch.extensions.iter().any(|e| e.ty == Type::PRE_SHARED_KEY),);
     assert!(
         !ch.extensions
@@ -54,12 +72,11 @@ fn no_resumption_omits_psk_extensions() {
 
 #[test]
 fn resumption_attaches_psk_kx_modes_and_offer() {
-    let ch = drive_ch(Some(Resumption::new(
-        [0x77u8; 32],
-        vec![0xAA; 64],
-        0xCAFEBABE,
-        12_345,
-    )));
+    let ch = drive_ch_at(
+        Some(Restore::try_new([0x77u8; 32], vec![0xAA; 64], 0xCAFEBABE, 5_000, 7_200).unwrap()),
+        &CipherSuite::SUPPORTED,
+        17_345,
+    );
 
     let kx_ext = ch
         .extensions
@@ -67,7 +84,7 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
         .find(|e| e.ty == Type::PSK_KEY_EXCHANGE_MODES)
         .expect("psk_kx_modes ext expected");
     assert_eq!(
-        KxModes::decode(&kx_ext.data).unwrap().as_slice(),
+        KxModesRef::decode(&kx_ext.data).unwrap().as_slice(),
         &[KX_MODE_DHE]
     );
 
@@ -76,7 +93,7 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
         .iter()
         .find(|e| e.ty == Type::PRE_SHARED_KEY)
         .expect("pre_shared_key ext expected");
-    let offer = Offer::decode(&psk_ext.data).unwrap();
+    let offer = OfferedPsks::decode(&psk_ext.data).unwrap().into_owned();
     assert_eq!(offer.identities.len(), 1);
     assert_eq!(offer.identities[0].identity, vec![0xAA; 64]);
     assert_eq!(
@@ -91,6 +108,36 @@ fn resumption_attaches_psk_kx_modes_and_offer() {
     );
 }
 
+#[test]
+fn expired_resumption_is_omitted() {
+    let ch = drive_ch_at(
+        Some(Restore::try_new([0x77; 32], vec![0xAA], 9, 5_000, 1).unwrap()),
+        &CipherSuite::SUPPORTED,
+        6_001,
+    );
+
+    assert!(
+        !ch.extensions
+            .iter()
+            .any(|e| matches!(e.ty, Type::PSK_KEY_EXCHANGE_MODES | Type::PRE_SHARED_KEY))
+    );
+}
+
+#[test]
+fn resumption_is_omitted_when_clock_precedes_receipt() {
+    let ch = drive_ch_at(
+        Some(Restore::try_new([0x77; 32], vec![0xAA], 9, 5_000, 1).unwrap()),
+        &CipherSuite::SUPPORTED,
+        4_999,
+    );
+
+    assert!(
+        !ch.extensions
+            .iter()
+            .any(|e| matches!(e.ty, Type::PSK_KEY_EXCHANGE_MODES | Type::PRE_SHARED_KEY))
+    );
+}
+
 /// RFC 8446 §4.2.11.2: the binder covers the ClientHello truncated at the start
 /// of `binders`, i.e. len - (2 list-len + 1 binder-len + 32) = len - 35 for one
 /// SHA-256 binder. A naive len - 32 is off by 3 and breaks interop.
@@ -100,21 +147,24 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
     use shin::wire::psk::ResumptionBinder;
 
     let psk = [0x99u8; 32];
-    let resumption = Resumption::new(psk, vec![0x5A; 48], 7, 1_000);
+    let restore = restored(psk, vec![0x5A; 48], 7);
 
-    let mut c = Client::new(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: [0x42u8; 32],
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption: Some(resumption),
-            enable_early_data: false,
+    let prepared = Config {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: [0x42u8; 32],
         },
-        || 0,
-    )
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        enable_early_data: false,
+    }
+    .try_into_template()
+    .unwrap()
+    .restore(restore)
     .unwrap();
+    let workspace = prepared.workspace_layout(None).allocate();
+    let mut c = prepared
+        .try_into_client_with_workspace(None, || 0, workspace)
+        .unwrap();
     let ch_bytes = c
         .start()
         .unwrap()
@@ -128,7 +178,7 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
         })
         .unwrap();
 
-    let ch = match Frame::decode(&mut Reader::new(&ch_bytes)).unwrap() {
+    let ch = match crate::decode_owned(&mut Reader::new(&ch_bytes)).unwrap() {
         Frame::ClientHello(ch) => ch,
         _ => panic!(),
     };
@@ -138,7 +188,12 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
             .iter()
             .find(|e| e.ty == Type::PRE_SHARED_KEY)
             .unwrap();
-        Offer::decode(&psk_ext.data).unwrap().binders[0].clone()
+        OfferedPsks::decode(&psk_ext.data)
+            .unwrap()
+            .binders()
+            .next()
+            .unwrap()
+            .to_vec()
     };
 
     let n = ch_bytes.len();
@@ -163,7 +218,23 @@ fn binder_covers_partial_ch_per_rfc_not_len_minus_32() {
 
 #[test]
 fn pre_shared_key_is_last_extension() {
-    let ch = drive_ch(Some(Resumption::new([0u8; 32], b"t".to_vec(), 0, 0)));
+    let ch = drive_ch(
+        Some(restored([0u8; 32], b"t".to_vec(), 0)),
+        &CipherSuite::SUPPORTED,
+    );
     let last = ch.extensions.last().expect("non-empty");
     assert_eq!(last.ty, Type::PRE_SHARED_KEY);
+}
+
+#[test]
+fn sha256_resumption_is_omitted_from_sha384_only_offer() {
+    let ch = drive_ch(
+        Some(restored([0u8; 32], b"t".to_vec(), 0)),
+        &[CipherSuite::Aes256GcmSha384],
+    );
+
+    assert!(!ch.extensions.iter().any(|extension| matches!(
+        extension.ty,
+        Type::PSK_KEY_EXCHANGE_MODES | Type::PRE_SHARED_KEY
+    )),);
 }

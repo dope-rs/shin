@@ -1,6 +1,6 @@
 use shin::client::Client;
 use shin::client::config::{Config, Verifier};
-use shin::connection::Epoch;
+use shin::connection::{Epoch, Error};
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
 use shin::wire::codec::Reader;
@@ -44,7 +44,6 @@ fn client() -> TestClient {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         clock as fn() -> u64,
@@ -54,7 +53,7 @@ fn client() -> TestClient {
 
 fn ch_with_suites(ch_bytes: &[u8], suites: Vec<u16>) -> Vec<u8> {
     let mut r = Reader::new(ch_bytes);
-    let Frame::ClientHello(mut ch) = Frame::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(mut ch) = crate::decode_owned(&mut r).unwrap() else {
         panic!("not a ClientHello");
     };
     ch.cipher_suites = suites;
@@ -65,7 +64,7 @@ fn ch_with_suites(ch_bytes: &[u8], suites: Vec<u16>) -> Vec<u8> {
 
 fn server_hello_suite(blob: &[u8]) -> u16 {
     let mut r = Reader::new(blob);
-    let Frame::ServerHello(sh) = Frame::decode(&mut r).unwrap() else {
+    let Frame::ServerHello(sh) = crate::decode_owned(&mut r).unwrap() else {
         panic!("not a ServerHello");
     };
     sh.cipher_suite
@@ -117,5 +116,17 @@ fn server_rejects_when_no_supported_suite_offered() {
     assert_eq!(
         server.read(Epoch::Plaintext, &ch).unwrap_err(),
         shin::connection::Error::UnsupportedCipherSuite,
+    );
+}
+
+#[test]
+fn server_rejects_empty_cipher_suite_vector_during_decode() {
+    let mut server = server();
+    let mut client = client();
+    let ch = send(&client.start().unwrap(), Epoch::Plaintext);
+    let ch = ch_with_suites(&ch, Vec::new());
+    assert_eq!(
+        server.read(Epoch::Plaintext, &ch).unwrap_err(),
+        Error::Decode,
     );
 }

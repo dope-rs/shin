@@ -42,7 +42,6 @@ fn client() -> TestClient {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         clock as fn() -> u64,
@@ -97,7 +96,7 @@ fn pq_client_hello_carries_hybrid_key_share() {
     let ch = send(&client.start().unwrap(), Epoch::Plaintext);
 
     let mut r = Reader::new(&ch);
-    let Frame::ClientHello(chm) = Frame::decode(&mut r).unwrap() else {
+    let Frame::ClientHello(chm) = crate::decode_owned(&mut r).unwrap() else {
         panic!("not a ClientHello");
     };
     let ks = chm

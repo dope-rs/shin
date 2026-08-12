@@ -60,6 +60,7 @@ fn error_maps_to_fatal_alert() {
             Description::NoApplicationProtocol,
         ),
         (Error::BadCertificate, Description::BadCertificate),
+        (Error::BadPskBinder, Description::DecryptError),
         (Error::BadFinished, Description::DecryptError),
         (Error::BadConfig, Description::InternalError),
     ];

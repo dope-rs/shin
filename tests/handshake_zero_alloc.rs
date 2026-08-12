@@ -1,9 +1,10 @@
 use std::convert::Infallible;
+use std::hint::black_box;
 
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use shin::client::config::{Config, Identity, OwnedTrustAnchor, Resumption, Verifier};
 use shin::client::{Client, Hybrid};
-use shin::connection::{DriveError, Epoch, Error, Event, EventContext, EventSink, WorkspaceRegion};
+use shin::connection::{Epoch, Error, Event, EventContext, EventSink};
 use shin::crypto::kx::HybridWorkspace;
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::Keys;
@@ -12,22 +13,61 @@ use shin::identity::cert::Cert;
 use shin::identity::spki::SubjectPublicKey;
 use shin::server::{
     Server, Shard, config, config::CertSource, config::ClientAuth, config::ClientCertVerifier,
-    config::ClientIdentity, config::Connection,
+    config::ClientIdentity, config::Connection, config::EarlyDataGuard,
 };
 use shin::transport::Mode;
 use shin::wire::codec;
 use shin::wire::extension::Type;
-use shin::wire::handshake::MAX_SIZE;
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::frame::{Frame, MessageRef};
 use shin::wire::handshake::workspace::Scratch;
+use shin::wire::record::{CipherSuite, MAX_PLAINTEXT_BODY};
 
-mod raw;
+mod support;
+
+use support::AllocationProbe;
 
 struct PinnedSpki(Vec<u8>);
+
+#[test]
+fn public_borrowed_handshake_view_is_allocation_free() {
+    use shin::wire::extension::Extension;
+    use shin::wire::handshake::messages::ClientHello;
+    use shin::wire::handshake::{RANDOM_LEN, TLS_1_2};
+
+    let frame = Frame::ClientHello(ClientHello {
+        legacy_version: TLS_1_2,
+        random: [0xA5; RANDOM_LEN],
+        legacy_session_id: vec![1, 2, 3],
+        cipher_suites: vec![0x1301, 0x1303],
+        legacy_compression_methods: vec![0],
+        extensions: vec![Extension::new(Type::SUPPORTED_VERSIONS, vec![2, 3, 4])],
+    });
+    let mut encoded = Vec::new();
+    frame.encode(&mut encoded).unwrap();
+
+    let allocations = AllocationProbe::measured(|| {
+        let MessageRef::ClientHello(hello) = MessageRef::decode(&encoded).unwrap() else {
+            panic!("expected ClientHello");
+        };
+        assert_eq!(hello.cipher_suites.len(), 2);
+        assert!(hello.cipher_suites.contains(0x1303));
+        assert!(hello.extensions.find(Type::SUPPORTED_VERSIONS).is_some());
+        black_box(hello);
+    });
+    assert_eq!(allocations, 0);
+}
 
 impl ClientCertVerifier for PinnedSpki {
     fn verify(&self, identity: &ClientIdentity<'_>) -> bool {
         identity.spki_der == self.0
+    }
+}
+
+struct AcceptEarlyData;
+
+impl EarlyDataGuard for AcceptEarlyData {
+    fn register(&mut self, _token: &[u8]) -> bool {
+        true
     }
 }
 
@@ -37,10 +77,11 @@ struct Wire {
     handshake: Vec<u8>,
     application: Vec<u8>,
     peer_extension: Vec<u8>,
-    ticket_nonce: Vec<u8>,
-    ticket: Vec<u8>,
-    ticket_age_add: u32,
-    resumption_psk: Option<[u8; 32]>,
+    ticket_suite: Option<CipherSuite>,
+    resumption: Option<Resumption>,
+    retain_tickets: bool,
+    zero_rtt_max: Option<u32>,
+    zero_rtt_alpn_h3: bool,
 }
 
 impl Wire {
@@ -50,10 +91,11 @@ impl Wire {
             handshake: Vec::with_capacity(16 * 1024),
             application: Vec::with_capacity(16 * 1024),
             peer_extension: Vec::with_capacity(16 * 1024),
-            ticket_nonce: Vec::with_capacity(255),
-            ticket: Vec::with_capacity(512),
-            ticket_age_add: 0,
-            resumption_psk: None,
+            ticket_suite: None,
+            resumption: None,
+            retain_tickets: true,
+            zero_rtt_max: None,
+            zero_rtt_alpn_h3: false,
         }
     }
 
@@ -62,17 +104,17 @@ impl Wire {
         self.handshake.clear();
         self.application.clear();
         self.peer_extension.clear();
-        self.ticket_nonce.clear();
-        self.ticket.clear();
-        self.ticket_age_add = 0;
-        self.resumption_psk = None;
+        self.ticket_suite = None;
+        self.resumption = None;
+        self.zero_rtt_max = None;
+        self.zero_rtt_alpn_h3 = false;
     }
 }
 
 impl EventSink for Wire {
     type Error = Infallible;
 
-    fn event(&mut self, event: Event<'_>, _context: EventContext) -> Result<(), Self::Error> {
+    fn event(&mut self, event: Event<'_>, context: EventContext) -> Result<(), Self::Error> {
         match event {
             Event::Send { epoch, data } => match epoch {
                 Epoch::Plaintext => self.plaintext.extend_from_slice(data),
@@ -84,19 +126,20 @@ impl EventSink for Wire {
                 self.peer_extension.clear();
                 self.peer_extension.extend_from_slice(data);
             }
-            Event::NewSessionTicket {
-                ticket_age_add,
-                ticket_nonce,
-                ticket,
+            Event::NewSessionTicket(ticket) => {
+                self.ticket_suite = context.cipher_suite();
+                if self.retain_tickets {
+                    self.resumption = Some(ticket.try_retain().unwrap());
+                }
+            }
+            Event::ZeroRttKeysReady {
+                max_early_data,
+                alpn,
                 ..
             } => {
-                self.ticket_age_add = ticket_age_add;
-                self.ticket_nonce.clear();
-                self.ticket_nonce.extend_from_slice(ticket_nonce);
-                self.ticket.clear();
-                self.ticket.extend_from_slice(ticket);
+                self.zero_rtt_max = Some(max_early_data);
+                self.zero_rtt_alpn_h3 = alpn == Some(b"h3".as_slice());
             }
-            Event::ResumptionSecret { psk } => self.resumption_psk = Some(*psk.as_array()),
             _ => {}
         }
         Ok(())
@@ -111,12 +154,79 @@ fn assert_zero_allocations(counts: [usize; 5]) {
     assert_eq!(counts, [0; 5]);
 }
 
+fn ticket_processing_allocations(retain: bool) -> usize {
+    let signing_key = SigningKey::from_seed(&[0x31; 32]).unwrap();
+    let server_pubkey = *signing_key.pubkey().unwrap();
+    let mut shard = Shard::new(config::Config {
+        source: CertSource::RawPublicKey { signing_key },
+        alpn_protocols: Vec::new(),
+        ticket_keys: Some(Keys::single([0x32; 32]).unwrap()),
+    })
+    .unwrap();
+    let server = Server::with_workspace(
+        Connection {
+            transport_params: Vec::new(),
+        },
+        || 0,
+        workspace(),
+    )
+    .unwrap();
+    let mut server = shard.bind(server).unwrap();
+    let mut client = Client::new(
+        Config {
+            verifier: Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            enable_early_data: false,
+        },
+        || 0,
+    )
+    .unwrap();
+    let mut client_wire = Wire::reserved();
+    let mut server_wire = Wire::reserved();
+
+    client.start_into(&mut client_wire).unwrap();
+    server
+        .read_into(Epoch::Plaintext, &client_wire.plaintext, &mut server_wire)
+        .unwrap();
+    client_wire.clear();
+    client
+        .read_into(Epoch::Plaintext, &server_wire.plaintext, &mut client_wire)
+        .unwrap();
+    client
+        .read_into(Epoch::Handshake, &server_wire.handshake, &mut client_wire)
+        .unwrap();
+    server_wire.clear();
+    server
+        .read_into(Epoch::Handshake, &client_wire.handshake, &mut server_wire)
+        .unwrap();
+    client_wire.clear();
+    client_wire.retain_tickets = retain;
+
+    AllocationProbe::measured(|| {
+        client
+            .read_into(
+                Epoch::Application,
+                &server_wire.application,
+                &mut client_wire,
+            )
+            .unwrap()
+    })
+}
+
+#[test]
+fn session_ticket_retention_is_the_only_ticket_allocation() {
+    assert_eq!(ticket_processing_allocations(false), 0);
+    assert_eq!(ticket_processing_allocations(true), 1);
+}
+
 #[test]
 fn role_defaults_reserve_only_reachable_workspace_regions() {
-    assert_eq!(Scratch::for_client().capacities(), (MAX_SIZE, MAX_SIZE, 0));
     assert_eq!(
         Scratch::for_server().capacities(),
-        (MAX_SIZE, MAX_SIZE, MAX_SIZE)
+        (MAX_PLAINTEXT_BODY, MAX_PLAINTEXT_BODY, MAX_PLAINTEXT_BODY)
     );
 }
 
@@ -126,7 +236,7 @@ fn x509_identity() -> (Vec<u8>, SigningKey, u64) {
     let mut reader = Reader::new(&pkcs8);
     let sequence = reader.read_tagged(Tag::SEQUENCE).unwrap();
     let mut sequence = Reader::new(sequence);
-    sequence.read_tagged(Tag::INTEGER).unwrap();
+    sequence.read_uint().unwrap();
     sequence.read_tagged(Tag::SEQUENCE).unwrap();
     let outer = sequence.read_tagged(Tag::OCTET_STRING).unwrap();
     let mut outer = Reader::new(outer);
@@ -139,11 +249,11 @@ fn x509_identity() -> (Vec<u8>, SigningKey, u64) {
     let cert = params.self_signed(&key).unwrap();
     let cert_der = cert.der().to_vec();
     let parsed = Cert::parse(&cert_der).unwrap();
-    let not_before =
-        shin::identity::UnixTime::from_time_value(&parsed.tbs.validity.not_before).unwrap();
-    let not_after =
-        shin::identity::UnixTime::from_time_value(&parsed.tbs.validity.not_after).unwrap();
-    (cert_der, signing_key, (not_before.0 + not_after.0) / 2)
+    let validity = parsed.tbs.validity;
+    let now = shin::identity::UnixTime((validity.not_before.0 + validity.not_after.0) / 2)
+        .as_secs()
+        .unwrap();
+    (cert_der, signing_key, now)
 }
 
 #[test]
@@ -162,75 +272,67 @@ fn caller_owned_hybrid_rpk_handshake_has_no_allocations() {
         },
         ClientAuth::Required,
         PinnedSpki(client_spki),
-    );
-    let mut server = Server::with_workspace(
+    )
+    .unwrap();
+    let server = Server::with_workspace(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
         workspace(),
-    );
+    )
+    .unwrap();
+    let mut server = shard.bind(server).unwrap();
     let mut hybrid_workspace = HybridWorkspace::new();
-    let client = Client::with_transport_workspace(
+    let client = Client::mutual(
         Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
-        Mode::Tls,
+        Identity::RawPublicKey {
+            signing_key: client_signing_key,
+        },
         || 0,
-        workspace(),
     )
     .unwrap();
     let mut client = Hybrid::from_client(client, &mut hybrid_workspace).unwrap();
-    client
-        .set_identity(Identity::RawPublicKey {
-            signing_key: client_signing_key,
-        })
-        .unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
 
-    let client_start = raw::measured(|| client.start_into(&mut client_wire).unwrap());
+    let client_start = AllocationProbe::measured(|| client.start_into(&mut client_wire).unwrap());
     let client_hello = client_wire.plaintext.clone();
-    let server_read = raw::measured(|| {
+    let server_read = AllocationProbe::measured(|| {
         server
-            .read_into(
-                Epoch::Plaintext,
-                &client_hello,
-                &mut shard,
-                &mut server_wire,
-            )
+            .read_into(Epoch::Plaintext, &client_hello, &mut server_wire)
             .unwrap()
     });
     let server_hello = server_wire.plaintext.clone();
     let server_flight = server_wire.handshake.clone();
     client_wire.clear();
-    let client_server_hello = raw::measured(|| {
+    let client_server_hello = AllocationProbe::measured(|| {
         client
             .read_into(Epoch::Plaintext, &server_hello, &mut client_wire)
             .unwrap()
     });
-    let client_server_flight = raw::measured(|| {
-        client
-            .read_into(Epoch::Handshake, &server_flight, &mut client_wire)
-            .unwrap()
+    let client_server_flight = AllocationProbe::measured(|| {
+        for fragment in server_flight.chunks(1) {
+            client
+                .read_into(Epoch::Handshake, fragment, &mut client_wire)
+                .unwrap();
+        }
     });
     let client_flight = client_wire.handshake.clone();
     server_wire.clear();
-    let server_finish = raw::measured(|| {
-        server
-            .read_into(
-                Epoch::Handshake,
-                &client_flight,
-                &mut shard,
-                &mut server_wire,
-            )
-            .unwrap()
+    let server_finish = AllocationProbe::measured(|| {
+        for fragment in client_flight.chunks(1) {
+            server
+                .read_into(Epoch::Handshake, fragment, &mut server_wire)
+                .unwrap();
+        }
     });
 
     assert_zero_allocations([
@@ -264,75 +366,68 @@ fn x509_handshake_has_no_allocations_after_construction() {
         },
         ClientAuth::Required,
         PinnedSpki(client_spki),
-    );
-    let mut server = Server::with_workspace(
+    )
+    .unwrap();
+    let server = Server::with_workspace(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
         workspace(),
-    );
-    let mut client = Client::with_transport_workspace(
+    )
+    .unwrap();
+    let mut server = shard.bind(server).unwrap();
+    let mut client = Client::mutual(
         Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: b"host.local".to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
-        Mode::Tls,
-        move || now * 1000,
-        workspace(),
-    )
-    .unwrap();
-    client
-        .set_identity(Identity::X509 {
+        Identity::X509 {
             chain_der: vec![client_cert_der],
             signing_key: client_signing_key,
-        })
-        .unwrap();
+        },
+        move || now * 1000,
+    )
+    .unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
 
-    let client_start = raw::measured(|| client.start_into(&mut client_wire).unwrap());
+    let client_start = AllocationProbe::measured(|| client.start_into(&mut client_wire).unwrap());
     let client_hello = client_wire.plaintext.clone();
-    let server_read = raw::measured(|| {
+    let server_read = AllocationProbe::measured(|| {
         server
-            .read_into(
-                Epoch::Plaintext,
-                &client_hello,
-                &mut shard,
-                &mut server_wire,
-            )
+            .read_into(Epoch::Plaintext, &client_hello, &mut server_wire)
             .unwrap()
     });
     let server_hello = server_wire.plaintext.clone();
     let server_flight = server_wire.handshake.clone();
     client_wire.clear();
-    let client_server_hello = raw::measured(|| {
+    let client_server_hello = AllocationProbe::measured(|| {
         client
             .read_into(Epoch::Plaintext, &server_hello, &mut client_wire)
             .unwrap()
     });
-    let client_server_flight = raw::measured(|| {
-        client
-            .read_into(Epoch::Handshake, &server_flight, &mut client_wire)
-            .unwrap()
+    let client_server_flight = AllocationProbe::measured(|| {
+        for fragment in server_flight.chunks(1) {
+            client
+                .read_into(Epoch::Handshake, fragment, &mut client_wire)
+                .unwrap();
+        }
     });
     let client_flight = client_wire.handshake.clone();
     server_wire.clear();
-    let server_finish = raw::measured(|| {
-        server
-            .read_into(
-                Epoch::Handshake,
-                &client_flight,
-                &mut shard,
-                &mut server_wire,
-            )
-            .unwrap()
+    let server_finish = AllocationProbe::measured(|| {
+        for fragment in client_flight.chunks(1) {
+            server
+                .read_into(Epoch::Handshake, fragment, &mut server_wire)
+                .unwrap();
+        }
     });
     assert_zero_allocations([
         client_start,
@@ -347,43 +442,47 @@ fn x509_handshake_has_no_allocations_after_construction() {
 fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
     let signing_key = SigningKey::from_seed(&[8; 32]).unwrap();
     let server_pubkey = *signing_key.pubkey().unwrap();
-    let mut shard = Shard::new(config::Config {
-        source: CertSource::RawPublicKey { signing_key },
-        alpn_protocols: vec![b"h3".to_vec()],
-        ticket_keys: Some(Keys::single([9; 32])),
-    });
-    let mut server = Server::with_transport_workspace(
+    let mut shard = Shard::with_early_data_guard(
+        config::Config {
+            source: CertSource::RawPublicKey { signing_key },
+            alpn_protocols: vec![b"h3".to_vec()],
+            ticket_keys: Some(Keys::single([9; 32]).unwrap()),
+        },
+        AcceptEarlyData,
+    )
+    .unwrap();
+    let server = Server::with_transport_workspace(
         Connection {
             transport_params: b"server tp".to_vec(),
         },
         Mode::Quic,
         || 0,
         workspace(),
-    );
-    let mut client = Client::with_transport_workspace(
+    )
+    .unwrap();
+    let mut server = shard.bind(server).unwrap();
+    let mut client = Client::new_with_transport(
         Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
             transport_params: b"client tp".to_vec(),
             alpn_protocols: vec![b"h3".to_vec()],
-            resumption: None,
             enable_early_data: false,
         },
         Mode::Quic,
         || 0,
-        workspace(),
     )
     .unwrap();
     let mut client_wire = Wire::reserved();
     let mut server_wire = Wire::reserved();
 
-    let client_start = raw::measured(|| client.start_into(&mut client_wire).unwrap());
+    let client_start = AllocationProbe::measured(|| client.start_into(&mut client_wire).unwrap());
     let client_hello = client_wire.plaintext.clone();
-    let server_read = raw::measured(|| {
+    let server_read = AllocationProbe::measured(|| {
         for fragment in client_hello.chunks(1) {
             server
-                .read_into(Epoch::Plaintext, fragment, &mut shard, &mut server_wire)
+                .read_into(Epoch::Plaintext, fragment, &mut server_wire)
                 .unwrap();
         }
     });
@@ -391,14 +490,14 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
     let server_hello = server_wire.plaintext.clone();
     let server_flight = server_wire.handshake.clone();
     client_wire.clear();
-    let client_server_hello = raw::measured(|| {
+    let client_server_hello = AllocationProbe::measured(|| {
         for fragment in server_hello.chunks(1) {
             client
                 .read_into(Epoch::Plaintext, fragment, &mut client_wire)
                 .unwrap();
         }
     });
-    let client_server_flight = raw::measured(|| {
+    let client_server_flight = AllocationProbe::measured(|| {
         for fragment in server_flight.chunks(1) {
             client
                 .read_into(Epoch::Handshake, fragment, &mut client_wire)
@@ -409,10 +508,10 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
     assert_eq!(client.selected_alpn(), Some(b"h3".as_slice()));
     let client_flight = client_wire.handshake.clone();
     server_wire.clear();
-    let server_finish = raw::measured(|| {
+    let server_finish = AllocationProbe::measured(|| {
         for fragment in client_flight.chunks(1) {
             server
-                .read_into(Epoch::Handshake, fragment, &mut shard, &mut server_wire)
+                .read_into(Epoch::Handshake, fragment, &mut server_wire)
                 .unwrap();
         }
     });
@@ -427,80 +526,61 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
     let ticket_record = server_wire.application.clone();
     client_wire.clear();
     assert_eq!(
-        raw::measured(|| {
+        AllocationProbe::measured(|| {
             client
                 .read_into(Epoch::Application, &ticket_record, &mut client_wire)
                 .unwrap()
         }),
-        0
+        1,
+        "retaining an opaque peer ticket performs exactly one allocation",
     );
-    let resumption = Resumption::new(
-        client_wire.resumption_psk.unwrap(),
-        client_wire.ticket.clone(),
-        client_wire.ticket_age_add,
-        0,
-    );
+    assert_eq!(client_wire.ticket_suite, Some(CipherSuite::Aes128GcmSha256),);
+    let resumption = client_wire.resumption.take().unwrap();
+    drop(server);
 
-    let mut resumed_server = Server::with_transport_workspace(
+    let resumed_server = Server::with_transport_workspace(
         Connection {
             transport_params: b"server tp".to_vec(),
         },
         Mode::Quic,
         || 0,
         workspace(),
-    );
-    let mut resumed_client = Client::with_transport_workspace(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: server_pubkey,
-            },
-            transport_params: b"client tp".to_vec(),
-            alpn_protocols: vec![b"h3".to_vec()],
-            resumption: Some(resumption),
-            enable_early_data: true,
-        },
-        Mode::Quic,
-        || 0,
-        workspace(),
     )
     .unwrap();
+    let mut resumed_server = shard.bind(resumed_server).unwrap();
+    let mut resumed_client = Client::resume(resumption, true, || 0).unwrap();
     client_wire.clear();
     server_wire.clear();
-    let client_start = raw::measured(|| resumed_client.start_into(&mut client_wire).unwrap());
+    let client_start =
+        AllocationProbe::measured(|| resumed_client.start_into(&mut client_wire).unwrap());
+    assert_eq!(client_wire.zero_rtt_max, Some(u32::MAX));
+    assert!(client_wire.zero_rtt_alpn_h3);
     let client_hello = client_wire.plaintext.clone();
-    let server_read = raw::measured(|| {
+    let server_read = AllocationProbe::measured(|| {
         resumed_server
-            .read_into(
-                Epoch::Plaintext,
-                &client_hello,
-                &mut shard,
-                &mut server_wire,
-            )
+            .read_into(Epoch::Plaintext, &client_hello, &mut server_wire)
             .unwrap()
     });
+    assert_eq!(server_wire.zero_rtt_max, Some(u32::MAX));
+    assert!(server_wire.zero_rtt_alpn_h3);
     let server_hello = server_wire.plaintext.clone();
     let server_flight = server_wire.handshake.clone();
     client_wire.clear();
-    let client_server_hello = raw::measured(|| {
+    let client_server_hello = AllocationProbe::measured(|| {
         resumed_client
             .read_into(Epoch::Plaintext, &server_hello, &mut client_wire)
             .unwrap()
     });
-    let client_server_flight = raw::measured(|| {
+    let client_server_flight = AllocationProbe::measured(|| {
         resumed_client
             .read_into(Epoch::Handshake, &server_flight, &mut client_wire)
             .unwrap()
     });
     let client_flight = client_wire.handshake.clone();
     server_wire.clear();
-    let server_finish = raw::measured(|| {
+    let server_finish = AllocationProbe::measured(|| {
         resumed_server
-            .read_into(
-                Epoch::Handshake,
-                &client_flight,
-                &mut shard,
-                &mut server_wire,
-            )
+            .read_into(Epoch::Handshake, &client_flight, &mut server_wire)
             .unwrap()
     });
     assert_zero_allocations([
@@ -513,65 +593,30 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
 }
 
 #[test]
-fn workspace_exhaustion_is_typed_and_never_reallocates() {
+fn server_admission_rejects_undersized_storage_without_allocating() {
     let signing_key = SigningKey::from_seed(&[10; 32]).unwrap();
-    let server_pubkey = *signing_key.pubkey().unwrap();
-    let mut client = Client::with_transport_workspace(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: server_pubkey,
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption: None,
-            enable_early_data: false,
-        },
-        Mode::Tls,
-        || 0,
-        Scratch::new(0, 0, 0),
-    )
-    .unwrap();
-    let mut wire = Wire::reserved();
-    let mut result = None;
-    let allocations = raw::measured(|| result = Some(client.start_into(&mut wire)));
-    assert_eq!(allocations, 0);
-    assert_eq!(
-        result.unwrap(),
-        Err(DriveError::Protocol(Error::WorkspaceExhausted(
-            WorkspaceRegion::OutboundFlight
-        )))
-    );
-
     let mut shard = Shard::new(config::Config {
         source: CertSource::RawPublicKey { signing_key },
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-    });
-    let mut server = Server::with_workspace(
+    })
+    .unwrap();
+    let server = Server::with_workspace(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
         Scratch::new(0, 16 * 1024, 0),
-    );
-    let mut result = None;
-    let allocations = raw::measured(|| {
-        result = Some(server.read_into(Epoch::Plaintext, &[1], &mut shard, &mut wire))
+    )
+    .unwrap();
+    let mut rejected = false;
+    let allocations = AllocationProbe::measured(|| {
+        rejected = matches!(shard.bind(server), Err(Error::BadConfig));
     });
     assert_eq!(allocations, 0);
-    assert_eq!(
-        result.unwrap(),
-        Err(DriveError::Protocol(Error::WorkspaceExhausted(
-            WorkspaceRegion::FragmentedMessage
-        )))
-    );
+    assert!(rejected);
 
     let server_signing_key = SigningKey::from_seed(&[12; 32]).unwrap();
-    let server_pubkey = *server_signing_key.pubkey().unwrap();
-    let client_signing_key = SigningKey::from_seed(&[13; 32]).unwrap();
-    let client_spki = SubjectPublicKey::Ed25519(*client_signing_key.pubkey().unwrap())
-        .encode()
-        .unwrap();
     let mut shard = Shard::with_client_auth(
         config::Config {
             source: CertSource::RawPublicKey {
@@ -581,70 +626,23 @@ fn workspace_exhaustion_is_typed_and_never_reallocates() {
             ticket_keys: None,
         },
         ClientAuth::Required,
-        PinnedSpki(client_spki),
-    );
-    let mut server = Server::with_workspace(
+        PinnedSpki(Vec::new()),
+    )
+    .unwrap();
+    let server = Server::with_workspace(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
         Scratch::new(16 * 1024, 16 * 1024, 0),
-    );
-    let mut client = Client::with_transport_workspace(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: server_pubkey,
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption: None,
-            enable_early_data: false,
-        },
-        Mode::Tls,
-        || 0,
-        workspace(),
     )
     .unwrap();
-    client
-        .set_identity(Identity::RawPublicKey {
-            signing_key: client_signing_key,
-        })
-        .unwrap();
-    let mut client_wire = Wire::reserved();
-    let mut server_wire = Wire::reserved();
-    client.start_into(&mut client_wire).unwrap();
-    server
-        .read_into(
-            Epoch::Plaintext,
-            &client_wire.plaintext,
-            &mut shard,
-            &mut server_wire,
-        )
-        .unwrap();
-    client_wire.clear();
-    client
-        .read_into(Epoch::Plaintext, &server_wire.plaintext, &mut client_wire)
-        .unwrap();
-    client
-        .read_into(Epoch::Handshake, &server_wire.handshake, &mut client_wire)
-        .unwrap();
-    let client_flight = client_wire.handshake.clone();
-    let mut result = None;
-    let allocations = raw::measured(|| {
-        result = Some(server.read_into(
-            Epoch::Handshake,
-            &client_flight,
-            &mut shard,
-            &mut server_wire,
-        ));
+    let mut rejected = false;
+    let allocations = AllocationProbe::measured(|| {
+        rejected = matches!(shard.bind(server), Err(Error::BadConfig));
     });
     assert_eq!(allocations, 0);
-    assert_eq!(
-        result.unwrap(),
-        Err(DriveError::Protocol(Error::WorkspaceExhausted(
-            WorkspaceRegion::PeerIdentity
-        )))
-    );
+    assert!(rejected);
 }
 
 #[test]
@@ -655,27 +653,27 @@ fn hello_retry_request_has_no_allocations() {
         source: CertSource::RawPublicKey { signing_key },
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-    });
-    let mut server = Server::with_workspace(
+    })
+    .unwrap();
+    let server = Server::with_workspace(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
         workspace(),
-    );
-    let mut client = Client::with_transport_workspace(
+    )
+    .unwrap();
+    let mut server = shard.bind(server).unwrap();
+    let mut client = Client::new(
         Config {
             verifier: Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
-        Mode::Tls,
         || 0,
-        workspace(),
     )
     .unwrap();
     client
@@ -686,26 +684,26 @@ fn hello_retry_request_has_no_allocations() {
     client.start_into(&mut client_wire).unwrap();
 
     let mut reader = codec::Reader::new(&client_wire.plaintext);
-    let Frame::ClientHello(mut hello) = Frame::decode(&mut reader).unwrap() else {
+    let Frame::ClientHello(mut hello) = MessageRef::decode_from(&mut reader).unwrap().into_owned()
+    else {
         panic!("client did not emit ClientHello");
     };
-    hello
+    let key_share = hello
         .extensions
-        .retain(|extension| extension.ty != Type::KEY_SHARE);
-    let mut without_key_share = Vec::new();
+        .iter_mut()
+        .find(|extension| extension.ty == Type::KEY_SHARE)
+        .unwrap();
+    key_share.data.clear();
+    key_share.data.extend_from_slice(&0u16.to_be_bytes());
+    let mut empty_key_share = Vec::new();
     Frame::ClientHello(hello)
-        .encode(&mut without_key_share)
+        .encode(&mut empty_key_share)
         .unwrap();
 
     assert_eq!(
-        raw::measured(|| {
+        AllocationProbe::measured(|| {
             server
-                .read_into(
-                    Epoch::Plaintext,
-                    &without_key_share,
-                    &mut shard,
-                    &mut server_wire,
-                )
+                .read_into(Epoch::Plaintext, &empty_key_share, &mut server_wire)
                 .unwrap()
         }),
         0
@@ -713,7 +711,7 @@ fn hello_retry_request_has_no_allocations() {
     let retry = server_wire.plaintext.clone();
     client_wire.clear();
     assert_eq!(
-        raw::measured(|| {
+        AllocationProbe::measured(|| {
             client
                 .read_into(Epoch::Plaintext, &retry, &mut client_wire)
                 .unwrap()

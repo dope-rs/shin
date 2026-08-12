@@ -1,101 +1,78 @@
+use core::mem::size_of;
+
+use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256, date_time_ymd};
 use shin::identity::UnixTime;
-use shin::identity::asn1::Tag;
-use shin::identity::cert::TimeValue;
+use shin::identity::cert::{Cert, Error, Validity};
 
-fn utc_time(s: &[u8]) -> TimeValue<'_> {
-    TimeValue {
-        tag: Tag::UTC_TIME,
-        bytes: s,
+fn certificate(not_before: (i32, u8, u8), not_after: (i32, u8, u8)) -> Vec<u8> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec!["time.local".into()]).unwrap();
+    params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
+    params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
+    params.self_signed(&key).unwrap().der().to_vec()
+}
+
+fn replace_time(der: &mut [u8], encoded: &[u8], replacement: &[u8]) {
+    assert_eq!(encoded.len(), replacement.len());
+    let offset = der
+        .windows(encoded.len())
+        .position(|candidate| candidate == encoded)
+        .expect("encoded certificate time");
+    der[offset..offset + encoded.len()].copy_from_slice(replacement);
+}
+
+#[test]
+fn parse_materializes_a_lifetime_free_validity_interval() {
+    let der = certificate((2020, 1, 1), (2050, 1, 1));
+    let validity = Cert::parse(&der).unwrap().tbs.validity;
+    assert_eq!(validity.not_before, UnixTime(1_577_836_800));
+    assert_eq!(validity.not_after, UnixTime(2_524_608_000));
+    assert_eq!(size_of::<Validity>(), 2 * size_of::<UnixTime>());
+}
+
+#[test]
+fn pre_epoch_x509_time_remains_orderable() {
+    let der = certificate((1950, 1, 1), (1970, 1, 1));
+    let validity = Cert::parse(&der).unwrap().tbs.validity;
+    assert_eq!(validity.not_before, UnixTime(-631_152_000));
+    assert_eq!(validity.not_after, UnixTime(0));
+    assert_eq!(validity.not_before.as_secs(), None);
+}
+
+#[test]
+fn maximum_x509_year_converts_without_year_linear_work() {
+    let der = certificate((2050, 1, 1), (9999, 1, 1));
+    let validity = Cert::parse(&der).unwrap().tbs.validity;
+    assert_eq!(validity.not_after, UnixTime(253_370_764_800));
+}
+
+#[test]
+fn parse_rejects_invalid_calendar_and_time_components() {
+    let der = certificate((2020, 1, 1), (2022, 1, 1));
+    for invalid in [
+        &b"200431000000Z"[..],
+        b"210229000000Z",
+        b"200230000000Z",
+        b"201231235960Z",
+        b"2001010000000",
+    ] {
+        let mut tampered = der.clone();
+        replace_time(&mut tampered, b"200101000000Z", invalid);
+        assert_eq!(Cert::parse(&tampered).unwrap_err(), Error::BadValidity);
     }
-}
 
-fn gen_time(s: &[u8]) -> TimeValue<'_> {
-    TimeValue {
-        tag: Tag::GENERALIZED_TIME,
-        bytes: s,
-    }
+    let mut leap_day = der;
+    replace_time(&mut leap_day, b"200101000000Z", b"200229000000Z");
+    assert!(Cert::parse(&leap_day).is_ok());
 }
 
 #[test]
-fn utc_time_unix_epoch() {
-    let t = utc_time(b"700101000000Z");
-    assert_eq!(UnixTime::from_time_value(&t).unwrap(), UnixTime(0));
-}
+fn parse_enforces_x509_time_encoding_and_interval_order() {
+    let mut noncanonical = certificate((2020, 1, 1), (2050, 1, 1));
+    replace_time(&mut noncanonical, b"20500101000000Z", b"20490101000000Z");
+    assert_eq!(Cert::parse(&noncanonical).unwrap_err(), Error::BadValidity);
 
-#[test]
-fn utc_time_year_2000_window() {
-    let t = utc_time(b"000101000000Z");
-    assert_eq!(
-        UnixTime::from_time_value(&t).unwrap(),
-        UnixTime(946_684_800)
-    );
-}
-
-#[test]
-fn utc_time_year_1990_window() {
-    let t = utc_time(b"900101000000Z");
-    assert_eq!(
-        UnixTime::from_time_value(&t).unwrap(),
-        UnixTime(631_152_000)
-    );
-}
-
-#[test]
-fn generalized_time_distant_future() {
-    let t = gen_time(b"20500101000000Z");
-    assert_eq!(
-        UnixTime::from_time_value(&t).unwrap(),
-        UnixTime(2_524_608_000)
-    );
-}
-
-#[test]
-fn invalid_time_format_rejected() {
-    let t = utc_time(b"700101");
-    assert!(UnixTime::from_time_value(&t).is_err());
-    let t = utc_time(b"7001010000007");
-    assert!(UnixTime::from_time_value(&t).is_err());
-}
-
-#[test]
-fn time_ordering_compares() {
-    let a = UnixTime::from_time_value(&utc_time(b"200101000000Z")).unwrap();
-    let b = UnixTime::from_time_value(&utc_time(b"210101000000Z")).unwrap();
-    assert!(a < b);
-}
-
-#[test]
-fn leap_second_rejected() {
-    // RFC 5280: seconds are 00..=59, so sec == 60 must be rejected.
-    assert!(UnixTime::from_time_value(&utc_time(b"201231235960Z")).is_err());
-    assert!(UnixTime::from_time_value(&gen_time(b"20201231235960Z")).is_err());
-    assert!(UnixTime::from_time_value(&utc_time(b"201231235959Z")).is_ok());
-}
-
-#[test]
-fn leap_year_handled() {
-    let jan1 = UnixTime::from_time_value(&utc_time(b"000101000000Z")).unwrap();
-    let mar1 = UnixTime::from_time_value(&utc_time(b"000301000000Z")).unwrap();
-    assert_eq!(mar1.0 - jan1.0, 60 * 86_400);
-}
-
-#[test]
-fn day_of_month_validated_against_month_length() {
-    // April has 30 days; April 31 is invalid.
-    assert!(UnixTime::from_time_value(&utc_time(b"210431000000Z")).is_err());
-    // June 31 invalid; June 30 valid.
-    assert!(UnixTime::from_time_value(&utc_time(b"210631000000Z")).is_err());
-    assert!(UnixTime::from_time_value(&utc_time(b"210630000000Z")).is_ok());
-}
-
-#[test]
-fn february_day_validation_with_leap_year() {
-    // 2021 is not a leap year: Feb 29 invalid, Feb 28 valid, Feb 30 always invalid.
-    assert!(UnixTime::from_time_value(&utc_time(b"210229000000Z")).is_err());
-    assert!(UnixTime::from_time_value(&utc_time(b"210228000000Z")).is_ok());
-    // 2020 is a leap year: Feb 29 valid, Feb 30 invalid.
-    assert!(UnixTime::from_time_value(&utc_time(b"200229000000Z")).is_ok());
-    assert!(UnixTime::from_time_value(&utc_time(b"200230000000Z")).is_err());
-    // Generalized-time leap century: 2000 is leap.
-    assert!(UnixTime::from_time_value(&gen_time(b"20000229000000Z")).is_ok());
+    let mut reversed = certificate((2020, 1, 1), (2022, 1, 1));
+    replace_time(&mut reversed, b"200101000000Z", b"230101000000Z");
+    assert_eq!(Cert::parse(&reversed).unwrap_err(), Error::BadValidity);
 }

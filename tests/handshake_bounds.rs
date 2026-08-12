@@ -1,6 +1,7 @@
 use shin::wire::codec::{DecodeError, Encode, Reader};
-use shin::wire::extension::{Extension, MAX_EXTENSIONS};
+use shin::wire::extension::{Extensions, MAX_EXTENSIONS};
 use shin::wire::handshake::MAX_CERTIFICATE_ENTRIES;
+use shin::wire::handshake::frame::CertificateRef;
 use shin::wire::handshake::messages::{Certificate, CertificateEntry};
 
 #[test]
@@ -19,7 +20,7 @@ fn duplicate_extension_type_is_rejected() {
     extensions.finish().unwrap();
     let mut r = Reader::new(&body);
     assert_eq!(
-        Extension::decode_list(&mut r).unwrap_err(),
+        Extensions::decode(&mut r).unwrap_err(),
         DecodeError::DuplicateExtension
     );
 }
@@ -38,8 +39,8 @@ fn distinct_extensions_decode() {
     data.finish().unwrap();
     extensions.finish().unwrap();
     let mut r = Reader::new(&body);
-    let exts = Extension::decode_list(&mut r).unwrap();
-    assert_eq!(exts.len(), 2);
+    let exts = Extensions::decode(&mut r).unwrap();
+    assert_eq!(exts.iter().count(), 2);
 }
 
 #[test]
@@ -56,7 +57,7 @@ fn too_many_extensions_rejected() {
     extensions.finish().unwrap();
     let mut r = Reader::new(&body);
     assert_eq!(
-        Extension::decode_list(&mut r).unwrap_err(),
+        Extensions::decode(&mut r).unwrap_err(),
         DecodeError::InvalidEnum
     );
 }
@@ -73,8 +74,8 @@ fn max_extensions_accepted() {
     }
     extensions.finish().unwrap();
     let mut r = Reader::new(&body);
-    let exts = Extension::decode_list(&mut r).unwrap();
-    assert_eq!(exts.len(), MAX_EXTENSIONS);
+    let exts = Extensions::decode(&mut r).unwrap();
+    assert_eq!(exts.iter().count(), MAX_EXTENSIONS);
 }
 
 #[test]
@@ -93,7 +94,7 @@ fn too_many_certificate_entries_rejected() {
     cert.encode(&mut bytes).unwrap();
     let mut r = Reader::new(&bytes);
     assert_eq!(
-        Certificate::decode(&mut r).unwrap_err(),
+        CertificateRef::decode(&mut r).unwrap_err(),
         DecodeError::TooManyCertificates
     );
 }
@@ -113,6 +114,6 @@ fn max_certificate_entries_accepted() {
     let mut bytes = Vec::new();
     cert.encode(&mut bytes).unwrap();
     let mut r = Reader::new(&bytes);
-    let decoded = Certificate::decode(&mut r).unwrap();
+    let decoded = CertificateRef::decode(&mut r).unwrap();
     assert_eq!(decoded.certificate_list.len(), MAX_CERTIFICATE_ENTRIES);
 }

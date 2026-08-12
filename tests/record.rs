@@ -136,7 +136,7 @@ fn seal_into_staged_equals_seal_and_round_trips() {
 fn seal_parts_crosses_slice_boundaries_without_changing_the_record() {
     let parts = [&b"response-"[..], &b""[..], &b"header"[..], &b"+body"[..]];
     let body_len = parts.iter().map(|part| part.len()).sum();
-    let pool = buffer::pool::Pool::try_new(1, 128).unwrap();
+    let pool = buffer::Pool::try_new(1, 128).unwrap();
     let mut output = pool.try_acquire_buffer().unwrap();
     let mut vectored = Sealer::from_secret(&TEST_SECRET).unwrap();
     {
@@ -156,7 +156,7 @@ fn seal_parts_crosses_slice_boundaries_without_changing_the_record() {
 
 #[test]
 fn seal_parts_rejects_length_mismatch_without_consuming_sequence() {
-    let pool = buffer::pool::Pool::try_new(1, 128).unwrap();
+    let pool = buffer::Pool::try_new(1, 128).unwrap();
     let mut output = pool.try_acquire_buffer().unwrap();
     let mut writer = output.spare_writer();
     let mut sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
@@ -192,7 +192,7 @@ fn seal_output_methods_match_byte_for_byte() {
         .unwrap();
     assert_eq!(&wire[..n], one.as_slice());
 
-    let pool = buffer::pool::Pool::try_new(1, one.len()).unwrap();
+    let pool = buffer::Pool::try_new(1, one.len()).unwrap();
     let mut direct = pool.try_acquire_buffer().unwrap();
     let mut into = Sealer::from_secret(&TEST_SECRET).unwrap();
     {
@@ -217,7 +217,7 @@ fn seal_output_methods_reject_undersized_buffer() {
         "a rejected seal must not spend the sequence"
     );
 
-    let pool = buffer::pool::Pool::try_new(1, HEADER_LEN).unwrap();
+    let pool = buffer::Pool::try_new(1, HEADER_LEN).unwrap();
     let mut tiny = pool.try_acquire_buffer().unwrap();
     let mut writer = tiny.spare_writer();
     assert_eq!(
@@ -236,7 +236,7 @@ fn encode_output_methods_match_byte_for_byte() {
     let n = Plaintext::encode_into_slice(ContentType::Handshake, body, &mut wire).unwrap();
     assert_eq!(&wire[..n], one.as_slice());
 
-    let pool = buffer::pool::Pool::try_new(1, one.len()).unwrap();
+    let pool = buffer::Pool::try_new(1, one.len()).unwrap();
     let mut direct = pool.try_acquire_buffer().unwrap();
     {
         let mut writer = direct.spare_writer();
@@ -253,7 +253,7 @@ fn encode_output_methods_reject_undersized_buffer() {
         Err(Error::BufferTooSmall)
     );
 
-    let pool = buffer::pool::Pool::try_new(1, HEADER_LEN).unwrap();
+    let pool = buffer::Pool::try_new(1, HEADER_LEN).unwrap();
     let mut tiny = pool.try_acquire_buffer().unwrap();
     let mut writer = tiny.spare_writer();
     assert_eq!(

@@ -2,11 +2,13 @@ use ring::rand::SystemRandom;
 use shin::crypto::material::ResumptionPsk;
 use shin::crypto::ticket::{Claims, Context, Error, Secret};
 use shin::transport::Mode;
+use shin::wire::record::CipherSuite;
 
 const SECRET: [u8; 32] = [0x42u8; 32];
+const SUITE: CipherSuite = CipherSuite::Aes128GcmSha256;
 
 fn s() -> Secret {
-    Secret::new(SECRET)
+    Secret::new(SECRET).unwrap()
 }
 
 #[test]
@@ -16,13 +18,13 @@ fn encrypt_then_decrypt_recovers_psk_age_add_and_issued_at() {
     let age_add = 0x1234_5678u32;
     let issued_at = 1_700_000_000_000u64;
     let ticket = s()
-        .encrypt(&psk, age_add, issued_at, 0x1301, b"", &rng)
+        .encrypt(&psk, age_add, issued_at, SUITE, b"", &rng)
         .unwrap();
     let dt = s().decrypt(&ticket).unwrap();
     assert_eq!(dt.psk.as_array(), &psk);
     assert_eq!(dt.age_add, age_add);
     assert_eq!(dt.issued_at_ms, issued_at);
-    assert_eq!(dt.suite, 0x1301);
+    assert_eq!(dt.suite, SUITE);
     assert_eq!(dt.alpn.as_slice(), b"");
 }
 
@@ -30,14 +32,23 @@ fn encrypt_then_decrypt_recovers_psk_age_add_and_issued_at() {
 fn encrypt_then_decrypt_round_trips_alpn() {
     let rng = SystemRandom::new();
     let psk = [0xCDu8; 32];
-    let ticket = s().encrypt(&psk, 7, 42, 0x1301, b"h2", &rng).unwrap();
+    let ticket = s().encrypt(&psk, 7, 42, SUITE, b"h2", &rng).unwrap();
     let dt = s().decrypt(&ticket).unwrap();
     assert_eq!(dt.psk.as_array(), &psk);
     assert_eq!(dt.alpn.as_slice(), b"h2");
 
-    let ticket2 = s().encrypt(&psk, 7, 42, 0x1301, b"http/1.1", &rng).unwrap();
+    let ticket2 = s().encrypt(&psk, 7, 42, SUITE, b"http/1.1", &rng).unwrap();
     let dt2 = s().decrypt(&ticket2).unwrap();
     assert_eq!(dt2.alpn.as_slice(), b"http/1.1");
+}
+
+#[test]
+fn encrypt_then_decrypt_round_trips_supported_cipher_suites() {
+    let rng = SystemRandom::new();
+    for suite in CipherSuite::SUPPORTED {
+        let ticket = s().encrypt(&[1; 32], 2, 3, suite, b"", &rng).unwrap();
+        assert_eq!(s().decrypt(&ticket).unwrap().suite, suite);
+    }
 }
 
 #[test]
@@ -45,7 +56,7 @@ fn encrypt_rejects_overlong_alpn() {
     let rng = SystemRandom::new();
     let too_long = [0u8; 256];
     assert_eq!(
-        s().encrypt(&[0u8; 32], 0, 0, 0x1301, &too_long, &rng),
+        s().encrypt(&[0u8; 32], 0, 0, SUITE, &too_long, &rng),
         Err(Error::BadFormat)
     );
 }
@@ -54,7 +65,7 @@ fn encrypt_rejects_overlong_alpn() {
 fn decrypt_rejects_tampered_tail() {
     let rng = SystemRandom::new();
     let psk = [0u8; 32];
-    let ticket = s().encrypt(&psk, 0, 0, 0x1301, b"", &rng).unwrap();
+    let ticket = s().encrypt(&psk, 0, 0, SUITE, b"", &rng).unwrap();
     let mut tampered = ticket.as_slice().to_vec();
     let n = tampered.len();
     tampered[n - 1] ^= 0xFF;
@@ -64,8 +75,8 @@ fn decrypt_rejects_tampered_tail() {
 #[test]
 fn decrypt_rejects_wrong_secret() {
     let rng = SystemRandom::new();
-    let other = Secret::new([0x00u8; 32]);
-    let ticket = s().encrypt(&[7u8; 32], 9, 0, 0x1301, b"", &rng).unwrap();
+    let other = Secret::new([0x00u8; 32]).unwrap();
+    let ticket = s().encrypt(&[7u8; 32], 9, 0, SUITE, b"", &rng).unwrap();
     assert_eq!(other.decrypt(&ticket), Err(Error::BadAuth));
 }
 
@@ -79,8 +90,8 @@ fn decrypt_rejects_short_input() {
 fn nonce_is_random_so_two_encryptions_differ() {
     let rng = SystemRandom::new();
     let psk = [0u8; 32];
-    let a = s().encrypt(&psk, 0, 0, 0x1301, b"", &rng).unwrap();
-    let b = s().encrypt(&psk, 0, 0, 0x1301, b"", &rng).unwrap();
+    let a = s().encrypt(&psk, 0, 0, SUITE, b"", &rng).unwrap();
+    let b = s().encrypt(&psk, 0, 0, SUITE, b"", &rng).unwrap();
     assert_ne!(a, b);
 }
 
@@ -95,7 +106,7 @@ fn authenticated_early_data_context_requires_same_mode_and_transport_params() {
                 psk: &psk,
                 age_add: 5,
                 issued_at_ms: 7,
-                suite: 0x1301,
+                suite: SUITE,
                 alpn: b"h3",
                 context,
             },
@@ -135,7 +146,7 @@ fn authenticated_early_data_context_requires_same_replay_domain() {
                 psk: &psk,
                 age_add: 5,
                 issued_at_ms: 7,
-                suite: 0x1301,
+                suite: SUITE,
                 alpn: b"h2",
                 context,
             },
@@ -180,7 +191,7 @@ fn malformed_mode_specific_allowance_is_not_issued() {
                     psk: &psk,
                     age_add: 0,
                     issued_at_ms: 0,
-                    suite: 0x1301,
+                    suite: SUITE,
                     alpn: b"",
                     context,
                 },

@@ -51,7 +51,6 @@ fn client_finished_and_server() -> (TestServer, Vec<u8>) {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         || 0,

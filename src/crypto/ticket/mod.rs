@@ -14,6 +14,15 @@ pub use keys::Keys;
 pub use rotator::Rotator;
 pub use secret::Secret;
 
+pub(crate) struct OpenedResumption {
+    pub(crate) psk: material::ResumptionPsk,
+    pub(crate) age_add: u32,
+    pub(crate) issued_at_ms: u64,
+    pub(crate) suite: record::CipherSuite,
+    pub(crate) context: Context,
+    pub(crate) alpn_matches: bool,
+}
+
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const PSK_LEN: usize = 32;
@@ -50,3 +59,5 @@ pub enum Error {
     BadKey,
 }
 use crate::crypto::hash;
+use crate::crypto::material;
+use crate::wire::record;

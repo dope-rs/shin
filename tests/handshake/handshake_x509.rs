@@ -1,6 +1,6 @@
 use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose, NameConstraints, PKCS_ED25519,
+    BasicConstraints, CertificateParams, DnValue, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, NameConstraints, PKCS_ED25519,
 };
 
 use shin::client::Client;
@@ -12,7 +12,9 @@ use shin::identity::asn1::{Reader, Tag};
 use shin::identity::cert::Cert;
 use shin::server::config::CertSource;
 
-use crate::common::{CollectEvents, Server, ServerConfig, find_send, has_done};
+use crate::common::{
+    CollectEvents, Server, ServerConfig, cert_validity_midpoint, find_send, has_done,
+};
 
 const HOSTNAME: &str = "host.local";
 
@@ -37,7 +39,7 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     let mut r = Reader::new(pkcs8);
     let inner = r.read_tagged(Tag::SEQUENCE).ok()?;
     let mut ir = Reader::new(inner);
-    let _version = ir.read_tagged(Tag::INTEGER).ok()?;
+    let _version = ir.read_uint().ok()?;
     let _alg = ir.read_tagged(Tag::SEQUENCE).ok()?;
     let outer_oct = ir.read_tagged(Tag::OCTET_STRING).ok()?;
     let mut or = Reader::new(outer_oct);
@@ -50,19 +52,12 @@ fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     Some(seed)
 }
 
-fn now_inside(cert_der: &[u8]) -> u64 {
-    let cert = Cert::parse(cert_der).unwrap();
-    let nb = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_before).unwrap();
-    let na = shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_after).unwrap();
-    (nb.0 + na.0) / 2
-}
-
 #[test]
 fn handshake_with_x509_chain() {
     let (cert_der, signing) = ed25519_self_signed();
 
     let anchor = OwnedTrustAnchor::from_cert_der(&cert_der).unwrap();
-    let now = now_inside(&cert_der);
+    let now = cert_validity_midpoint(&cert_der);
 
     let server = Server::new(
         ServerConfig {
@@ -82,10 +77,10 @@ fn handshake_with_x509_chain() {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now * 1000,
@@ -105,6 +100,82 @@ fn handshake_with_x509_chain() {
     let cf = find_send(&c3, Epoch::Handshake).expect("CF");
     let s2 = server.read(Epoch::Handshake, &cf).unwrap();
     assert!(has_done(&s2));
+}
+
+#[test]
+fn handshake_matches_semantically_equal_anchor_name() {
+    let root_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+    let mut issuer_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    issuer_params.distinguished_name = rcgen::DistinguishedName::new();
+    issuer_params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        DnValue::Utf8String("  Cafe\u{301}   ROOT ".into()),
+    );
+    issuer_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    issuer_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+
+    let mut anchor_params = issuer_params.clone();
+    anchor_params.distinguished_name = rcgen::DistinguishedName::new();
+    anchor_params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        DnValue::Utf8String("CAFÉ ROOT".into()),
+    );
+    let anchor_der = anchor_params.self_signed(&root_key).unwrap().der().to_vec();
+
+    let leaf_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+    let leaf_seed = extract_ed25519_seed(&leaf_key.serialize_der()).unwrap();
+    let signing = SigningKey::from_seed(&leaf_seed).unwrap();
+    let mut leaf_params = CertificateParams::new(vec![HOSTNAME.into()]).unwrap();
+    leaf_params.is_ca = IsCa::NoCa;
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let leaf_der = leaf_params
+        .signed_by(&leaf_key, &Issuer::from_params(&issuer_params, &root_key))
+        .unwrap()
+        .der()
+        .to_vec();
+    let leaf = Cert::parse(&leaf_der).unwrap();
+    let anchor = Cert::parse(&anchor_der).unwrap();
+    assert_ne!(
+        leaf.tbs.names.issuer.as_der(),
+        anchor.tbs.names.subject.as_der()
+    );
+    let now = cert_validity_midpoint(&leaf_der);
+
+    let mut server = Server::new(
+        ServerConfig {
+            source: CertSource::X509 {
+                chain_der: vec![leaf_der],
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
+        },
+        || 0,
+    );
+    let mut client = Client::new(
+        config::Config {
+            verifier: Verifier::X509 {
+                anchors: vec![OwnedTrustAnchor::from_cert_der(&anchor_der).unwrap()],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            enable_early_data: false,
+        },
+        move || now * 1000,
+    )
+    .unwrap();
+
+    let ch = find_send(&client.start().unwrap(), Epoch::Plaintext).unwrap();
+    let server_flight = server.read(Epoch::Plaintext, &ch).unwrap();
+    let sh = find_send(&server_flight, Epoch::Plaintext).unwrap();
+    let server_hs = find_send(&server_flight, Epoch::Handshake).unwrap();
+    client.read(Epoch::Plaintext, &sh).unwrap();
+    let completed = client.read(Epoch::Handshake, &server_hs).unwrap();
+    assert!(has_done(&completed));
 }
 
 #[test]
@@ -160,7 +231,7 @@ fn handshake_enforces_certificate_derived_anchor_name_constraints() {
         .unwrap()
         .der()
         .to_vec();
-    let now = now_inside(&leaf_der);
+    let now = cert_validity_midpoint(&leaf_der);
 
     let mut server = Server::new(
         ServerConfig {
@@ -180,10 +251,10 @@ fn handshake_enforces_certificate_derived_anchor_name_constraints() {
             verifier: Verifier::X509 {
                 anchors: vec![OwnedTrustAnchor::from_cert_der(&root_der).unwrap()],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now * 1000,
@@ -207,7 +278,7 @@ fn handshake_enforces_certificate_derived_anchor_name_constraints() {
 fn rejects_wrong_hostname() {
     let (cert_der, signing) = ed25519_self_signed();
     let anchor = OwnedTrustAnchor::from_cert_der(&cert_der).unwrap();
-    let now = now_inside(&cert_der);
+    let now = cert_validity_midpoint(&cert_der);
 
     let mut server = Server::new(
         ServerConfig {
@@ -227,10 +298,10 @@ fn rejects_wrong_hostname() {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: b"other.local".to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now * 1000,
@@ -255,7 +326,7 @@ fn rejects_unknown_anchor() {
     let (cert_der, signing) = ed25519_self_signed();
     let (other_der, _) = ed25519_self_signed();
     let bogus_anchor = OwnedTrustAnchor::from_cert_der(&other_der).unwrap();
-    let now = now_inside(&cert_der);
+    let now = cert_validity_midpoint(&cert_der);
 
     let mut server = Server::new(
         ServerConfig {
@@ -275,10 +346,10 @@ fn rejects_unknown_anchor() {
             verifier: Verifier::X509 {
                 anchors: vec![bogus_anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || now * 1000,
@@ -297,9 +368,7 @@ fn rejects_unknown_anchor() {
 
 fn not_after(cert_der: &[u8]) -> u64 {
     let cert = Cert::parse(cert_der).unwrap();
-    shin::identity::UnixTime::from_time_value(&cert.tbs.validity.not_after)
-        .unwrap()
-        .0
+    cert.tbs.validity.not_after.as_secs().unwrap()
 }
 
 #[test]
@@ -326,10 +395,10 @@ fn stale_clock_rejects_expired_certificate() {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),
+                certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         move || expired_at * 1000,
@@ -355,10 +424,10 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
         verifier: Verifier::X509 {
             anchors: Vec::new(),
             hostname: HOSTNAME.as_bytes().to_vec(),
+            certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
         },
         transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
-        resumption: None,
         enable_early_data: false,
     };
     assert_eq!(
@@ -372,10 +441,10 @@ fn config_validate_rejects_empty_anchors_and_hostname() {
         verifier: Verifier::X509 {
             anchors: vec![anchor],
             hostname: Vec::new(),
+            certificate_limit: shin::client::config::CertificateLimit::ONE_RECORD,
         },
         transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
-        resumption: None,
         enable_early_data: false,
     };
     assert_eq!(empty_host.validate().unwrap_err(), Error::MissingServerName);
@@ -389,7 +458,6 @@ fn config_validate_rejects_oversized_alpn_and_transport_params() {
         },
         transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
-        resumption: None,
         enable_early_data: false,
     };
 

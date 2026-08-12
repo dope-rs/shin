@@ -39,6 +39,9 @@ pub enum Error {
         len: usize,
         maximum: usize,
     },
+    InvalidResumptionLifetime,
+    ResumptionKeyDerivation,
+    InvalidEarlyDataEntitlement,
     ClientHelloEncodingOverflow,
     ClientHelloTooLarge {
         len: usize,
@@ -90,6 +93,15 @@ impl fmt::Display for Error {
                 formatter,
                 "resumption ticket length {len} exceeds maximum {maximum}"
             ),
+            Self::InvalidResumptionLifetime => {
+                formatter.write_str("resumption ticket lifetime is invalid")
+            }
+            Self::ResumptionKeyDerivation => {
+                formatter.write_str("resumption PSK derivation failed")
+            }
+            Self::InvalidEarlyDataEntitlement => {
+                formatter.write_str("early-data entitlement is incompatible with this profile")
+            }
             Self::ClientHelloEncodingOverflow => {
                 formatter.write_str("initial ClientHello length field overflow")
             }

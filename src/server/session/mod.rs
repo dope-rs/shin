@@ -2,7 +2,7 @@ use crate::connection;
 use crate::crypto::hash;
 use crate::crypto::material;
 use crate::crypto::schedule;
-use crate::identity::leafkey;
+use crate::identity;
 use crate::memory::threadbound;
 use crate::server;
 use crate::server::config;
@@ -12,8 +12,12 @@ use crate::wire::handshake::messages;
 use crate::wire::handshake::reassemblers;
 use crate::wire::handshake::views;
 use crate::wire::handshake::workspace;
+use crate::wire::protocols;
 use crate::wire::record;
+use core::mem;
 use ring::rand;
+
+pub(super) mod updates;
 
 const MAX_TICKET_AGE_SKEW_MS: u64 = 10_000;
 const MAX_EARLY_DATA_SIZE: u32 = 16_384;
@@ -22,7 +26,6 @@ const TICKET_LIFETIME_MS: u64 = TICKET_LIFETIME_SECS as u64 * 1_000;
 
 pub(super) struct Session<C> {
     pub(super) connection: config::Connection,
-    pub(super) connection_validation_error: Option<connection::Error>,
     pub(super) transport_mode: transport::Mode,
     pub(super) handshake: Handshake,
     pub(super) peer: Peer,
@@ -31,12 +34,12 @@ pub(super) struct Session<C> {
     pub(super) runtime: Runtime<C>,
 }
 
-pub(super) trait Drive {
+pub(super) trait Drive<const DOMAIN: u8> {
     fn drive_record<G, V, S>(
         &mut self,
         epoch: connection::Epoch,
         data: &[u8],
-        shard: &mut server::Shard<G, V>,
+        shard: &mut server::Shard<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
@@ -49,19 +52,13 @@ pub(super) trait Drive {
         epoch: connection::Epoch,
         message: views::MessageRef<'_>,
         raw: &[u8],
-        shard: &mut server::Shard<G, V>,
+        shard: &mut server::Shard<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
         G: config::EarlyDataGuard,
         V: config::ClientCertVerifier,
         S: connection::EventSink + ?Sized;
-
-    fn send_key_update<S: connection::EventSink + ?Sized>(
-        &mut self,
-        request_update: bool,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>;
 
     fn poison(&mut self);
 }
@@ -70,14 +67,16 @@ pub(super) struct AcceptedPsk {
     pub(super) psk: material::ResumptionPsk,
     pub(super) ticket: Ticket,
     pub(super) binder: [u8; 32],
-    pub(super) alpn: arrayvec::ArrayVec<u8, 255>,
+    pub(super) alpn_matches: bool,
     pub(super) _thread: threadbound::ThreadBound,
 }
+
+const _: () = assert!(mem::size_of::<AcceptedPsk>() <= 104);
 
 pub(super) struct Ticket {
     pub(super) age_add: u32,
     pub(super) issued_at_ms: u64,
-    pub(super) suite: u16,
+    pub(super) suite: record::CipherSuite,
     pub(super) obfuscated_age: u32,
     pub(super) max_early_data: Option<u32>,
 }
@@ -107,9 +106,8 @@ impl EarlyData {
     pub(super) fn admit<G: config::EarlyDataGuard>(
         &mut self,
         guard: &mut G,
-        offered: bool,
+        offered: Option<protocols::EarlyDataSignal>,
         psk: Option<&AcceptedPsk>,
-        selected_alpn: Option<&[u8]>,
         suite: Option<record::CipherSuite>,
         now_ms: u64,
     ) -> bool {
@@ -117,7 +115,7 @@ impl EarlyData {
         self.remaining = None;
         self.maximum = None;
         self.enabled = enabled;
-        if !enabled || !offered {
+        if !enabled || offered.is_none() {
             return false;
         }
         let Some(psk) = psk else {
@@ -126,10 +124,7 @@ impl EarlyData {
         let Some(maximum) = psk.ticket.max_early_data else {
             return false;
         };
-        let selected_alpn = selected_alpn.unwrap_or_default();
-        if selected_alpn != psk.alpn.as_slice()
-            || suite.map(record::CipherSuite::wire_id) != Some(psk.ticket.suite)
-        {
+        if !psk.alpn_matches || suite != Some(psk.ticket.suite) {
             return false;
         }
         if now_ms < psk.ticket.issued_at_ms {
@@ -193,14 +188,24 @@ pub(super) struct Handshake {
     pub(super) transcript: hash::Transcript,
     pub(super) hrr_done: bool,
     pub(super) hrr_invariant: Option<retry::ClientHelloInvariant>,
-    pub(super) shard_identity: Option<u64>,
 }
 
 pub(super) struct Peer {
-    pub(super) selected_alpn: Option<arrayvec::ArrayVec<u8, 255>>,
+    pub(super) selected_alpn: Option<protocols::AlpnId>,
     pub(super) early_data: EarlyData,
-    pub(super) client_cert_type: u8,
-    pub(super) client_leaf: Option<leafkey::LeafKey>,
+    pub(super) client_cert_type: identity::CertificateType,
+}
+
+const _: () = assert!(mem::size_of::<Peer>() <= 40);
+
+impl Peer {
+    pub(super) fn selected_alpn<'a>(
+        &self,
+        protocols: &'a protocols::PreparedAlpn,
+    ) -> Option<&'a [u8]> {
+        self.selected_alpn
+            .and_then(|selected| protocols.get(selected))
+    }
 }
 
 pub(super) struct Application {
@@ -280,49 +285,10 @@ impl<C: connection::Clock> Session<C> {
         ku: messages::KeyUpdate,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        use crate::connection::Error;
-        use crate::connection::Event;
-        use crate::connection::EventContext;
-        use crate::connection::KeyDirection;
         if !self.transport_mode.allows_tls_key_update() {
-            return Err(Error::UnexpectedMessage.into());
+            return Err(connection::Error::UnexpectedMessage.into());
         }
-        if !self.application.traffic.consume_update() {
-            return Err(Error::UnexpectedMessage.into());
-        }
-        let suite = self.application.traffic.suite();
-        let read = self.application.traffic.advance(material::Side::Client)?;
-        EventContext::emit(
-            events,
-            suite,
-            Event::KeyUpdate {
-                direction: KeyDirection::Read,
-                secret: read,
-            },
-        )?;
-
-        if ku.request_update == 1 {
-            use crate::connection::Epoch;
-            let reply = messages::KeyUpdate { request_update: 0 };
-            let bytes = reply.encode_framed();
-            EventContext::emit(
-                events,
-                suite,
-                Event::Send {
-                    epoch: Epoch::Application,
-                    data: &bytes,
-                },
-            )?;
-            let write = self.application.traffic.advance(material::Side::Server)?;
-            EventContext::emit(
-                events,
-                suite,
-                Event::KeyUpdate {
-                    direction: KeyDirection::Write,
-                    secret: write,
-                },
-            )?;
-        }
-        Ok(())
+        connection::KeyUpdateCore::<connection::ServerRole>::new(&mut self.application.traffic)
+            .receive(ku.request, events)
     }
 }

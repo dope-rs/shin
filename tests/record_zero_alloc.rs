@@ -6,9 +6,12 @@ use shin::client::config::Config;
 use shin::connection::{DriveError, Epoch, Event, EventContext, EventSink};
 use shin::crypto::sig;
 use shin::server;
+use shin::wire::handshake::KeyUpdateRequest;
 use shin::wire::record::{CipherSuite, ContentType, Opener, Sealer};
 
-mod raw;
+mod support;
+
+use support::AllocationProbe;
 
 const TEST_SECRET: [u8; 32] = [
     0xb6, 0x7b, 0x7d, 0x69, 0x0c, 0xc1, 0x6c, 0x4e, 0x75, 0xe5, 0x42, 0x13, 0xcb, 0x2d, 0x37, 0xb4,
@@ -55,6 +58,7 @@ struct KeyUpdateSink {
     sends: usize,
     updates: usize,
     suite: Option<CipherSuite>,
+    expected_request: u8,
 }
 
 impl EventSink for KeyUpdateSink {
@@ -64,7 +68,7 @@ impl EventSink for KeyUpdateSink {
         match event {
             Event::Send { epoch, data } => {
                 assert_eq!(epoch, Epoch::Application);
-                assert_eq!(data, [24, 0, 0, 1, 0]);
+                assert_eq!(data, [24, 0, 0, 1, self.expected_request]);
                 self.sends += 1;
                 self.suite = context.cipher_suite();
             }
@@ -96,21 +100,21 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
         .unwrap();
     let mut opener = Opener::from_secret(&TEST_SECRET).unwrap();
     let mut parts_sealer = Sealer::from_secret(&TEST_SECRET).unwrap();
-    let pool = buffer::pool::Pool::try_new(1, 128).unwrap();
+    let pool = buffer::Pool::try_new(1, 128).unwrap();
     let mut sealed_output = pool.try_acquire_buffer().unwrap();
     let parts = [&b"caller-"[..], &b"owned "[..], &b"input"[..]];
 
     opener.open(&mut warmup).unwrap().unwrap();
 
-    raw::reset();
+    AllocationProbe::reset();
     let (content_type, range, _) = opener.open(&mut measured).unwrap().unwrap();
-    let allocations = raw::count();
+    let allocations = AllocationProbe::count();
 
     assert_eq!(content_type, ContentType::ApplicationData);
     assert_eq!(&measured[range], b"caller-owned output");
     assert_eq!(allocations, 0, "opening a caller-owned record allocated");
 
-    raw::reset();
+    AllocationProbe::reset();
     {
         let mut writer = sealed_output.spare_writer();
         parts_sealer
@@ -122,7 +126,7 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
             )
             .unwrap();
     }
-    let allocations = raw::count();
+    let allocations = AllocationProbe::count();
 
     assert!(!sealed_output.is_empty());
     assert_eq!(
@@ -138,13 +142,16 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
         },
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-    });
-    let mut server = server::Server::new(
+    })
+    .unwrap();
+    let server = server::Server::new(
         server::config::Connection {
             transport_params: Vec::new(),
         },
         || 0,
-    );
+    )
+    .unwrap();
+    let mut server = shard.bind(server).unwrap();
     let mut client = Client::new(
         Config {
             verifier: shin::client::config::Verifier::RawPublicKey {
@@ -152,7 +159,6 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         || 0,
@@ -161,7 +167,7 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
     let client_start = collect_handshake_events(|events| client.start_into(events));
     let client_hello = client_start.send(Epoch::Plaintext);
     let server_start = collect_handshake_events(|events| {
-        server.read_into(Epoch::Plaintext, &client_hello, &mut shard, events)
+        server.read_into(Epoch::Plaintext, &client_hello, events)
     });
     let server_hello = server_start.send(Epoch::Plaintext);
     let server_flight = server_start.send(Epoch::Handshake);
@@ -171,7 +177,7 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
     });
     let client_flight = client_finish.send(Epoch::Handshake);
     let server_finish = collect_handshake_events(|events| {
-        server.read_into(Epoch::Handshake, &client_flight, &mut shard, events)
+        server.read_into(Epoch::Handshake, &client_flight, events)
     });
     assert!(server_finish.done);
 
@@ -180,23 +186,39 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
         sends: 0,
         updates: 0,
         suite: None,
+        expected_request: 0,
     };
-    raw::reset();
-    client.send_key_update_into(false, &mut sink).unwrap();
-    let allocations = raw::count();
+    AllocationProbe::reset();
+    client
+        .key_updates()
+        .send_into(KeyUpdateRequest::NotRequested, &mut sink)
+        .unwrap();
+    let allocations = AllocationProbe::count();
 
     assert_eq!(sink.sends, 1);
     assert_eq!(sink.updates, 1);
     assert_eq!(sink.suite, Some(CipherSuite::Aes128GcmSha256));
     assert_eq!(allocations, 0);
 
-    raw::reset();
+    sink.expected_request = 1;
+    AllocationProbe::reset();
+    client
+        .key_updates()
+        .send_into(KeyUpdateRequest::Requested, &mut sink)
+        .unwrap();
+    let allocations = AllocationProbe::count();
+
+    assert_eq!(sink.sends, 2);
+    assert_eq!(sink.updates, 2);
+    assert_eq!(allocations, 0);
+
+    AllocationProbe::reset();
     client
         .read_into(Epoch::Application, &key_update, &mut sink)
         .unwrap();
-    let allocations = raw::count();
+    let allocations = AllocationProbe::count();
 
-    assert_eq!(sink.updates, 2);
+    assert_eq!(sink.updates, 3);
     assert_eq!(sink.suite, Some(CipherSuite::Aes128GcmSha256));
     assert_eq!(allocations, 0);
 
@@ -206,15 +228,15 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
     client
         .read_into(Epoch::Application, &key_update[2..], &mut sink)
         .unwrap();
-    raw::reset();
+    AllocationProbe::reset();
     client
         .read_into(Epoch::Application, &key_update[..3], &mut sink)
         .unwrap();
     client
         .read_into(Epoch::Application, &key_update[3..], &mut sink)
         .unwrap();
-    let allocations = raw::count();
+    let allocations = AllocationProbe::count();
 
-    assert_eq!(sink.updates, 4);
+    assert_eq!(sink.updates, 5);
     assert_eq!(allocations, 0);
 }

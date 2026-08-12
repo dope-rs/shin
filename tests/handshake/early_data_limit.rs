@@ -1,5 +1,5 @@
 use shin::client::Client;
-use shin::client::config::{Config, Resumption, Verifier};
+use shin::client::config::{Config, Restore, Verifier};
 use shin::connection::{Clock, Epoch, Error};
 use shin::crypto::sig::SigningKey;
 use shin::server::{config::CertSource, config::EarlyDataGuard};
@@ -54,7 +54,7 @@ fn server(accept: bool) -> Server<TestGuard, TestGuard> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET)),
+            ticket_keys: Some(shin::crypto::ticket::Keys::single(TICKET_SECRET).unwrap()),
             accept_early_data: accept,
         },
         TestGuard::new(NOW_MS),
@@ -62,23 +62,28 @@ fn server(accept: bool) -> Server<TestGuard, TestGuard> {
     )
 }
 
-fn client(resumption: Option<Resumption>, enable_early_data: bool) -> Client<fn() -> u64> {
-    Client::new(
-        Config {
-            verifier: Verifier::RawPublicKey {
-                expected_pubkey: *signing_key().pubkey().unwrap(),
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            resumption,
-            enable_early_data,
+fn client(restore: Option<Restore<'_>>, enable_early_data: bool) -> Client<fn() -> u64> {
+    let template = Config {
+        verifier: Verifier::RawPublicKey {
+            expected_pubkey: *signing_key().pubkey().unwrap(),
         },
-        (|| 0) as fn() -> u64,
-    )
-    .unwrap()
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        enable_early_data,
+    }
+    .try_into_template()
+    .unwrap();
+    let prepared = match restore {
+        Some(restore) => template.restore(restore).unwrap(),
+        None => template.without_resumption(),
+    };
+    let workspace = prepared.workspace_layout(None).allocate();
+    prepared
+        .try_into_client_with_workspace(None, (|| 0) as fn() -> u64, workspace)
+        .unwrap()
 }
 
-fn issue_ticket() -> Resumption {
+fn issue_ticket() -> Restore<'static> {
     let mut s = server(true);
     let mut c = client(None, false);
     let c1 = c.start().unwrap();
@@ -93,29 +98,10 @@ fn issue_ticket() -> Resumption {
     let nst = find_send(&s2, Epoch::Application).unwrap();
     let extra = c.read(Epoch::Application, &nst).unwrap();
 
-    let mut psk = None;
-    let mut tkt = None;
-    for e in extra {
-        match e {
-            Event::ResumptionSecret { psk: p } => psk = Some(p),
-            Event::NewSessionTicket {
-                ticket_age_add,
-                ticket,
-                max_early_data,
-                ..
-            } => tkt = Some((ticket_age_add, ticket, max_early_data)),
-            _ => {}
-        }
-    }
-    let (age_add, ticket, max_early_data) = tkt.unwrap();
-    Resumption::new_with_early_data(
-        psk.unwrap(),
-        ticket,
-        age_add,
-        0,
-        max_early_data.unwrap(),
-        shin::transport::Mode::Tls,
-    )
+    extra
+        .into_iter()
+        .find_map(Event::into_restore)
+        .expect("server issued a restorable ticket")
 }
 
 fn early_accepted_server() -> Server<TestGuard, TestGuard> {

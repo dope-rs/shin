@@ -2,9 +2,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use shin::wire::codec::Reader;
-use shin::wire::extension::Extension;
+use shin::wire::extension::Extensions;
 
 fuzz_target!(|data: &[u8]| {
     let mut r = Reader::new(data);
-    let _ = Extension::decode_list(&mut r);
+    let _ = Extensions::decode(&mut r);
 });

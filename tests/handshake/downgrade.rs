@@ -17,7 +17,6 @@ fn client() -> Client<fn() -> u64> {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            resumption: None,
             enable_early_data: false,
         },
         (|| 0) as fn() -> u64,
@@ -28,7 +27,7 @@ fn client() -> Client<fn() -> u64> {
 fn session_id_echo(events: &[Event]) -> Vec<u8> {
     let encoded = send(events, Epoch::Plaintext);
     let mut reader = Reader::new(&encoded);
-    let Frame::ClientHello(hello) = Frame::decode(&mut reader).unwrap() else {
+    let Frame::ClientHello(hello) = crate::decode_owned(&mut reader).unwrap() else {
         panic!("expected ClientHello");
     };
     hello.legacy_session_id

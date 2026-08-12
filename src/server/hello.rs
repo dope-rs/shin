@@ -1,5 +1,4 @@
 use crate::connection;
-use crate::crypto::kx;
 use crate::server;
 use crate::server::config;
 use crate::server::resumption::Resumption as _;
@@ -7,19 +6,18 @@ use crate::server::retry;
 use crate::server::retry::Retry as _;
 use crate::transport;
 use crate::wire::codec::Encode as _;
+use crate::wire::codec::Reserve as _;
 use crate::wire::extension;
+use crate::wire::handshake;
 use crate::wire::handshake::views;
 use crate::wire::protocols;
 use ring::rand::SecureRandom as _;
-
-use crate::wire::handshake;
-
 pub(super) trait Hello {
-    fn handle_client_hello<G, V, S>(
+    fn handle_client_hello<G, V, S, const DOMAIN: u8>(
         &mut self,
         ch: views::ClientHelloRef<'_>,
         raw: &[u8],
-        shard: &mut server::Shard<G, V>,
+        shard: &mut server::Shard<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
@@ -27,12 +25,12 @@ pub(super) trait Hello {
         V: config::ClientCertVerifier,
         S: connection::EventSink + ?Sized;
 }
-impl<C: connection::Clock> Hello for server::Server<C> {
-    fn handle_client_hello<G, V, S>(
+impl<C: connection::Clock, const SERVER_DOMAIN: u8> Hello for server::Server<C, SERVER_DOMAIN> {
+    fn handle_client_hello<G, V, S, const DOMAIN: u8>(
         &mut self,
         ch: views::ClientHelloRef<'_>,
         raw: &[u8],
-        shard: &mut server::Shard<G, V>,
+        shard: &mut server::Shard<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
@@ -47,15 +45,16 @@ impl<C: connection::Clock> Hello for server::Server<C> {
         use crate::wire::handshake::frame::Frame;
         use crate::wire::handshake::messages::Finished;
         use crate::wire::protocols::SignatureAlgorithms;
-        use crate::wire::protocols::SupportedGroups;
         use crate::wire::protocols::SupportedVersions;
         use crate::wire::psk::RESUMPTION_HASH;
         use crate::wire::record::CipherSuite;
         if ch.legacy_version != handshake::TLS_1_2 {
             return Err(connection::Error::IllegalParameter.into());
         }
+        let offers = ClientHelloOffers::parse(ch.extensions, raw)?;
+        let client_kx = offers.kx();
         if let Some(invariant) = self.session.handshake.hrr_invariant {
-            invariant.validate(ch)?;
+            invariant.validate(ch, client_kx)?;
         }
         let selected_suite = CipherSuite::SUPPORTED
             .iter()
@@ -86,28 +85,15 @@ impl<C: connection::Clock> Hello for server::Server<C> {
         if !SupportedVersions::decode_client(sv.data)?.contains(protocols::TLS_1_3) {
             return Err(connection::Error::BadVersion.into());
         }
-        let groups = ch
-            .extensions
-            .find(extension::Type::SUPPORTED_GROUPS)
-            .ok_or(connection::Error::MissingExtension)?;
-        let supported_groups = SupportedGroups::decode(groups.data)?;
-        let mut hrr_group = None;
-        for group in kx::KexGroup::SUPPORTED {
-            if supported_groups.contains(group.wire_id()) {
-                hrr_group = Some(group);
-                break;
-            }
-        }
-        let hrr_group = hrr_group.ok_or(connection::Error::UnsupportedGroup)?;
+        let hrr_group = client_kx.retry_group();
         let sigs = ch
             .extensions
             .find(extension::Type::SIGNATURE_ALGORITHMS)
             .ok_or(connection::Error::MissingExtension)?;
-        let local_sig_scheme = shard.policy.config.source.signing_key().sig_scheme();
-        if !SignatureAlgorithms::contains(sigs.data, local_sig_scheme)? {
+        let local_sig_scheme = shard.policy.source.signing_key().sig_scheme();
+        if !SignatureAlgorithms::accepts(sigs.data, Some(local_sig_scheme))? {
             return Err(connection::Error::UnsupportedSigScheme.into());
         }
-        let offers = ClientHelloOffers::parse(ch.extensions)?;
         match (
             self.session.transport_mode,
             offers.peer_quic_transport_parameters(),
@@ -120,18 +106,8 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             }
             _ => {}
         }
-        let chosen_share = ch
-            .extensions
-            .find(extension::Type::KEY_SHARE)
-            .map(|ks| {
-                use crate::wire::protocols::KeyShares;
-                KeyShares::decode_client(ks.data)
-                    .map(|shares| shares.select_client_entry(&kx::KexGroup::SUPPORTED))
-            })
-            .transpose()?
-            .flatten();
-        let (kex_group, peer_pubkey) = match chosen_share {
-            Some(v) => v,
+        let peer_share = match client_kx.selected() {
+            Some(share) => share,
             None if !self.session.handshake.hrr_done => {
                 let invariant = retry::ClientHelloInvariant::capture(ch, hrr_group)?;
                 return self.send_hello_retry_request(
@@ -144,9 +120,10 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             }
             None => return Err(connection::Error::MissingExtension.into()),
         };
+        let kex_group = peer_share.group();
+        let peer_pubkey = peer_share.key_exchange();
 
-        self.session.peer.selected_alpn =
-            offers.select_alpn(&shard.policy.config.alpn_protocols)?;
+        self.session.peer.selected_alpn = offers.select_alpn(&shard.policy.alpn)?;
         if let Some(parameters) = offers.peer_quic_transport_parameters() {
             connection::EventContext::emit(
                 events,
@@ -158,13 +135,15 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             )?;
         }
 
-        let psk_accepted = if hash_alg == RESUMPTION_HASH {
+        let psk_accepted = if hash_alg == RESUMPTION_HASH
+            && let Some(psk) = offers.psk()
+        {
             self.try_accept_psk(
-                &ch,
-                raw,
-                shard.policy.config.ticket_keys.as_ref(),
+                psk,
+                shard.policy.ticket_keys.as_ref(),
+                self.session.peer.selected_alpn(&shard.policy.alpn),
                 shard.prepared.replay_domain.id(),
-            )
+            )?
         } else {
             None
         };
@@ -173,13 +152,10 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             &mut shard.policy.guard,
             offers.early_data(),
             psk_accepted.as_ref(),
-            self.session.peer.selected_alpn.as_deref(),
             self.session.application.traffic.suite(),
             now_ms,
         );
-
         self.session.handshake.transcript.update(raw);
-
         if let (Some(p), true) = (psk_accepted.as_ref(), early_accepted) {
             let h_ch = self
                 .session
@@ -191,13 +167,17 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             connection::EventContext::emit(
                 events,
                 self.session.application.traffic.suite(),
-                connection::Event::ZeroRttKeysReady { secret: &cets },
+                connection::Event::ZeroRttKeysReady {
+                    secret: &cets,
+                    max_early_data: p
+                        .ticket
+                        .max_early_data
+                        .ok_or(connection::Error::UnexpectedMessage)?,
+                    alpn: self.session.peer.selected_alpn(&shard.policy.alpn),
+                },
             )?;
         }
 
-        let (server_share, dhe) = kex_group
-            .respond(peer_pubkey, &self.session.runtime.rng)
-            .map_err(|_| connection::Error::Kx)?;
         let mut server_random = [0u8; RANDOM_LEN];
         self.session
             .runtime
@@ -226,7 +206,14 @@ impl<C: connection::Clock> Hello for server::Server<C> {
         let mut share = extension::Extension::begin(&mut extensions, extension::Type::KEY_SHARE)?;
         share.put_u16(kex_group.wire_id());
         let mut key = share.begin_u16()?;
-        key.put_slice(&server_share);
+        let dhe = kex_group
+            .respond(
+                peer_pubkey,
+                &self.session.runtime.rng,
+                key.reserve_slice(kex_group.server_share_len())?,
+            )
+            .map_err(|_| connection::Error::Kx)?
+            .into_secret();
         key.finish()?;
         share.finish()?;
         if psk_accepted.is_some() {
@@ -275,8 +262,7 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             },
         )?;
 
-        let certificate_negotiation =
-            offers.certificate_negotiation(&shard.policy.config.source)?;
+        let certificate_negotiation = offers.certificate_negotiation(&shard.policy.source)?;
         self.session.peer.client_cert_type = certificate_negotiation.client_type;
         self.session.buffers.flight.clear();
         let ee_start = self.session.buffers.flight.len();
@@ -291,7 +277,7 @@ impl<C: connection::Clock> Hello for server::Server<C> {
                 &mut extensions,
                 extension::Type::SERVER_CERTIFICATE_TYPE,
             )?;
-            cert_type.put_u8(certificate_negotiation.server_type);
+            cert_type.put_u8(certificate_negotiation.server_type.wire_id());
             cert_type.finish()?;
         }
         if offers.offered_client_certificate_type() {
@@ -299,7 +285,7 @@ impl<C: connection::Clock> Hello for server::Server<C> {
                 &mut extensions,
                 extension::Type::CLIENT_CERTIFICATE_TYPE,
             )?;
-            cert_type.put_u8(certificate_negotiation.client_type);
+            cert_type.put_u8(certificate_negotiation.client_type.wire_id());
             cert_type.finish()?;
         }
         if self.session.transport_mode.is_quic() {
@@ -310,7 +296,7 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             parameters.put_slice(&self.session.connection.transport_params);
             parameters.finish()?;
         }
-        if let Some(protocol) = self.session.peer.selected_alpn.as_deref() {
+        if let Some(protocol) = self.session.peer.selected_alpn(&shard.policy.alpn) {
             let mut protocols = extension::Extension::begin(
                 &mut extensions,
                 extension::Type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
@@ -347,7 +333,7 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             )?;
             let mut encoded = algorithms.begin_u16()?;
             for algorithm in SignatureAlgorithms::x509().as_slice() {
-                encoded.put_u16(*algorithm);
+                encoded.put_u16(algorithm.wire_id());
             }
             encoded.finish()?;
             algorithms.finish()?;
@@ -363,7 +349,7 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             use crate::server::config::CertSource;
             use crate::wire::codec::EncodeError;
             use crate::wire::handshake::messages::CertificateVerify;
-            let raw_public_key = match &shard.policy.config.source {
+            let raw_public_key = match &shard.policy.source {
                 CertSource::RawPublicKey { signing_key } => {
                     use crate::identity::spki::SubjectPublicKey;
                     Some(SubjectPublicKey::encoded_ed25519(
@@ -380,7 +366,7 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             let mut certificate = self.session.buffers.flight.begin_u24()?;
             certificate.begin_u8()?.finish()?;
             let mut entries = certificate.begin_u24()?;
-            match (&shard.policy.config.source, raw_public_key) {
+            match (&shard.policy.source, raw_public_key) {
                 (CertSource::RawPublicKey { .. }, Some(public_key)) => {
                     let mut data = entries.begin_u24()?;
                     data.put_slice(&public_key);
@@ -413,14 +399,13 @@ impl<C: connection::Clock> Hello for server::Server<C> {
             let cv_msg = CertificateVerify::message(h_pre_cv.as_slice(), true)?;
             let sig = shard
                 .policy
-                .config
                 .source
                 .signing_key()
                 .sign_fixed(&cv_msg)
                 .map_err(|_| connection::Error::Sig)?;
             let cv_start = self.session.buffers.flight.len();
             Frame::encode_certificate_verify(
-                shard.policy.config.source.signing_key().sig_scheme(),
+                shard.policy.source.signing_key().sig_scheme(),
                 &sig,
                 &mut self.session.buffers.flight,
             )?;

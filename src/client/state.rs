@@ -1,6 +1,7 @@
 use crate::crypto::material;
 use crate::crypto::schedule;
 use crate::identity::leafkey;
+use core::mem;
 
 pub(super) struct HandshakeSecrets {
     pub(super) schedule: schedule::Schedule,
@@ -8,98 +9,79 @@ pub(super) struct HandshakeSecrets {
     pub(super) server_traffic: material::TrafficSecret,
 }
 
-/// Fixed client-handshake storage keeps the peer key inline without making one
-/// state variant disproportionately large.
-pub(super) struct State {
-    kind: StateKind,
-    secrets: Option<HandshakeSecrets>,
-    server_leaf_key: Option<leafkey::LeafKey>,
+/// Where the authenticated server key lives until CertificateVerify. The
+/// marker is connection state; the bytes remain in their natural owner.
+#[derive(Clone, Copy)]
+pub(super) enum ServerLeaf {
+    PinnedEd25519,
+    Flight(leafkey::LeafKeyKind),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum StateKind {
+/// Client phase with exactly the values required by the next input. Unlike a
+/// flattened option bag, impossible phase/data combinations are unrepresentable.
+pub(super) enum State {
     Initial,
     ExpectServerHello,
-    ExpectEncryptedExtensions,
-    ExpectCertificate,
-    ExpectCertificateVerify,
-    ExpectServerFinished,
+    ExpectEncryptedExtensions {
+        secrets: HandshakeSecrets,
+    },
+    ExpectCertificate {
+        secrets: HandshakeSecrets,
+    },
+    ExpectCertificateVerify {
+        secrets: HandshakeSecrets,
+        server_leaf: ServerLeaf,
+    },
+    ExpectServerFinished {
+        secrets: HandshakeSecrets,
+    },
     Done,
     Failed,
 }
 
+const _: () = assert!(mem::size_of::<ServerLeaf>() == 1);
+const _: () = assert!(mem::size_of::<State>() <= 184);
+
 impl State {
     pub(super) fn initial() -> Self {
-        Self::empty(StateKind::Initial)
+        Self::Initial
     }
 
     pub(super) fn expect_server_hello() -> Self {
-        Self::empty(StateKind::ExpectServerHello)
+        Self::ExpectServerHello
     }
 
     pub(super) fn expect_encrypted_extensions(secrets: HandshakeSecrets) -> Self {
-        Self::with_secrets(StateKind::ExpectEncryptedExtensions, secrets)
+        Self::ExpectEncryptedExtensions { secrets }
     }
 
     pub(super) fn expect_certificate(secrets: HandshakeSecrets) -> Self {
-        Self::with_secrets(StateKind::ExpectCertificate, secrets)
+        Self::ExpectCertificate { secrets }
     }
 
     pub(super) fn expect_certificate_verify(
         secrets: HandshakeSecrets,
-        server_leaf_key: leafkey::LeafKey,
+        server_leaf: ServerLeaf,
     ) -> Self {
-        Self {
-            kind: StateKind::ExpectCertificateVerify,
-            secrets: Some(secrets),
-            server_leaf_key: Some(server_leaf_key),
+        Self::ExpectCertificateVerify {
+            secrets,
+            server_leaf,
         }
     }
 
     pub(super) fn expect_server_finished(secrets: HandshakeSecrets) -> Self {
-        Self::with_secrets(StateKind::ExpectServerFinished, secrets)
+        Self::ExpectServerFinished { secrets }
     }
 
     pub(super) fn done() -> Self {
-        Self::empty(StateKind::Done)
+        Self::Done
     }
 
     pub(super) fn fail(&mut self) {
-        self.zeroize_secrets();
-        self.kind = StateKind::Failed;
-        self.secrets = None;
-        self.server_leaf_key = None;
-    }
-
-    fn empty(kind: StateKind) -> Self {
-        Self {
-            kind,
-            secrets: None,
-            server_leaf_key: None,
-        }
-    }
-
-    fn with_secrets(kind: StateKind, secrets: HandshakeSecrets) -> Self {
-        Self {
-            kind,
-            secrets: Some(secrets),
-            server_leaf_key: None,
-        }
-    }
-
-    pub(super) fn kind(&self) -> StateKind {
-        self.kind
-    }
-
-    pub(super) fn take_secrets(&mut self) -> Option<HandshakeSecrets> {
-        self.secrets.take()
-    }
-
-    pub(super) fn server_leaf_key(&self) -> Option<leafkey::LeafKey> {
-        self.server_leaf_key.clone()
+        *self = Self::Failed;
     }
 
     pub(super) fn zeroize_secrets(&mut self) {
-        self.secrets = None;
+        self.fail();
     }
 }

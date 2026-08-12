@@ -1,20 +1,15 @@
 use crate::crypto::hash;
 use crate::crypto::kdf;
 use crate::crypto::material;
+use crate::crypto::sig;
 use crate::wire::codec;
 use crate::wire::codec::Encode as _;
 use crate::wire::extension;
 use crate::wire::handshake::views;
 use alloc::vec;
+use o3::collections::fixed::array;
 
 use ring::hmac;
-
-fn own_extensions(extensions: extension::Extensions<'_>) -> vec::Vec<extension::Extension> {
-    extensions
-        .iter()
-        .map(|extension| extension::Extension::new(extension.ty, extension.data.to_vec()))
-        .collect()
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHello {
@@ -43,21 +38,17 @@ impl ClientHello {
         compression.finish()?;
         extension::Extension::encode_list(&self.extensions, out)
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::ClientHelloRef::decode(r)?.into())
-    }
 }
 
-impl From<views::ClientHelloRef<'_>> for ClientHello {
-    fn from(message: views::ClientHelloRef<'_>) -> Self {
-        Self {
-            legacy_version: message.legacy_version,
-            random: message.random,
-            legacy_session_id: message.legacy_session_id.to_vec(),
-            cipher_suites: message.cipher_suites.iter().collect(),
-            legacy_compression_methods: message.legacy_compression_methods.to_vec(),
-            extensions: own_extensions(message.extensions),
+impl views::ClientHelloRef<'_> {
+    pub fn into_owned(self) -> ClientHello {
+        ClientHello {
+            legacy_version: self.legacy_version,
+            random: self.random,
+            legacy_session_id: self.legacy_session_id.to_vec(),
+            cipher_suites: self.cipher_suites.iter().collect(),
+            legacy_compression_methods: self.legacy_compression_methods.to_vec(),
+            extensions: self.extensions.into_owned(),
         }
     }
 }
@@ -83,21 +74,17 @@ impl ServerHello {
         out.put_u8(self.legacy_compression_method);
         extension::Extension::encode_list(&self.extensions, out)
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::ServerHelloRef::decode(r)?.into())
-    }
 }
 
-impl From<views::ServerHelloRef<'_>> for ServerHello {
-    fn from(message: views::ServerHelloRef<'_>) -> Self {
-        Self {
-            legacy_version: message.legacy_version,
-            random: message.random,
-            legacy_session_id_echo: message.legacy_session_id_echo.to_vec(),
-            cipher_suite: message.cipher_suite,
-            legacy_compression_method: message.legacy_compression_method,
-            extensions: own_extensions(message.extensions),
+impl views::ServerHelloRef<'_> {
+    pub fn into_owned(self) -> ServerHello {
+        ServerHello {
+            legacy_version: self.legacy_version,
+            random: self.random,
+            legacy_session_id_echo: self.legacy_session_id_echo.to_vec(),
+            cipher_suite: self.cipher_suite,
+            legacy_compression_method: self.legacy_compression_method,
+            extensions: self.extensions.into_owned(),
         }
     }
 }
@@ -115,16 +102,12 @@ impl EncryptedExtensions {
         }
         encoded.finish()
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::EncryptedExtensionsRef::decode(r)?.into())
-    }
 }
 
-impl From<views::EncryptedExtensionsRef<'_>> for EncryptedExtensions {
-    fn from(message: views::EncryptedExtensionsRef<'_>) -> Self {
-        Self {
-            extensions: own_extensions(message.extensions),
+impl views::EncryptedExtensionsRef<'_> {
+    pub fn into_owned(self) -> EncryptedExtensions {
+        EncryptedExtensions {
+            extensions: self.extensions.into_owned(),
         }
     }
 }
@@ -142,17 +125,13 @@ impl CertificateEntry {
         data.finish()?;
         extension::Extension::encode_list(&self.extensions, out)
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::CertificateEntryRef::decode(r)?.into())
-    }
 }
 
-impl From<views::CertificateEntryRef<'_>> for CertificateEntry {
-    fn from(entry: views::CertificateEntryRef<'_>) -> Self {
-        Self {
-            cert_data: entry.cert_data.to_vec(),
-            extensions: own_extensions(entry.extensions),
+impl views::CertificateEntryRef<'_> {
+    pub fn into_owned(self) -> CertificateEntry {
+        CertificateEntry {
+            cert_data: self.cert_data.to_vec(),
+            extensions: self.extensions.into_owned(),
         }
     }
 }
@@ -164,19 +143,22 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    pub(crate) fn chain_fits(chain_der: &[vec::Vec<u8>]) -> bool {
-        use crate::wire::handshake::MAX_SIZE;
+    pub(crate) fn chain_message_len(chain_der: &[vec::Vec<u8>]) -> Option<usize> {
         const FIXED_MESSAGE_BYTES: usize = 4 + 1 + 3;
         const ENTRY_FRAMING_BYTES: usize = 3 + 2;
         if chain_der.len() > super::MAX_CERTIFICATE_ENTRIES {
-            return false;
+            return None;
         }
         chain_der
             .iter()
             .try_fold(FIXED_MESSAGE_BYTES, |message_len, certificate| {
                 message_len.checked_add(ENTRY_FRAMING_BYTES + certificate.len())
             })
-            .is_some_and(|message_len| message_len <= MAX_SIZE)
+    }
+
+    pub(crate) fn chain_fits(chain_der: &[vec::Vec<u8>]) -> bool {
+        use crate::wire::handshake::MAX_SIZE;
+        Self::chain_message_len(chain_der).is_some_and(|message_len| message_len <= MAX_SIZE)
     }
 
     pub fn encode(&self, out: &mut impl codec::Encode) -> Result<(), codec::EncodeError> {
@@ -189,17 +171,17 @@ impl Certificate {
         }
         entries.finish()
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::CertificateRef::decode(r)?.into())
-    }
 }
 
-impl From<views::CertificateRef<'_>> for Certificate {
-    fn from(message: views::CertificateRef<'_>) -> Self {
-        Self {
-            certificate_request_context: message.certificate_request_context.to_vec(),
-            certificate_list: message.certificate_list.iter().map(Into::into).collect(),
+impl views::CertificateRef<'_> {
+    pub fn into_owned(self) -> Certificate {
+        Certificate {
+            certificate_request_context: self.certificate_request_context.to_vec(),
+            certificate_list: self
+                .certificate_list
+                .iter()
+                .map(views::CertificateEntryRef::into_owned)
+                .collect(),
         }
     }
 }
@@ -219,43 +201,48 @@ impl CertificateRequest {
         context.finish()?;
         extension::Extension::encode_list(&self.extensions, out)
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::CertificateRequestRef::decode(r)?.into())
-    }
 }
 
-impl From<views::CertificateRequestRef<'_>> for CertificateRequest {
-    fn from(message: views::CertificateRequestRef<'_>) -> Self {
-        Self {
-            certificate_request_context: message.certificate_request_context.to_vec(),
-            extensions: own_extensions(message.extensions),
+impl views::CertificateRequestRef<'_> {
+    pub fn into_owned(self) -> CertificateRequest {
+        CertificateRequest {
+            certificate_request_context: self.certificate_request_context.to_vec(),
+            extensions: self.extensions.into_owned(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateVerify {
-    pub algorithm: u16,
+    pub algorithm: sig::SignatureScheme,
     pub signature: vec::Vec<u8>,
 }
 
 impl CertificateVerify {
+    /// Encoded handshake-frame length for a signature of `signature_len` bytes.
+    pub(crate) const fn frame_len(signature_len: usize) -> usize {
+        const HANDSHAKE_HEADER_LEN: usize = 4;
+        const ALGORITHM_LEN: usize = 2;
+        const SIGNATURE_VECTOR_LEN: usize = 2;
+
+        HANDSHAKE_HEADER_LEN + ALGORITHM_LEN + SIGNATURE_VECTOR_LEN + signature_len
+    }
+
     pub(crate) fn message(
         transcript_hash: &[u8],
         from_server: bool,
-    ) -> Result<arrayvec::ArrayVec<u8, { 64 + 33 + 1 + hash::MAX_LEN }>, codec::EncodeError> {
-        use core::iter::repeat_n;
+    ) -> Result<array::CopyInline<u8, { 64 + 33 + 1 + hash::MAX_LEN }>, codec::EncodeError> {
         let context = if from_server {
             b"TLS 1.3, server CertificateVerify".as_slice()
         } else {
             b"TLS 1.3, client CertificateVerify".as_slice()
         };
-        let mut msg = arrayvec::ArrayVec::new();
-        msg.extend(repeat_n(0x20, 64));
+        let mut msg = array::CopyInline::new();
+        msg.try_extend_from_slice(&[0x20; 64])
+            .map_err(|_| codec::EncodeError::Overflow)?;
         msg.try_extend_from_slice(context)
             .map_err(|_| codec::EncodeError::Overflow)?;
-        msg.push(0x00);
+        msg.push(0x00).map_err(|_| codec::EncodeError::Overflow)?;
         msg.try_extend_from_slice(transcript_hash)
             .map_err(|_| codec::EncodeError::Overflow)?;
         Ok(msg)
@@ -266,26 +253,22 @@ impl CertificateVerify {
     }
 
     pub(crate) fn encode_fields(
-        algorithm: u16,
+        algorithm: sig::SignatureScheme,
         signature_bytes: &[u8],
         out: &mut impl codec::Encode,
     ) -> Result<(), codec::EncodeError> {
-        out.put_u16(algorithm);
+        out.put_u16(algorithm.wire_id());
         let mut signature = out.begin_u16()?;
         signature.put_slice(signature_bytes);
         signature.finish()
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::CertificateVerifyRef::decode(r)?.into())
-    }
 }
 
-impl From<views::CertificateVerifyRef<'_>> for CertificateVerify {
-    fn from(message: views::CertificateVerifyRef<'_>) -> Self {
-        Self {
-            algorithm: message.algorithm,
-            signature: message.signature.to_vec(),
+impl views::CertificateVerifyRef<'_> {
+    pub fn into_owned(self) -> CertificateVerify {
+        CertificateVerify {
+            algorithm: self.algorithm,
+            signature: self.signature.to_vec(),
         }
     }
 }
@@ -321,17 +304,11 @@ impl Finished {
     pub(crate) fn encode_verify_data(verify_data: &[u8], out: &mut impl codec::Encode) {
         out.put_slice(verify_data);
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(Self {
-            verify_data: r.take_all().to_vec(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyUpdate {
-    pub request_update: u8,
+    pub request: super::KeyUpdateRequest,
 }
 
 impl KeyUpdate {
@@ -339,20 +316,18 @@ impl KeyUpdate {
 
     pub(crate) fn encode_framed(self) -> [u8; Self::ENCODED_LEN] {
         use crate::wire::handshake::Type;
-        [Type::KeyUpdate as u8, 0, 0, 1, self.request_update]
+        [Type::KeyUpdate as u8, 0, 0, 1, self.request as u8]
     }
 
     pub fn encode(&self, out: &mut impl codec::Encode) -> Result<(), codec::EncodeError> {
-        out.put_u8(self.request_update);
+        out.put_u8(self.request as u8);
         Ok(())
     }
 
     pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        let request_update = r.u8()?;
-        if request_update > 1 {
-            return Err(codec::DecodeError::InvalidEnum);
-        }
-        Ok(Self { request_update })
+        Ok(Self {
+            request: super::KeyUpdateRequest::from_u8(r.u8()?)?,
+        })
     }
 }
 
@@ -377,20 +352,16 @@ impl NewSessionTicket {
         ticket.finish()?;
         extension::Extension::encode_list(&self.extensions, out)
     }
-
-    pub fn decode(r: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
-        Ok(views::NewSessionTicketRef::decode(r)?.into())
-    }
 }
 
-impl From<views::NewSessionTicketRef<'_>> for NewSessionTicket {
-    fn from(message: views::NewSessionTicketRef<'_>) -> Self {
-        Self {
-            ticket_lifetime: message.ticket_lifetime,
-            ticket_age_add: message.ticket_age_add,
-            ticket_nonce: message.ticket_nonce.to_vec(),
-            ticket: message.ticket.to_vec(),
-            extensions: own_extensions(message.extensions),
+impl views::NewSessionTicketRef<'_> {
+    pub fn into_owned(self) -> NewSessionTicket {
+        NewSessionTicket {
+            ticket_lifetime: self.ticket_lifetime,
+            ticket_age_add: self.ticket_age_add,
+            ticket_nonce: self.ticket_nonce.to_vec(),
+            ticket: self.ticket.to_vec(),
+            extensions: self.extensions.into_owned(),
         }
     }
 }

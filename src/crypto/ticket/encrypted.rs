@@ -1,16 +1,17 @@
 use crate::crypto::ticket;
 use core::ops;
+use o3::collections::fixed::array;
 
 /// An authenticated, opaque session ticket with a protocol-bounded size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Encrypted {
-    pub(super) bytes: arrayvec::ArrayVec<u8, { ticket::MAX_LEN }>,
+    pub(super) bytes: array::CopyInline<u8, { ticket::MAX_LEN }>,
 }
 
 impl Encrypted {
     pub(super) fn new() -> Self {
         Self {
-            bytes: arrayvec::ArrayVec::new(),
+            bytes: array::CopyInline::new(),
         }
     }
 
