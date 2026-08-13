@@ -10,7 +10,7 @@ use shin::server::config::{CertSource, ClientAuth, ClientCertVerifier, ClientIde
 use shin::transport::Mode;
 use shin::wire::codec::Reader;
 use shin::wire::extension::{Extension, Type};
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::Frame;
 use shin::wire::handshake::messages::{EncryptedExtensions, KeyUpdate, ServerHello};
 use shin::wire::handshake::{KeyUpdateRequest, RANDOM_LEN, TLS_1_2};
 
@@ -240,7 +240,7 @@ fn client_answers_hello_retry_request_echoing_cookie() {
         .expect("HRR is answered, not aborted");
     let retry = send(&evs, Epoch::Plaintext);
     use shin::wire::handshake;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
     let mut r = Reader::new(&retry);
     let Frame::ClientHello(ch2) = crate::decode_owned(&mut r).unwrap() else {
         panic!("retry must be a ClientHello");

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    sync::{Arc, Mutex},
+};
 
 use shin::client::Client;
 use shin::client::config::{Config, NegotiatedAlpn, Restore, Verifier};
@@ -24,14 +27,14 @@ type TestClient = Client<fn() -> u64>;
 
 struct TestGuard {
     now: u64,
-    seen: Vec<Vec<u8>>,
+    seen: RefCell<Vec<Vec<u8>>>,
 }
 
 impl TestGuard {
     fn new(now: u64) -> Self {
         Self {
             now,
-            seen: Vec::new(),
+            seen: RefCell::new(Vec::new()),
         }
     }
 }
@@ -43,11 +46,12 @@ impl Clock for TestGuard {
 }
 
 impl EarlyDataGuard for TestGuard {
-    fn register(&mut self, token: &[u8]) -> bool {
-        if self.seen.iter().any(|t| t.as_slice() == token) {
+    fn register(&self, token: &[u8]) -> bool {
+        let mut seen = self.seen.borrow_mut();
+        if seen.iter().any(|t| t.as_slice() == token) {
             return false;
         }
-        self.seen.push(token.to_vec());
+        seen.push(token.to_vec());
         true
     }
 }
@@ -58,7 +62,7 @@ struct SharedGuard {
 }
 
 impl EarlyDataGuard for SharedGuard {
-    fn register(&mut self, token: &[u8]) -> bool {
+    fn register(&self, token: &[u8]) -> bool {
         let mut seen = self.seen.lock().unwrap();
         if seen.iter().any(|entry| entry.as_slice() == token) {
             return false;
@@ -243,7 +247,7 @@ fn ticket_from_shard<G: EarlyDataGuard>(shard: &mut Shard<G>) -> Restore<'static
         TestGuard::new(NOW_MS),
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let mut client = client(None, false);
     let client_start = client.start().unwrap();
     let client_hello = find_send(&client_start, Epoch::Plaintext).unwrap();
@@ -281,7 +285,7 @@ fn client_offers_early_data_emits_cets_and_ext() {
 
     let ch_bytes = find_send(&evs, Epoch::Plaintext).unwrap();
     use shin::wire::codec::Reader;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
     let mut r = Reader::new(&ch_bytes);
     let m = crate::decode_owned(&mut r).unwrap();
     let Frame::ClientHello(ch) = m else { panic!() };
@@ -343,7 +347,7 @@ fn server_accepts_early_data_emits_matching_cets_and_ee_ext() {
 
     let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
     use shin::wire::codec::Reader;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
     let mut r = Reader::new(&s_hs_blob);
     let m = crate::decode_owned(&mut r).unwrap();
     let Frame::EncryptedExtensions(ee) = m else {
@@ -410,13 +414,13 @@ fn replayed_early_data_is_rejected() {
     };
 
     let s1 = server::Server::new(connection_config(), TestGuard::new(NOW_MS)).unwrap();
-    let mut s1 = shard.bind(s1).unwrap();
+    let mut s1 = shard.bind(s1).into_result().unwrap();
     let out1 = s1.read(Epoch::Plaintext, &ch).unwrap();
     assert!(cets(&out1).is_some(), "first use accepts early data");
     drop(s1);
 
     let s2 = server::Server::new(connection_config(), TestGuard::new(NOW_MS)).unwrap();
-    let mut s2 = shard.bind(s2).unwrap();
+    let mut s2 = shard.bind(s2).into_result().unwrap();
     let out2 = s2.read(Epoch::Plaintext, &ch).unwrap();
     assert!(
         cets(&out2).is_none(),
@@ -445,7 +449,7 @@ fn different_default_random_domains_reject_zero_rtt_but_keep_psk_resumption() {
         TestGuard::new(NOW_MS),
     )
     .unwrap();
-    let mut server = accepting_shard.bind(server).unwrap();
+    let mut server = accepting_shard.bind(server).into_result().unwrap();
     let server_start = server.read(Epoch::Plaintext, &client_hello).unwrap();
     assert!(
         cets(&server_start).is_none(),
@@ -489,7 +493,7 @@ fn explicit_shared_domain_and_shared_guard_accept_once_across_shards() {
         transport_params: Vec::new(),
     };
     let first_server = server::Server::new(connection(), TestGuard::new(NOW_MS)).unwrap();
-    let mut first_server = accepting_shard.bind(first_server).unwrap();
+    let mut first_server = accepting_shard.bind(first_server).into_result().unwrap();
     let first = first_server.read(Epoch::Plaintext, &client_hello).unwrap();
     assert!(
         cets(&first).is_some(),
@@ -497,7 +501,7 @@ fn explicit_shared_domain_and_shared_guard_accept_once_across_shards() {
     );
 
     let replay_server = server::Server::new(connection(), TestGuard::new(NOW_MS)).unwrap();
-    let mut replay_server = replay_shard.bind(replay_server).unwrap();
+    let mut replay_server = replay_shard.bind(replay_server).into_result().unwrap();
     let replay = replay_server.read(Epoch::Plaintext, &client_hello).unwrap();
     assert!(
         cets(&replay).is_none(),
@@ -524,7 +528,7 @@ fn ticket_key_rotation_preserves_shard_replay_domain() {
         TestGuard::new(NOW_MS),
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let server_start = server.read(Epoch::Plaintext, &client_hello).unwrap();
     assert!(
         cets(&server_start).is_some(),
@@ -623,7 +627,7 @@ fn early_data_rejected_when_resumed_alpn_mismatches() {
 #[test]
 fn early_data_rejected_when_resumed_cipher_suite_differs() {
     use shin::wire::codec::Reader;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
 
     let resumption = first_handshake_ticket_for_suite(
         Vec::new(),
@@ -659,7 +663,7 @@ fn early_data_rejected_when_resumed_cipher_suite_differs() {
 fn rewrite_early_data_acceptance(flight: &[u8], early_data_first: bool, body: &[u8]) -> Vec<u8> {
     use shin::wire::codec::Reader;
     use shin::wire::extension::Extension;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
 
     let mut encoded = Vec::new();
     let mut reader = Reader::new(flight);
@@ -808,7 +812,7 @@ fn expired_ticket_does_not_resume_via_psk() {
     let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
     use shin::wire::codec::Reader;
     use shin::wire::handshake;
-    use shin::wire::handshake::frame::MessageRef;
+    use shin::wire::handshake::views::MessageRef;
     let mut r = Reader::new(&s_hs_blob);
     let mut types = Vec::new();
     while !r.is_empty() {
@@ -836,7 +840,7 @@ fn fresh_ticket_still_resumes_via_psk() {
     let s_hs_blob = find_send(&s1, Epoch::Handshake).unwrap();
     use shin::wire::codec::Reader;
     use shin::wire::handshake;
-    use shin::wire::handshake::frame::MessageRef;
+    use shin::wire::handshake::views::MessageRef;
     let mut r = Reader::new(&s_hs_blob);
     let mut types = Vec::new();
     while !r.is_empty() {
@@ -864,7 +868,7 @@ fn reencode_ch<F: FnOnce(&mut shin::wire::handshake::messages::ClientHello)>(
     mutate: F,
 ) -> Vec<u8> {
     use shin::wire::codec::Reader;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
     let mut r = Reader::new(ch_bytes);
     let Frame::ClientHello(mut ch) = crate::decode_owned(&mut r).unwrap() else {
         panic!()
@@ -949,7 +953,7 @@ fn established_server() -> Server<TestGuard, TestGuard> {
 
 #[test]
 fn server_caps_key_updates_per_record() {
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
     use shin::wire::handshake::messages::KeyUpdate;
     let mut s = established_server();
     // Many KeyUpdate(request_update=1) in one record => bounded reply amplification.
@@ -970,8 +974,8 @@ fn requested_key_updates_coalesce_until_the_response_is_drained() {
     use std::convert::Infallible;
 
     use shin::connection::{EventContext, EventSink, KeyDirection};
+    use shin::wire::handshake::Frame;
     use shin::wire::handshake::KeyUpdateRequest;
-    use shin::wire::handshake::frame::Frame;
     use shin::wire::handshake::messages::KeyUpdate;
 
     #[derive(Default)]
@@ -1061,7 +1065,7 @@ fn requested_key_updates_coalesce_until_the_response_is_drained() {
 
 #[test]
 fn server_allows_bounded_key_updates() {
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
     use shin::wire::handshake::messages::KeyUpdate;
     let mut s = established_server();
     let mut record = Vec::new();
@@ -1096,7 +1100,7 @@ fn rewrite_ticket(
     edit: impl FnOnce(&mut shin::wire::handshake::messages::NewSessionTicket),
 ) -> Vec<u8> {
     use shin::wire::codec::Reader;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
 
     let Frame::NewSessionTicket(mut ticket) =
         crate::decode_owned(&mut Reader::new(encoded)).unwrap()
@@ -1181,7 +1185,7 @@ fn zero_lifetime_ticket_is_discarded_without_an_event() {
 fn nst_advertises_early_data_when_accept_enabled() {
     use shin::wire::codec::Reader;
     use shin::wire::extension::Type;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
 
     let mut s = server(true, NOW_MS);
     let mut c = client(None, false);
@@ -1215,7 +1219,7 @@ fn nst_advertises_early_data_when_accept_enabled() {
 #[test]
 fn nst_does_not_advertise_early_data_without_replay_guard() {
     use shin::wire::codec::Reader;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
 
     let mut s = server_no_guard(true, NOW_MS);
     let mut c = client(None, false);
@@ -1246,7 +1250,7 @@ fn nst_does_not_advertise_early_data_without_replay_guard() {
 fn nst_omits_early_data_when_accept_disabled() {
     use shin::wire::codec::Reader;
     use shin::wire::extension::Type;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
 
     let mut s = server(false, NOW_MS);
     let mut c = client(None, false);

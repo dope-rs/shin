@@ -1,5 +1,5 @@
 use crate::client::config;
-use crate::client::config::resumption;
+use crate::client::config::resumptions;
 use crate::crypto::material;
 use crate::transport;
 use crate::wire::psk;
@@ -15,7 +15,7 @@ pub(super) mod alpn;
 pub struct Restore<'a> {
     psk: material::ResumptionPsk,
     ticket: borrow::Cow<'a, [u8]>,
-    timing: resumption::TicketTiming,
+    timing: resumptions::TicketTiming,
     lifetime_ms: num::NonZeroU32,
     early_data: Option<EarlyData<'a>>,
 }
@@ -38,12 +38,12 @@ impl<'a> Restore<'a> {
         ticket_lifetime_secs: u32,
     ) -> Result<Self, config::Error> {
         let ticket = ticket.into();
-        resumption::Active::validate_ticket(&ticket)?;
-        let lifetime_ms = resumption::Active::lifetime_ms(ticket_lifetime_secs)?;
+        resumptions::Active::validate_ticket(&ticket)?;
+        let lifetime_ms = resumptions::Active::lifetime_ms(ticket_lifetime_secs)?;
         Ok(Self {
             psk: psk.into(),
             ticket,
-            timing: resumption::TicketTiming {
+            timing: resumptions::TicketTiming {
                 lifetime_secs: ticket_lifetime_secs,
                 age_add: ticket_age_add,
                 received_at_ms,
@@ -69,7 +69,7 @@ impl<'a> Restore<'a> {
             }
         };
         if self.early_data.is_some()
-            || !resumption::Active::valid_early_data(maximum, transport_mode)
+            || !resumptions::Active::valid_early_data(maximum, transport_mode)
             || suite.hash_alg() != psk::RESUMPTION_HASH
             || !valid_alpn
         {
@@ -84,7 +84,7 @@ impl<'a> Restore<'a> {
         Ok(self)
     }
 
-    pub(crate) fn bind(self, template: &config::Template) -> resumption::Active {
+    pub(super) fn bind(self, template: &config::Template) -> resumptions::Active {
         let early_data = self.early_data.and_then(|restored| {
             if restored.transport_mode != template.transport_mode() {
                 return None;
@@ -93,13 +93,13 @@ impl<'a> Restore<'a> {
                 config::NegotiatedAlpn::Absent => None,
                 config::NegotiatedAlpn::Protocol(protocol) => Some(template.find_alpn(&protocol)?),
             };
-            Some(resumption::BoundEarlyData {
+            Some(resumptions::BoundEarlyData {
                 maximum: restored.maximum,
                 suite: restored.suite,
                 alpn,
             })
         });
-        resumption::Active {
+        resumptions::Active {
             psk: self.psk,
             ticket: self.ticket.into_owned(),
             ticket_age_add: self.timing.age_add,

@@ -3,36 +3,32 @@ use crate::crypto::material;
 use crate::crypto::ticket;
 use crate::memory::threadbound;
 use crate::transport;
-use crate::wire::handshake::views;
-use crate::wire::handshake::workspace as handshake_workspace;
+use crate::wire::handshake::reassemblers;
+use crate::wire::handshake::storage;
 use crate::wire::record;
-use authentication::Authentication as _;
 use core::mem;
-use hello::Hello as _;
 use rand::SecureRandom as _;
-use resumption::Resumption as _;
 use ring::rand;
-use session::Drive as _;
+use session::drive;
 
-mod authentication;
+mod binding;
 mod bound;
 pub mod config;
-mod hello;
-mod negotiation;
-mod resumption;
-mod retry;
+mod rejection;
 mod session;
-mod workspace;
+pub mod workspace;
 
+pub use binding::Binding;
 pub use bound::connection::Connection;
 pub use bound::multiplexedconnection::MultiplexedConnection;
 pub use bound::multiplexedconnection::PooledConnection;
+pub use bound::multiplexedconnection::QuicConnection;
+pub use bound::multiplexedconnection::QuicPooledConnection;
 pub use bound::ownedconnection::OwnedConnection;
-pub use bound::shard::Shard;
+pub(in crate::server) use bound::shard::Authority;
+pub use bound::shard::{PreparedShard, Shard};
+pub use rejection::Rejection;
 pub use session::updates::Updates;
-pub use workspace::Workspace;
-pub use workspace::WorkspaceLayout;
-pub use workspace::WorkspaceProfile;
 
 /// Authenticated namespace for deployment-wide 0-RTT replay decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,113 +81,24 @@ impl ReplayDomain {
 /// assert_send::<Server<fn() -> u64>>();
 /// ```
 pub struct Server<C: connection::Clock, const DOMAIN: u8 = 0> {
+    reassembler: reassemblers::HsReassembler,
     session: session::Session<C>,
 }
 
-impl<C: connection::Clock, const DOMAIN: u8> session::Drive<DOMAIN> for Server<C, DOMAIN> {
-    fn drive_record<G, V, S>(
-        &mut self,
-        epoch: connection::Epoch,
-        data: &[u8],
-        shard: &mut Shard<G, V, DOMAIN>,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>
-    where
-        G: config::EarlyDataGuard,
-        V: config::ClientCertVerifier,
-        S: connection::EventSink + ?Sized,
-    {
-        self.session.buffers.reasm.begin_record(epoch)?;
-        let mut input = data;
-        while let Some(raw) = self.session.buffers.reasm.next_record(epoch, &mut input)? {
-            let message = views::MessageRef::decode(raw.as_ref())?;
-            self.process(epoch, message, raw.as_ref(), shard, events)?;
-            self.session.buffers.reasm.recycle(raw);
-        }
-        Ok(())
-    }
-
-    fn process<G, V, S>(
-        &mut self,
-        epoch: connection::Epoch,
-        message: views::MessageRef<'_>,
-        raw: &[u8],
-        shard: &mut Shard<G, V, DOMAIN>,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>
-    where
-        G: config::EarlyDataGuard,
-        V: config::ClientCertVerifier,
-        S: connection::EventSink + ?Sized,
-    {
-        let state = mem::replace(&mut self.session.handshake.state, session::State::Failed);
-        match (state, message) {
-            (session::State::ExpectClientHello, views::MessageRef::ClientHello(hello))
-                if epoch == connection::Epoch::Plaintext =>
-            {
-                self.session.handshake.state = session::State::ExpectClientHello;
-                self.handle_client_hello(hello, raw, shard, events)
-            }
-            (
-                session::State::ExpectEndOfEarlyData {
-                    client_handshake_traffic,
-                },
-                views::MessageRef::EndOfEarlyData,
-            ) if epoch == connection::Epoch::Handshake => {
-                self.handle_end_of_early_data(raw, client_handshake_traffic)?;
-                Ok(())
-            }
-            (
-                session::State::ExpectClientCertificate {
-                    client_handshake_traffic,
-                },
-                views::MessageRef::Certificate(certificate),
-            ) if epoch == connection::Epoch::Handshake => {
-                self.handle_client_certificate(
-                    certificate,
-                    raw,
-                    client_handshake_traffic,
-                    shard.policy.client_auth,
-                )?;
-                Ok(())
-            }
-            (
-                session::State::ExpectClientCertVerify {
-                    client_handshake_traffic,
-                },
-                views::MessageRef::CertificateVerify(verify),
-            ) if epoch == connection::Epoch::Handshake => {
-                self.handle_client_cert_verify(verify, raw, client_handshake_traffic, shard)?;
-                Ok(())
-            }
-            (
-                session::State::ExpectClientFinished { verify_data },
-                views::MessageRef::Finished(finished),
-            ) if epoch == connection::Epoch::Handshake => {
-                self.handle_client_finished(finished, raw, verify_data, shard, events)
-            }
-            (session::State::Done, views::MessageRef::KeyUpdate(update))
-                if epoch == connection::Epoch::Application =>
-            {
-                self.session.handshake.state = session::State::Done;
-                self.session.handle_key_update(update, events)
-            }
-            _ => Err(connection::Error::UnexpectedMessage.into()),
-        }
-    }
-
-    fn poison(&mut self) {
-        self.session.handshake.state.fail();
-        self.session.application.zeroize_secrets();
-        self.session.peer.early_data.close();
-        self.session.buffers.reasm.discard();
-        self.session.buffers.flight.clear();
-        self.session.buffers.identity_workspace.clear();
-    }
+pub(in crate::server) struct QuicServer<C: connection::Clock, const DOMAIN: u8 = 0> {
+    session: session::Session<C>,
 }
 
 impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
-    pub(in crate::server) fn tls_with_workspace<V>(clock: C, workspace: Workspace<V>) -> Self
+    /// Validated maximum storage required by one outbound handshake flight.
+    pub fn outbound_flight_capacity(&self) -> usize {
+        self.session.buffers.flight.capacity()
+    }
+
+    pub(in crate::server) fn tls_with_workspace<V>(
+        clock: C,
+        workspace: workspace::Workspace<V>,
+    ) -> Self
     where
         V: config::ClientCertVerifier,
     {
@@ -207,9 +114,26 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
         )
     }
 
+    pub(in crate::server) fn quic_with_workspace<V>(
+        clock: C,
+        transport_params: alloc::vec::Vec<u8>,
+        workspace: workspace::Workspace<V>,
+    ) -> QuicServer<C, DOMAIN>
+    where
+        V: config::ClientCertVerifier,
+    {
+        let Self { session, .. } = Self::from_validated(
+            config::Connection { transport_params },
+            transport::Mode::Quic,
+            clock,
+            workspace.into_scratch(),
+        );
+        QuicServer { session }
+    }
+
     /// Creates a TLS-over-stream connection.
     pub fn new(config: config::Connection, clock: C) -> Result<Self, connection::Error> {
-        Self::with_workspace(config, clock, handshake_workspace::Scratch::for_server())
+        Self::with_workspace(config, clock, storage::Scratch::for_server())
     }
 
     /// Creates a connection for the explicitly selected transport.
@@ -222,14 +146,14 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
             config,
             transport_mode,
             clock,
-            handshake_workspace::Scratch::for_server(),
+            storage::Scratch::for_server(),
         )
     }
 
     pub fn with_workspace(
         config: config::Connection,
         clock: C,
-        workspace: handshake_workspace::Scratch,
+        workspace: storage::Scratch,
     ) -> Result<Self, connection::Error> {
         Self::with_transport_workspace(config, transport::Mode::Tls, clock, workspace)
     }
@@ -240,7 +164,7 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
         config: config::Connection,
         transport_mode: transport::Mode,
         clock: C,
-        workspace: handshake_workspace::Scratch,
+        workspace: storage::Scratch,
     ) -> Result<Self, connection::Error> {
         config.validate_with_transport(transport_mode)?;
         Ok(Self::from_validated(
@@ -255,9 +179,8 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
         config: config::Connection,
         transport_mode: transport::Mode,
         clock: C,
-        workspace: handshake_workspace::Scratch,
+        workspace: storage::Scratch,
     ) -> Self {
-        use crate::crypto::hash::Transcript;
         use crate::identity::CertificateType;
         use crate::wire::handshake::reassemblers::HsReassembler;
         use ring::rand::SystemRandom;
@@ -267,21 +190,17 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
         use session::Handshake;
         use session::Peer;
         use session::Runtime;
-        let handshake_workspace::Scratch {
+        let storage::Scratch {
             reassembly,
             flight,
             identity,
         } = workspace;
         Self {
+            reassembler: HsReassembler::with_buffer(reassembly),
             session: session::Session {
                 connection: config,
                 transport_mode,
-                handshake: Handshake {
-                    state: session::State::ExpectClientHello,
-                    transcript: Transcript::new(),
-                    hrr_done: false,
-                    hrr_invariant: None,
-                },
+                handshake: Handshake::initial(),
                 peer: Peer {
                     selected_alpn: None,
                     early_data: EarlyData::new(),
@@ -293,7 +212,6 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
                     exporter_master: None,
                 },
                 buffers: Buffers {
-                    reasm: HsReassembler::with_buffer(reassembly),
                     flight,
                     identity_workspace: identity,
                 },
@@ -307,9 +225,9 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
     }
 
     /// Returns the caller-owned handshake storage after clearing protocol bytes.
-    pub fn into_workspace(mut self) -> handshake_workspace::Scratch {
-        handshake_workspace::Scratch::from_buffers(
-            self.session.buffers.reasm.release_buffer(),
+    pub fn into_workspace(mut self) -> storage::Scratch {
+        storage::Scratch::from_buffers(
+            self.reassembler.release_buffer(),
             mem::take(&mut self.session.buffers.flight),
             mem::take(&mut self.session.buffers.identity_workspace),
         )
@@ -359,7 +277,7 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
         let required =
             shard.workspace_layout(&self.session.connection, self.session.transport_mode)?;
         let (fragmented_message, outbound_flight, peer_identity) = required.capacities();
-        if self.session.buffers.reasm.capacity() < fragmented_message
+        if self.reassembler.capacity() < fragmented_message
             || self.session.buffers.flight.capacity() < outbound_flight
             || self.session.buffers.identity_workspace.capacity() < peer_identity
         {
@@ -372,7 +290,7 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
     /// window returns [`Error::EarlyDataLimitExceeded`](connection::Error::EarlyDataLimitExceeded)
     /// and closes permanently.
     pub fn note_early_data(&mut self, len: usize) -> Result<(), connection::Error> {
-        if self.session.handshake.state == session::State::Failed {
+        if self.session.handshake.is_failed() {
             return Err(connection::Error::ConnectionFailed);
         }
         let result = self
@@ -386,11 +304,11 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
         result
     }
 
-    fn read_bound<G, V, S>(
+    fn read_authorized<G, V, S>(
         &mut self,
         epoch: connection::Epoch,
         data: &[u8],
-        shard: &mut Shard<G, V, DOMAIN>,
+        authority: &Authority<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
@@ -398,10 +316,40 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
         V: config::ClientCertVerifier,
         S: connection::EventSink + ?Sized,
     {
-        if self.session.handshake.state == session::State::Failed {
+        if self.session.handshake.is_failed() {
             return Err(connection::Error::ConnectionFailed.into());
         }
-        let result = self.drive_record(epoch, data, shard, events);
+        let result = drive::Drive::new(&mut self.session).read(
+            &mut self.reassembler,
+            epoch,
+            data,
+            authority,
+            events,
+        );
+        if result.is_err() {
+            self.poison();
+        }
+        result
+    }
+
+    fn read_authorized_framed<G, V, S>(
+        &mut self,
+        epoch: connection::Epoch,
+        raw: &[u8],
+        authority: &Authority<G, V, DOMAIN>,
+        events: &mut S,
+    ) -> Result<(), connection::DriveError<S::Error>>
+    where
+        G: config::EarlyDataGuard,
+        V: config::ClientCertVerifier,
+        S: connection::LendingEventSink + ?Sized,
+    {
+        if self.session.handshake.is_failed() {
+            return Err(connection::Error::ConnectionFailed.into());
+        }
+        let mut events = connection::RequiredFlightSink::new(events);
+        let result =
+            drive::Drive::new(&mut self.session).read_framed(epoch, raw, authority, &mut events);
         if result.is_err() {
             self.poison();
         }
@@ -414,6 +362,67 @@ impl<C: connection::Clock, const DOMAIN: u8> Server<C, DOMAIN> {
     }
 
     pub fn is_done(&self) -> bool {
-        matches!(self.session.handshake.state, session::State::Done)
+        self.session.handshake.is_done()
+    }
+
+    pub(in crate::server) fn poison(&mut self) {
+        self.session.poison();
+        self.reassembler.discard();
+    }
+}
+
+impl<C: connection::Clock, const DOMAIN: u8> QuicServer<C, DOMAIN> {
+    pub(in crate::server) fn read_authorized_framed<G, V, S>(
+        &mut self,
+        epoch: connection::Epoch,
+        raw: &[u8],
+        authority: &Authority<G, V, DOMAIN>,
+        events: &mut S,
+    ) -> Result<(), connection::DriveError<S::Error>>
+    where
+        G: config::EarlyDataGuard,
+        V: config::ClientCertVerifier,
+        S: connection::LendingEventSink + ?Sized,
+    {
+        if self.session.handshake.is_failed() {
+            return Err(connection::Error::ConnectionFailed.into());
+        }
+        let mut events = connection::RequiredFlightSink::new(events);
+        let result =
+            drive::Drive::new(&mut self.session).read_framed(epoch, raw, authority, &mut events);
+        if result.is_err() {
+            self.session.poison();
+        }
+        result
+    }
+
+    pub(in crate::server) fn note_early_data(
+        &mut self,
+        len: usize,
+    ) -> Result<(), connection::Error> {
+        if self.session.handshake.is_failed() {
+            return Err(connection::Error::ConnectionFailed);
+        }
+        let result = self
+            .session
+            .peer
+            .early_data
+            .charge(len, self.session.transport_mode);
+        if result.is_err() {
+            self.session.poison();
+        }
+        result
+    }
+
+    pub(in crate::server) fn is_done(&self) -> bool {
+        self.session.handshake.is_done()
+    }
+
+    pub(in crate::server) fn into_workspace(mut self) -> storage::Scratch {
+        storage::Scratch::from_buffers(
+            storage::BoundedBuffer::default(),
+            mem::take(&mut self.session.buffers.flight),
+            mem::take(&mut self.session.buffers.identity_workspace),
+        )
     }
 }

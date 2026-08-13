@@ -5,7 +5,7 @@ use shin::crypto::sig::SigningKey;
 use shin::server::{Shard, config::CertSource, config::Connection, config::EarlyDataGuard};
 use shin::wire::codec::Reader;
 use shin::wire::extension::Type;
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::Frame;
 use shin::wire::handshake::messages::ClientHello;
 
 use crate::common::CollectEvents;
@@ -185,7 +185,7 @@ fn selected_protocol_is_available_from_the_bound_connection() {
         || 0,
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
 
     let client_hello = take_send(client.start().unwrap(), Epoch::Plaintext);
     server.read(Epoch::Plaintext, &client_hello).unwrap();

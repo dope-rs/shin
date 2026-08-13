@@ -436,9 +436,10 @@ where
         clock: C,
         shard: Shard<G, V>,
     ) -> Policy<C, G, V> {
-        let server =
-            server::Server::new_with_transport(connection_config, transport_mode, clock).unwrap();
-        Policy::Configured(server::OwnedConnection::new(server, shard).unwrap())
+        Policy::Configured(
+            server::OwnedConnection::prepare(shard, connection_config, transport_mode, clock)
+                .unwrap(),
+        )
     }
 
     fn bind_default(
@@ -447,9 +448,10 @@ where
         clock: C,
         shard: Shard,
     ) -> Policy<C, G, V> {
-        let server =
-            server::Server::new_with_transport(connection_config, transport_mode, clock).unwrap();
-        Policy::Default(server::OwnedConnection::new(server, shard).unwrap())
+        Policy::Default(
+            server::OwnedConnection::prepare(shard, connection_config, transport_mode, clock)
+                .unwrap(),
+        )
     }
 
     fn configured(

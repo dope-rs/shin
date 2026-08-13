@@ -1,14 +1,15 @@
 use crate::connection;
 use crate::crypto::hash;
 use crate::crypto::kx;
-use crate::server;
-use crate::server::negotiation;
+use crate::server::session;
+use crate::server::session::negotiation;
 use crate::wire::codec::Encode as _;
 use crate::wire::extension;
 use crate::wire::handshake;
 use crate::wire::handshake::views;
 use crate::wire::protocols;
 use crate::wire::psk;
+use core::mem;
 
 /// Heap-free snapshot of the parts of ClientHello which RFC 8446 forbids a
 /// client from changing across HelloRetryRequest.
@@ -117,22 +118,21 @@ fn update_psk_invariant(
     Ok(())
 }
 
-pub(super) trait Retry {
-    fn send_hello_retry_request<S: connection::EventSink + ?Sized>(
-        &mut self,
-        client_hello: &[u8],
-        session_id_echo: &[u8],
-        request_group: kx::KexGroup,
-        invariant: ClientHelloInvariant,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>;
+pub(super) struct Retry<'session, C> {
+    session: &'session mut session::Session<C>,
 }
 
-impl<C: connection::Clock, const DOMAIN: u8> Retry for server::Server<C, DOMAIN> {
+const _: () = assert!(mem::size_of::<Retry<'static, ()>>() == mem::size_of::<usize>());
+
+impl<'session, C> Retry<'session, C> {
+    pub(super) fn new(session: &'session mut session::Session<C>) -> Self {
+        Self { session }
+    }
+
     /// RFC 8446 §4.1.4: ask for a retry (one only) when the ClientHello carried
     /// no usable key_share, rewriting the transcript to `message_hash(CH1)`.
-    fn send_hello_retry_request<S: connection::EventSink + ?Sized>(
-        &mut self,
+    pub(super) fn send_hello_retry_request<S: connection::EventSink + ?Sized>(
+        self,
         client_hello: &[u8],
         session_id_echo: &[u8],
         request_group: kx::KexGroup,
@@ -146,12 +146,17 @@ impl<C: connection::Clock, const DOMAIN: u8> Retry for server::Server<C, DOMAIN>
             .traffic
             .suite()
             .ok_or(connection::Error::UnsupportedCipherSuite)?;
-        self.session.buffers.flight.clear();
-        self.session
-            .buffers
-            .flight
-            .put_u8(handshake::Type::ServerHello as u8);
-        let mut hello = self.session.buffers.flight.begin_u24()?;
+        let suite_context = self.session.application.traffic.suite();
+        let outbound = connection::EventContext::begin_send(
+            events,
+            suite_context,
+            connection::Epoch::Plaintext,
+            self.session.buffers.flight.capacity(),
+        )?;
+        let mut flight = self.session.buffers.flight.flight(outbound);
+        flight.clear();
+        flight.put_u8(handshake::Type::ServerHello as u8);
+        let mut hello = flight.begin_u24()?;
         hello.put_u16(handshake::TLS_1_2);
         hello.put_slice(&HELLO_RETRY_REQUEST_RANDOM);
         let mut session = hello.begin_u8()?;
@@ -181,21 +186,21 @@ impl<C: connection::Clock, const DOMAIN: u8> Retry for server::Server<C, DOMAIN>
         self.session.handshake.transcript =
             hash::Transcript::restart_with_message_hash(algorithm, &client_hello_hash)
                 .map_err(connection::Error::from)?;
-        self.session
-            .handshake
-            .transcript
-            .update(&self.session.buffers.flight);
+        self.session.handshake.transcript.update(flight.as_slice());
 
         self.session.handshake.hrr_done = true;
         self.session.handshake.hrr_invariant = Some(invariant);
-        connection::EventContext::emit(
-            events,
-            self.session.application.traffic.suite(),
-            connection::Event::Send {
-                epoch: connection::Epoch::Plaintext,
-                data: &self.session.buffers.flight,
-            },
-        )?;
+        let direct = flight.commit();
+        if !direct {
+            connection::EventContext::emit(
+                events,
+                suite_context,
+                connection::Event::Send {
+                    epoch: connection::Epoch::Plaintext,
+                    data: &self.session.buffers.flight,
+                },
+            )?;
+        }
         Ok(())
     }
 }

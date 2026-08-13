@@ -1,7 +1,6 @@
-use crate::client;
 use crate::client::config;
 use crate::client::session;
-use crate::client::state;
+use crate::client::session::state;
 use crate::connection;
 use crate::crypto::hash;
 use crate::crypto::material;
@@ -9,59 +8,43 @@ use crate::crypto::sig;
 use crate::identity::leafkey;
 use crate::identity::spki;
 use crate::wire::codec::Encode as _;
-use crate::wire::handshake::frame;
 use crate::wire::handshake::messages;
 use crate::wire::handshake::views;
+use core::mem;
 
 use crate::identity::chain;
 
 use crate::wire::handshake;
 
-pub(super) trait Authentication {
-    fn handle_certificate_request(
-        &mut self,
-        cr: views::CertificateRequestRef<'_>,
-        raw: &[u8],
-    ) -> Result<(), connection::Error>;
-    fn append_client_auth_flight(
-        &mut self,
-        alg: hash::Algorithm,
-        response: session::CertificateResponse,
-    ) -> Result<(), connection::Error>;
-    fn handle_certificate(
-        &mut self,
-        cert: views::CertificateRef<'_>,
-        raw: &[u8],
-        secrets: state::HandshakeSecrets,
-    ) -> Result<(), connection::Error>;
-    fn offered_sig_scheme(&self, scheme: sig::SignatureScheme) -> bool;
-    fn handle_certificate_verify(
-        &mut self,
-        cv: views::CertificateVerifyRef<'_>,
-        raw: &[u8],
-        secrets: state::HandshakeSecrets,
-        server_leaf: state::ServerLeaf,
-    ) -> Result<(), connection::Error>;
-    fn handle_server_finished<S: connection::EventSink + ?Sized>(
-        &mut self,
-        sf: &[u8],
-        raw: &[u8],
-        secrets: state::HandshakeSecrets,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>;
+pub(super) struct Authentication<'session, 'policy, C, K> {
+    machine: &'session mut session::Session<C, K>,
+    policy: &'policy config::Policy<'policy>,
 }
-impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
+
+const _: () = assert!(
+    mem::size_of::<Authentication<'static, 'static, (), ()>>() == 2 * mem::size_of::<usize>()
+);
+
+impl<'session, 'policy, C, K> Authentication<'session, 'policy, C, K> {
+    pub(super) fn new(
+        machine: &'session mut session::Session<C, K>,
+        policy: &'policy config::Policy<'policy>,
+    ) -> Self {
+        Self { machine, policy }
+    }
+
     /// Select the client-auth response from a borrowed main-handshake request;
     /// the identity flight is sent only after server authentication succeeds.
-    fn handle_certificate_request(
-        &mut self,
+    pub(super) fn handle_certificate_request(
+        self,
         cr: views::CertificateRequestRef<'_>,
         raw: &[u8],
     ) -> Result<(), connection::Error> {
+        let Self { machine, policy } = self;
         use crate::client::session::CertificateResponse;
         use crate::wire::extension::Type;
         use crate::wire::protocols::SignatureAlgorithms;
-        if self.session.credentials.certificate_response.is_some() {
+        if machine.credentials.certificate_response.is_some() {
             return Err(connection::Error::UnexpectedMessage);
         }
         if !cr.certificate_request_context.is_empty() {
@@ -72,29 +55,27 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
             .iter()
             .find(|e| e.ty == Type::SIGNATURE_ALGORITHMS)
             .ok_or(connection::Error::MissingExtension)?;
-        let signing_scheme = self
-            .session
-            .credentials
-            .identity
-            .as_ref()
+        let signing_scheme = policy
+            .identity()
             .map(|source| source.signing_key().sig_scheme());
         let signing_scheme_accepted = SignatureAlgorithms::accepts(sigs.data, signing_scheme)?;
-        self.session.credentials.certificate_response = Some(
-            if self.session.credentials.identity.is_some() && signing_scheme_accepted {
+        machine.credentials.certificate_response =
+            Some(if policy.identity().is_some() && signing_scheme_accepted {
                 CertificateResponse::Identity
             } else {
                 CertificateResponse::Empty
-            },
-        );
-        self.session.handshake.transcript.update(raw);
+            });
+        machine.handshake.transcript.update(raw);
         Ok(())
     }
 
     /// Build our client Certificate (+ CertificateVerify if we hold an identity)
     /// in response to a CertificateRequest, appending each to the transcript so
     /// the subsequent client Finished covers them.
-    fn append_client_auth_flight(
-        &mut self,
+    fn append_flight(
+        transcript: &mut hash::Transcript,
+        flight: &mut handshake::storage::BoundedBuffer,
+        policy: &config::Policy<'_>,
         alg: hash::Algorithm,
         response: session::CertificateResponse,
     ) -> Result<(), connection::Error> {
@@ -102,20 +83,13 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
         use crate::client::session::CertificateResponse;
         let identity = match response {
             CertificateResponse::Empty => None,
-            CertificateResponse::Identity => Some(
-                self.session
-                    .credentials
-                    .identity
-                    .as_deref()
-                    .ok_or(connection::Error::BadConfig)?,
-            ),
+            CertificateResponse::Identity => {
+                Some(&**policy.identity().ok_or(connection::Error::BadConfig)?)
+            }
         };
-        let cert_start = self.session.buffers.flight.len();
-        self.session
-            .buffers
-            .flight
-            .put_u8(handshake::Type::Certificate as u8);
-        let mut certificate = self.session.buffers.flight.begin_u24()?;
+        let cert_start = flight.len();
+        flight.put_u8(handshake::Type::Certificate as u8);
+        let mut certificate = flight.begin_u24()?;
         certificate.begin_u8()?.finish()?;
         let mut entries = certificate.begin_u24()?;
         match identity {
@@ -140,45 +114,34 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
         }
         entries.finish()?;
         certificate.finish()?;
-        self.session
-            .handshake
-            .transcript
-            .update(&self.session.buffers.flight[cert_start..]);
+        transcript.update(&flight[cert_start..]);
 
         if let Some(src) = identity {
             let scheme = src.signing_key().sig_scheme();
-            let h = self
-                .session
-                .handshake
-                .transcript
-                .hash(alg)
-                .map_err(connection::Error::from)?;
+            let h = transcript.hash(alg).map_err(connection::Error::from)?;
             let cv_msg = messages::CertificateVerify::message(h.as_slice(), false)?;
             let signature = src
                 .signing_key()
                 .sign_fixed(&cv_msg)
                 .map_err(|_| connection::Error::Sig)?;
-            let cv_start = self.session.buffers.flight.len();
-            frame::Frame::encode_certificate_verify(
-                scheme,
-                &signature,
-                &mut self.session.buffers.flight,
-            )?;
-            self.session
-                .handshake
-                .transcript
-                .update(&self.session.buffers.flight[cv_start..]);
+            let cv_start = flight.len();
+            handshake::Frame::encode_certificate_verify(scheme, &signature, flight)?;
+            transcript.update(&flight[cv_start..]);
         }
         Ok(())
     }
 
-    fn handle_certificate(
-        &mut self,
+    pub(super) fn handle_certificate(
+        self,
         cert: views::CertificateRef<'_>,
         raw: &[u8],
         secrets: state::HandshakeSecrets,
-    ) -> Result<(), connection::Error> {
-        let server_leaf = match self.session.offer.config.verifier() {
+    ) -> Result<(), connection::Error>
+    where
+        C: connection::Clock,
+    {
+        let Self { machine, policy } = self;
+        let server_leaf = match policy.template().verifier() {
             config::Verifier::RawPublicKey { expected_pubkey } => {
                 if cert.certificate_list.len() != 1 {
                     return Err(connection::Error::BadCertificate);
@@ -203,7 +166,7 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
             } => {
                 use crate::identity::UnixTime;
                 use crate::identity::chain::Chain;
-                let now = UnixTime::from_secs(self.session.runtime.clock.now_secs());
+                let now = UnixTime::from_secs(machine.runtime.clock.now_secs());
                 if cert.certificate_list.is_empty() {
                     return Err(connection::Error::BadCertificate);
                 }
@@ -228,27 +191,20 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
                 let leaf_spki = validated.spki();
                 let leaf = leafkey::LeafKey::from_x509_spki(leaf_spki)?;
                 let server_leaf = state::ServerLeaf::Flight(leaf.kind());
-                self.session.buffers.flight.clear();
-                self.session
-                    .buffers
-                    .flight
-                    .try_extend(leaf.raw())
-                    .map_err(|_| {
-                        connection::Error::WorkspaceExhausted(
-                            connection::WorkspaceRegion::PeerIdentity,
-                        )
-                    })?;
+                machine.buffers.flight.clear();
+                machine.buffers.flight.try_extend(leaf.raw()).map_err(|_| {
+                    connection::Error::WorkspaceExhausted(connection::WorkspaceRegion::PeerIdentity)
+                })?;
                 server_leaf
             }
         };
-        self.session.handshake.transcript.update(raw);
-        self.session.handshake.state =
-            state::State::expect_certificate_verify(secrets, server_leaf);
+        machine.handshake.transcript.update(raw);
+        machine.handshake.state = state::State::expect_certificate_verify(secrets, server_leaf);
         Ok(())
     }
 
-    fn offered_sig_scheme(&self, scheme: sig::SignatureScheme) -> bool {
-        match self.session.offer.config.verifier() {
+    fn offered_sig_scheme(policy: &config::Policy<'_>, scheme: sig::SignatureScheme) -> bool {
+        match policy.template().verifier() {
             config::Verifier::RawPublicKey { .. } => scheme == sig::SignatureScheme::ED25519,
             config::Verifier::X509 { .. } | config::Verifier::X509Store { .. } => {
                 use crate::wire::protocols::SignatureAlgorithms;
@@ -257,24 +213,24 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
         }
     }
 
-    fn handle_certificate_verify(
-        &mut self,
+    pub(super) fn handle_certificate_verify(
+        self,
         cv: views::CertificateVerifyRef<'_>,
         raw: &[u8],
         secrets: state::HandshakeSecrets,
         server_leaf: state::ServerLeaf,
     ) -> Result<(), connection::Error> {
-        if !self.offered_sig_scheme(cv.algorithm) {
+        let Self { machine, policy } = self;
+        if !Self::offered_sig_scheme(policy, cv.algorithm) {
             return Err(connection::Error::SigSchemeNotOffered);
         }
-        let h_pre_cv = self
-            .session
+        let h_pre_cv = machine
             .handshake
             .transcript
-            .hash(self.session.application.hash_alg()?)
+            .hash(machine.application.hash_alg()?)
             .map_err(connection::Error::from)?;
         let msg = messages::CertificateVerify::message(h_pre_cv.as_slice(), true)?;
-        let leaf = match (server_leaf, self.session.offer.config.verifier()) {
+        let leaf = match (server_leaf, policy.template().verifier()) {
             (
                 state::ServerLeaf::PinnedEd25519,
                 config::Verifier::RawPublicKey { expected_pubkey },
@@ -283,32 +239,32 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
                 expected_pubkey.as_slice(),
             )?,
             (state::ServerLeaf::Flight(kind), config::Verifier::X509Store { .. }) => {
-                leafkey::LeafKey::from_raw(kind, self.session.buffers.flight.as_slice())?
+                leafkey::LeafKey::from_raw(kind, machine.buffers.flight.as_slice())?
             }
             _ => return Err(connection::Error::BadConfig),
         };
         leaf.verify(cv.algorithm, &msg, cv.signature)?;
-        self.session.buffers.flight.clear();
-        self.session.handshake.transcript.update(raw);
-        self.session.handshake.state = state::State::expect_server_finished(secrets);
+        machine.buffers.flight.clear();
+        machine.handshake.transcript.update(raw);
+        machine.handshake.state = state::State::expect_server_finished(secrets);
         Ok(())
     }
 
-    fn handle_server_finished<S: connection::EventSink + ?Sized>(
-        &mut self,
+    pub(super) fn handle_server_finished<S: connection::EventSink + ?Sized>(
+        self,
         sf: &[u8],
         raw: &[u8],
         secrets: state::HandshakeSecrets,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
+        let Self { machine, policy } = self;
         use crate::client::session::EarlyData;
         use crate::connection::Epoch;
         use crate::connection::Event;
         use crate::connection::EventContext;
         use crate::wire::handshake::messages::Finished;
-        let alg = self.session.application.hash_alg()?;
-        let h_pre_sf = self
-            .session
+        let alg = machine.application.hash_alg()?;
+        let h_pre_sf = machine
             .handshake
             .transcript
             .hash(alg)
@@ -318,10 +274,9 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
         if !expected.ct_eq(sf) {
             return Err(connection::Error::BadFinished.into());
         }
-        self.session.handshake.transcript.update(raw);
+        machine.handshake.transcript.update(raw);
 
-        let h_sf = self
-            .session
+        let h_sf = machine
             .handshake
             .transcript
             .hash(alg)
@@ -331,19 +286,11 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
         let c_ap = master.client_application_traffic_secret(h_sf.as_slice())?;
         let s_ap = master.server_application_traffic_secret(h_sf.as_slice())?;
         let exporter_master = master.exporter_master_secret(h_sf.as_slice())?;
-        self.session.application.traffic.activate(c_ap, s_ap)?;
-        self.session.application.exporter_master = Some(exporter_master);
-        let suite = self.session.application.traffic.suite();
-        let read_secret = self
-            .session
-            .application
-            .traffic
-            .secret(material::Side::Server)?;
-        let write_secret = self
-            .session
-            .application
-            .traffic
-            .secret(material::Side::Client)?;
+        machine.application.traffic.activate(c_ap, s_ap)?;
+        machine.application.exporter_master = Some(exporter_master);
+        let suite = machine.application.traffic.suite();
+        let read_secret = machine.application.traffic.secret(material::Side::Server)?;
+        let write_secret = machine.application.traffic.secret(material::Side::Client)?;
 
         EventContext::emit(
             events,
@@ -355,19 +302,14 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
             },
         )?;
 
-        if matches!(self.session.extensions.early_data, EarlyData::Accepted)
-            && self
-                .session
-                .offer
-                .config
-                .transport_mode()
-                .uses_end_of_early_data()
+        if matches!(machine.extensions.early_data, EarlyData::Accepted)
+            && policy.template().transport_mode().uses_end_of_early_data()
         {
             const END_OF_EARLY_DATA: [u8; 4] = [handshake::Type::EndOfEarlyData as u8, 0, 0, 0];
-            self.session.handshake.transcript.update(&END_OF_EARLY_DATA);
+            machine.handshake.transcript.update(&END_OF_EARLY_DATA);
             EventContext::emit(
                 events,
-                self.session.application.traffic.suite(),
+                machine.application.traffic.suite(),
                 Event::Send {
                     epoch: Epoch::Handshake,
                     data: &END_OF_EARLY_DATA,
@@ -375,49 +317,56 @@ impl<C: connection::Clock, K> Authentication for client::Client<C, K> {
             )?;
         }
 
-        self.session.buffers.flight.clear();
-        if let Some(response) = self.session.credentials.certificate_response.take() {
-            self.append_client_auth_flight(alg, response)?;
+        let outbound = EventContext::begin_send(
+            events,
+            suite,
+            Epoch::Handshake,
+            machine.buffers.flight.capacity(),
+        )?;
+        let mut flight = machine.buffers.flight.flight(outbound);
+        flight.clear();
+        if let Some(response) = machine.credentials.certificate_response.take() {
+            Self::append_flight(
+                &mut machine.handshake.transcript,
+                &mut flight,
+                policy,
+                alg,
+                response,
+            )?;
         }
 
-        let h_pre_cf = self
-            .session
+        let h_pre_cf = machine
             .handshake
             .transcript
             .hash(alg)
             .map_err(connection::Error::from)?;
         let cf_data =
             Finished::verify_data(alg, secrets.client_traffic.as_slice(), h_pre_cf.as_slice())?;
-        let cf_start = self.session.buffers.flight.len();
-        frame::Frame::encode_finished(cf_data.as_slice(), &mut self.session.buffers.flight)?;
-        self.session
-            .handshake
-            .transcript
-            .update(&self.session.buffers.flight[cf_start..]);
-        let h_cf = self
-            .session
+        let cf_start = flight.len();
+        handshake::Frame::encode_finished(cf_data.as_slice(), &mut *flight)?;
+        machine.handshake.transcript.update(&flight[cf_start..]);
+        let h_cf = machine
             .handshake
             .transcript
             .hash(alg)
             .map_err(connection::Error::from)?;
         let rms = master.resumption_master_secret(h_cf.as_slice())?;
-        self.session.application.resumption_master = Some(rms);
+        machine.application.resumption_master = Some(rms);
+        let direct = flight.commit();
 
-        EventContext::emit(
-            events,
-            self.session.application.traffic.suite(),
-            Event::Send {
-                epoch: Epoch::Handshake,
-                data: &self.session.buffers.flight,
-            },
-        )?;
-        EventContext::emit(
-            events,
-            self.session.application.traffic.suite(),
-            Event::Done,
-        )?;
+        if !direct {
+            EventContext::emit(
+                events,
+                suite,
+                Event::Send {
+                    epoch: Epoch::Handshake,
+                    data: &machine.buffers.flight,
+                },
+            )?;
+        }
+        EventContext::emit(events, machine.application.traffic.suite(), Event::Done)?;
 
-        self.session.handshake.state = state::State::done();
+        machine.handshake.state = state::State::done();
         Ok(())
     }
 }

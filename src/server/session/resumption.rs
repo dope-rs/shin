@@ -7,44 +7,25 @@ use crate::server::session;
 use crate::wire::codec::Encode as _;
 use crate::wire::extension;
 use crate::wire::psk;
+use core::mem;
 use ring::rand::SecureRandom as _;
 use subtle::ConstantTimeEq as _;
 
 use crate::wire::handshake;
 
-pub(super) trait Resumption {
-    fn try_accept_psk(
-        &self,
-        offer: psk::Tail<'_>,
-        keys: Option<&ticket::Keys>,
-        selected_alpn: Option<&[u8]>,
-        replay_domain: &[u8; ticket::REPLAY_DOMAIN_LEN],
-    ) -> Result<Option<session::AcceptedPsk>, connection::Error>;
-    fn handle_client_finished<G, V, S, const DOMAIN: u8>(
-        &mut self,
-        f: &[u8],
-        raw: &[u8],
-        expected: material::FinishedVerifyData,
-        shard: &server::Shard<G, V, DOMAIN>,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>
-    where
-        G: config::EarlyDataGuard,
-        V: config::ClientCertVerifier,
-        S: connection::EventSink + ?Sized;
-    fn emit_session_ticket<S: connection::EventSink + ?Sized>(
-        &mut self,
-        keys: Option<&ticket::Keys>,
-        selected_alpn: Option<&[u8]>,
-        replay_domain: [u8; ticket::REPLAY_DOMAIN_LEN],
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>;
+pub(super) struct Resumption<'session, C> {
+    session: &'session mut session::Session<C>,
 }
-impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
-    for server::Server<C, SERVER_DOMAIN>
-{
-    fn try_accept_psk(
-        &self,
+
+const _: () = assert!(mem::size_of::<Resumption<'static, ()>>() == mem::size_of::<usize>());
+
+impl<'session, C: connection::Clock> Resumption<'session, C> {
+    pub(super) fn new(session: &'session mut session::Session<C>) -> Self {
+        Self { session }
+    }
+
+    pub(super) fn try_accept_psk(
+        self,
         offer: psk::Tail<'_>,
         keys: Option<&ticket::Keys>,
         selected_alpn: Option<&[u8]>,
@@ -95,12 +76,12 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
         Ok(Some(accepted))
     }
 
-    fn handle_client_finished<G, V, S, const DOMAIN: u8>(
-        &mut self,
+    pub(super) fn handle_client_finished<G, V, S, const DOMAIN: u8>(
+        self,
         f: &[u8],
         raw: &[u8],
         expected: material::FinishedVerifyData,
-        shard: &server::Shard<G, V, DOMAIN>,
+        authority: &server::Authority<G, V, DOMAIN>,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>>
     where
@@ -120,29 +101,24 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
             connection::Event::Done,
         )?;
         self.session.handshake.state = State::Done;
-        self.emit_session_ticket(
-            shard.policy.ticket_keys.as_ref(),
-            self.session.peer.selected_alpn(&shard.policy.alpn),
-            *shard.prepared.replay_domain.id(),
-            events,
-        )?;
+        self.emit_session_ticket(authority, events)?;
         Ok(())
     }
 
-    fn emit_session_ticket<S: connection::EventSink + ?Sized>(
-        &mut self,
-        keys: Option<&ticket::Keys>,
-        selected_alpn: Option<&[u8]>,
-        replay_domain: [u8; ticket::REPLAY_DOMAIN_LEN],
+    fn emit_session_ticket<G, V, S, const DOMAIN: u8>(
+        self,
+        authority: &server::Authority<G, V, DOMAIN>,
         events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>> {
+    ) -> Result<(), connection::DriveError<S::Error>>
+    where
+        G: config::EarlyDataGuard,
+        V: config::ClientCertVerifier,
+        S: connection::EventSink + ?Sized,
+    {
         use crate::connection::Epoch;
         use crate::crypto::schedule::ResumptionMaster;
         use crate::server::session::TICKET_LIFETIME_SECS;
         let Some(master) = self.session.application.master.as_ref() else {
-            return Ok(());
-        };
-        let Some(keys) = keys else {
             return Ok(());
         };
         if master.hash_alg() != psk::RESUMPTION_HASH {
@@ -170,7 +146,11 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
             .map_err(|_| connection::Error::Rng)?;
         let age_add = u32::from_be_bytes(age_add_bytes);
         let psk = ResumptionMaster::from_secret(&rms).psk(&nonce)?;
-        let alpn = selected_alpn.unwrap_or_default();
+        let alpn = self
+            .session
+            .peer
+            .selected_alpn(&authority.alpn)
+            .unwrap_or_default();
         let suite = self
             .session
             .application
@@ -186,10 +166,14 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
             self.session.transport_mode,
             max_early_data,
             &self.session.connection.transport_params,
-            replay_domain,
+            *authority.replay_domain.id(),
         );
-        let ticket = keys
-            .encrypt_claims(
+        let ticket = {
+            let keys = authority.ticket_keys.borrow();
+            let Some(keys) = keys.as_ref() else {
+                return Ok(());
+            };
+            keys.encrypt_claims(
                 ticket::Claims {
                     psk: &psk,
                     age_add,
@@ -200,13 +184,19 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
                 },
                 &self.session.runtime.rng,
             )
-            .map_err(|_| connection::Error::Rng)?;
-        self.session.buffers.flight.clear();
-        self.session
-            .buffers
-            .flight
-            .put_u8(handshake::Type::NewSessionTicket as u8);
-        let mut nst = self.session.buffers.flight.begin_u24()?;
+            .map_err(|_| connection::Error::Rng)?
+        };
+        let suite_context = self.session.application.traffic.suite();
+        let outbound = connection::EventContext::begin_send(
+            events,
+            suite_context,
+            Epoch::Application,
+            self.session.buffers.flight.capacity(),
+        )?;
+        let mut flight = self.session.buffers.flight.flight(outbound);
+        flight.clear();
+        flight.put_u8(handshake::Type::NewSessionTicket as u8);
+        let mut nst = flight.begin_u24()?;
         nst.put_u32(TICKET_LIFETIME_SECS);
         nst.put_u32(age_add);
         let mut ticket_nonce = nst.begin_u8()?;
@@ -224,14 +214,17 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Resumption
         }
         extensions.finish()?;
         nst.finish()?;
-        connection::EventContext::emit(
-            events,
-            self.session.application.traffic.suite(),
-            connection::Event::Send {
-                epoch: Epoch::Application,
-                data: &self.session.buffers.flight,
-            },
-        )?;
+        let direct = flight.commit();
+        if !direct {
+            connection::EventContext::emit(
+                events,
+                suite_context,
+                connection::Event::Send {
+                    epoch: Epoch::Application,
+                    data: &self.session.buffers.flight,
+                },
+            )?;
+        }
         Ok(())
     }
 }

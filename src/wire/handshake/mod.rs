@@ -1,10 +1,12 @@
 use crate::wire::codec;
 
-pub mod frame;
+mod frame;
 pub mod messages;
 pub(crate) mod reassemblers;
-pub(crate) mod views;
-pub mod workspace;
+pub mod storage;
+pub mod views;
+
+pub use frame::Frame;
 
 /// Whether a TLS KeyUpdate asks the peer to update its write key.
 #[repr(u8)]
@@ -74,3 +76,37 @@ pub const MAX_CERTIFICATE_ENTRIES: usize = 16;
 pub const MAX_SIZE: usize = 256 * 1024;
 pub const MAX_KEY_UPDATES_PER_RECORD: u32 = 8;
 pub const MAX_KEY_UPDATES_WITHOUT_APP_DATA: u32 = 8;
+
+/// Returns the complete encoded length named by a TLS handshake header.
+#[inline]
+pub fn encoded_message_len(header: &[u8]) -> Result<usize, codec::DecodeError> {
+    let &[_, high, middle, low, ..] = header else {
+        return Err(codec::DecodeError::Underflow);
+    };
+    let total = 4 + u32::from_be_bytes([0, high, middle, low]) as usize;
+    if total > MAX_SIZE {
+        return Err(codec::DecodeError::HandshakeTooLarge);
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_length_has_one_bounded_wire_definition() {
+        assert_eq!(
+            encoded_message_len(&[Type::ClientHello as u8, 0, 0, 3]),
+            Ok(7)
+        );
+        assert_eq!(
+            encoded_message_len(&[Type::ClientHello as u8, 0, 0]),
+            Err(codec::DecodeError::Underflow)
+        );
+        assert_eq!(
+            encoded_message_len(&[Type::Certificate as u8, 4, 0, 0]),
+            Err(codec::DecodeError::HandshakeTooLarge)
+        );
+    }
+}

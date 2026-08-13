@@ -120,7 +120,7 @@ fn resumed_handshake_skips_certificate_and_certificate_verify() {
 
     use shin::wire::codec::Reader;
     use shin::wire::handshake::Type;
-    use shin::wire::handshake::frame::MessageRef;
+    use shin::wire::handshake::views::MessageRef;
     let mut r = Reader::new(&s_hs_blob);
     let mut types = Vec::new();
     while !r.is_empty() {

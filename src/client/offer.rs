@@ -1,5 +1,5 @@
 use crate::client::config;
-use crate::client::config::resumption;
+use crate::client::config::resumptions;
 use crate::client::session;
 use crate::connection;
 use crate::crypto::hash;
@@ -13,7 +13,7 @@ use crate::wire::record;
 use alloc::vec;
 
 use crate::wire::handshake;
-use crate::wire::handshake::workspace;
+use crate::wire::handshake::storage;
 use crate::wire::protocols;
 
 #[derive(Clone, Copy)]
@@ -43,7 +43,7 @@ struct HelloCore<'a> {
 #[derive(Clone, Copy)]
 struct HelloExtensions<'a> {
     cookie: Option<protocols::Cookie<'a>>,
-    resumption: Option<resumption::Offer<'a>>,
+    resumption: Option<resumptions::Offer<'a>>,
     offer_early_data: bool,
     certificate_types: session::CertificateTypeOffers,
 }
@@ -59,7 +59,7 @@ pub(super) struct Request<'a> {
     pub(super) certificate_types: session::CertificateTypeOffers,
     pub(super) kx_pubkey: &'a [u8],
     pub(super) cookie: Option<protocols::Cookie<'a>>,
-    pub(super) resumption: Option<resumption::Offer<'a>>,
+    pub(super) resumption: Option<resumptions::Offer<'a>>,
     pub(super) offer_early_data: bool,
 }
 
@@ -225,7 +225,7 @@ impl<'a> Offer<'a> {
         verifier: &config::Verifier,
         transport_params: &[u8],
         alpn_protocols: &[vec::Vec<u8>],
-        resumption: Option<&resumption::Active>,
+        resumption: Option<&resumptions::Active>,
     ) -> Result<usize, codec::EncodeError> {
         use crate::crypto::kx::MAX_CLIENT_SHARE_LEN;
         use crate::wire::codec::EncodedSize;
@@ -255,7 +255,7 @@ impl<'a> Offer<'a> {
             },
             extensions: HelloExtensions {
                 cookie: None,
-                resumption: resumption.map(resumption::Active::encoding_offer),
+                resumption: resumption.map(resumptions::Active::encoding_offer),
                 offer_early_data: true,
                 certificate_types: session::CertificateTypeOffers {
                     server: matches!(verifier, config::Verifier::RawPublicKey { .. })
@@ -267,26 +267,45 @@ impl<'a> Offer<'a> {
         .encode(&mut size)?;
         size.finish()
     }
+
+    pub(super) fn maximum_initial_len_for_transport_params(
+        transport_mode: transport::Mode,
+        verifier: &config::Verifier,
+        transport_params_len: usize,
+        alpn_protocols: &[vec::Vec<u8>],
+        resumption: Option<&resumptions::Active>,
+    ) -> Result<usize, codec::EncodeError> {
+        let base =
+            Self::maximum_initial_len(transport_mode, verifier, &[], alpn_protocols, resumption)?;
+        if transport_mode.is_quic() {
+            base.checked_add(transport_params_len)
+                .ok_or(codec::EncodeError::Overflow)
+        } else {
+            Ok(base)
+        }
+    }
 }
 
 impl Request<'_> {
     pub(super) fn encode(
         self,
+        config: &config::Template,
+        transport_params: &[u8],
         offer: &session::OfferSettings,
         handshake: &session::Handshake,
-        flight: &mut workspace::BoundedBuffer,
+        flight: &mut storage::BoundedBuffer,
     ) -> Result<Option<BinderSlot>, connection::Error> {
-        let session_id = if offer.config.transport_mode().uses_legacy_session_id() {
+        let session_id = if config.transport_mode().uses_legacy_session_id() {
             handshake.session_id.as_slice()
         } else {
             &[]
         };
         let hello = Offer {
             policy: HelloPolicy {
-                verifier: offer.config.verifier(),
-                transport_mode: offer.config.transport_mode(),
-                transport_params: offer.config.transport_params(),
-                alpn_protocols: offer.config.alpn_protocols(),
+                verifier: config.verifier(),
+                transport_mode: config.transport_mode(),
+                transport_params,
+                alpn_protocols: config.alpn_protocols(),
             },
             core: HelloCore {
                 suites: &offer.offered_suites,

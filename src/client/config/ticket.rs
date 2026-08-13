@@ -1,5 +1,5 @@
 use crate::client::config;
-use crate::client::config::resumption;
+use crate::client::config::resumptions;
 use crate::crypto::material;
 use crate::crypto::schedule;
 use crate::transport;
@@ -9,12 +9,12 @@ use core::fmt;
 /// A validated, borrow-scoped TLS 1.3 session ticket. Ignoring it performs no
 /// derivation or allocation; `try_retain` explicitly creates owned state.
 pub struct Ticket<'a> {
-    pub(crate) template: &'a config::Template,
-    pub(crate) master: &'a material::ResumptionMasterSecret,
-    pub(crate) nonce: &'a [u8],
-    pub(crate) identity: &'a [u8],
-    pub(crate) timing: resumption::TicketTiming,
-    pub(crate) profile: resumption::IssuedProfile,
+    pub(in crate::client) template: &'a config::Template,
+    pub(in crate::client) master: &'a material::ResumptionMasterSecret,
+    pub(in crate::client) nonce: &'a [u8],
+    pub(in crate::client) identity: &'a [u8],
+    pub(in crate::client) timing: resumptions::TicketTiming,
+    pub(in crate::client) profile: resumptions::IssuedProfile,
 }
 
 impl Ticket<'_> {
@@ -29,7 +29,7 @@ impl Ticket<'_> {
     /// Derives the PSK, copies the opaque ticket once, and binds the endpoint.
     pub fn try_retain(self) -> Result<config::Resumption, config::Error> {
         let psk = self.try_psk()?;
-        config::Resumption::from_issued(resumption::Issued {
+        config::Resumption::from_issued(resumptions::Issued {
             origin: self.template.clone(),
             psk,
             ticket: self.identity,

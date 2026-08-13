@@ -2,14 +2,18 @@ use core::hint::black_box;
 use core::mem::size_of;
 
 use ring::rand::SystemRandom;
+use shin::client;
 use shin::client::config::{Config, NegotiatedAlpn, Restore, Resumption, Verifier};
-use shin::client::{Client, Hybrid, Ticket, Workspace as ClientWorkspace};
+use shin::client::{Client, Hybrid, Ticket};
 use shin::crypto::kx::{EphemeralKey, HybridWorkspace, KexGroup};
 use shin::crypto::ticket;
 use shin::server::config::{ClientAuthVerifier, NoClientAuth};
-use shin::server::{MultiplexedConnection, PooledConnection, Server, Shard, Workspace};
+use shin::server::workspace::{Profile, Workspace};
+use shin::server::{
+    Binding, MultiplexedConnection, PooledConnection, PreparedShard, Rejection, Server, Shard,
+};
 use shin::transport::Mode;
-use shin::wire::handshake::workspace::Scratch;
+use shin::wire::handshake::storage::Scratch;
 use shin::wire::record::{CipherSuite, MAX_PLAINTEXT_BODY};
 
 mod support;
@@ -68,27 +72,37 @@ fn default_workspaces_reserve_one_record_not_the_handshake_limit() {
     assert_eq!(client_profile, (2, 32 * 1024));
     assert_eq!(server_profile, (2, 32 * 1024));
     assert_eq!(mutual_server_profile, (3, 48 * 1024));
-    assert_eq!(size_of::<Scratch>(), 120);
-    assert_eq!(size_of::<ClientWorkspace>(), 80);
+    assert_eq!(size_of::<Scratch>(), 144);
+    assert_eq!(size_of::<client::workspace::Workspace>(), 96);
     assert_eq!(size_of::<Workspace>(), size_of::<Scratch>());
+    assert_eq!(size_of::<Profile>(), 4 * size_of::<usize>());
+    assert_eq!(
+        size_of::<Binding<u8, [u8; 1_024]>>(),
+        size_of::<Result<u8, Rejection<[u8; 1_024]>>>()
+    );
     assert_eq!(
         size_of::<Workspace<ClientAuthVerifier<NoClientAuth>>>(),
         size_of::<Scratch>(),
     );
-    assert_eq!(size_of::<Client<TestClock>>(), 1_328);
-    assert_eq!(size_of::<Server<TestClock>>(), 1_024);
-    assert_eq!(size_of::<Shard>(), 360);
+    assert_eq!(size_of::<Client<TestClock>>(), 1_336);
+    assert_eq!(
+        size_of::<shin::client::PooledConnection<'static, TestClock>>(),
+        2 * size_of::<usize>(),
+    );
+    assert_eq!(size_of::<Server<TestClock>>(), 1_048);
+    assert_eq!(size_of::<PreparedShard>(), size_of::<usize>());
+    assert_eq!(size_of::<Shard>(), size_of::<usize>());
     assert_eq!(
         size_of::<MultiplexedConnection<TestClock>>(),
         size_of::<Server<TestClock>>() + size_of::<usize>(),
     );
     assert_eq!(
-        size_of::<PooledConnection<TestClock>>(),
-        size_of::<MultiplexedConnection<TestClock>>(),
+        size_of::<PooledConnection<'static, TestClock>>(),
+        2 * size_of::<usize>(),
     );
     assert_eq!(
-        size_of::<PooledConnection<TestClock, 0, ClientAuthVerifier<NoClientAuth>>>(),
-        size_of::<PooledConnection<TestClock>>(),
+        size_of::<PooledConnection<'static, TestClock, 0, ClientAuthVerifier<NoClientAuth>>>(),
+        size_of::<PooledConnection<'static, TestClock>>(),
     );
     black_box((server, mutual_server));
 }
@@ -118,15 +132,63 @@ fn multiplexed_server_admission_is_allocation_free() {
     )
     .unwrap();
     let allocations = AllocationProbe::measured(|| {
-        black_box(shard.bind_multiplexed(server).unwrap());
+        black_box(shard.bind_multiplexed(server).into_result().unwrap());
     });
     assert_eq!(allocations, 0);
 
-    let workspace = shard.tls_workspace_layout().allocate();
+    let pool = shard
+        .tls_profile()
+        .into_pool::<fn() -> u64>(o3::collections::slab::Capacity::try_from(1).unwrap());
     let allocations = AllocationProbe::measured(|| {
-        black_box(shard.tls_with_workspace(now as fn() -> u64, workspace));
+        black_box(pool.connect(now as fn() -> u64).unwrap());
     });
     assert_eq!(allocations, 0);
+}
+
+#[test]
+fn one_time_domain_binding_preserves_borrows_without_allocation() {
+    use core::cell::Cell;
+
+    use shin::crypto::sig::SigningKey;
+    use shin::server::config::{CertSource, EarlyDataGuard};
+
+    struct BorrowedGuard<'a>(&'a Cell<usize>);
+
+    impl EarlyDataGuard for BorrowedGuard<'_> {
+        fn register(&self, _token: &[u8]) -> bool {
+            self.0.set(self.0.get() + 1);
+            true
+        }
+    }
+
+    let registrations = Cell::new(0);
+    let prepared = PreparedShard::with_early_data_guard(
+        shin::server::config::Config {
+            source: CertSource::RawPublicKey {
+                signing_key: SigningKey::from_seed(&[7; 32]).unwrap(),
+            },
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+        },
+        BorrowedGuard(&registrations),
+    )
+    .unwrap();
+
+    let mut shard = None;
+    let allocations = AllocationProbe::measured(|| {
+        shard = Some(prepared.bind_domain::<7>());
+    });
+
+    assert_eq!(allocations, 0);
+    let shard = shard.unwrap();
+    let pool = shard
+        .tls_profile()
+        .into_pool::<fn() -> u64>(o3::collections::slab::Capacity::try_from(1).unwrap());
+    let connection = pool.connect((|| 0) as fn() -> u64).unwrap();
+    drop(connection);
+    drop(pool);
+    drop(shard);
+    assert_eq!(registrations.get(), 0);
 }
 
 #[test]
@@ -150,18 +212,20 @@ fn mutual_workspace_profile_survives_recycling_without_allocation() {
         NoClientAuth,
     )
     .unwrap();
-    let mut workspace = Some(shard.tls_workspace_layout().allocate());
+    let pool = shard
+        .tls_profile()
+        .into_pool::<fn() -> u64>(o3::collections::slab::Capacity::try_from(1).unwrap());
 
     let allocations = AllocationProbe::measured(|| {
         for _ in 0..128 {
-            let connection =
-                shard.tls_with_workspace(now as fn() -> u64, workspace.take().unwrap());
-            workspace = Some(connection.into_workspace());
+            let connection = pool.connect(now as fn() -> u64).unwrap();
+            black_box(&connection);
+            drop(connection);
         }
     });
 
     assert_eq!(allocations, 0);
-    black_box(workspace);
+    black_box(pool);
 }
 
 #[test]
@@ -267,10 +331,10 @@ fn verifier_bound_shapes_mutual_identity_storage_once() {
         || 0,
     )
     .unwrap();
-    assert!(matches!(
-        shard.bind_multiplexed(undersized),
-        Err(shin::connection::Error::BadConfig)
-    ));
+    let Err(rejection) = shard.bind_multiplexed(undersized).into_result() else {
+        panic!("undersized server was admitted");
+    };
+    assert_eq!(rejection.error(), &shin::connection::Error::BadConfig);
 }
 
 #[test]
@@ -366,7 +430,7 @@ fn hybrid_workspace_is_inline_and_charged_only_to_opt_in_clients() {
     assert_eq!(allocations, 0);
 
     assert_eq!(size_of::<HybridWorkspace>(), 3_272);
-    assert_eq!(size_of::<Hybrid<'static, TestClock>>(), 1_192);
+    assert_eq!(size_of::<Hybrid<'static, TestClock>>(), 1_200);
 }
 
 #[test]

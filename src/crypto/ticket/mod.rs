@@ -52,6 +52,13 @@ const MAX_CIPHERTEXT_LEN: usize = MAX_PLAINTEXT_LEN + TAG_LEN;
 
 pub const MAX_LEN: usize = NONCE_LEN + MAX_CIPHERTEXT_LEN;
 
+pub(crate) const fn encrypted_len(alpn_len: usize) -> Option<usize> {
+    if alpn_len > MAX_ALPN_LEN {
+        return None;
+    }
+    Some(NONCE_LEN + FIXED_PLAINTEXT_LEN + alpn_len + TAG_LEN)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     BadFormat,

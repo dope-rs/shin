@@ -53,7 +53,7 @@ impl<'a> KxModesRef<'a> {
         Ok(Self(modes))
     }
 
-    pub fn as_slice(self) -> &'a [u8] {
+    pub fn as_slice(&self) -> &'a [u8] {
         self.0
     }
 

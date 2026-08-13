@@ -4,8 +4,7 @@ use crate::crypto::sig;
 use crate::crypto::ticket;
 use crate::identity;
 use crate::transport;
-use crate::wire::handshake;
-use crate::wire::handshake::views;
+use crate::wire::handshake::{self, messages, views};
 use crate::wire::protocols;
 use crate::wire::record;
 use alloc::vec;
@@ -89,6 +88,7 @@ const EMPTY_EARLY_DATA_EXTENSION_LEN: usize = EXTENSION_HEADER_LEN;
 pub(super) struct FlightProfile {
     tls_flight_len: usize,
     maximum_quic_transport_parameters_len: u16,
+    maximum_alpn_len: u8,
     client_auth: bool,
 }
 
@@ -118,6 +118,7 @@ impl FlightProfile {
         Some(Self {
             tls_flight_len,
             maximum_quic_transport_parameters_len,
+            maximum_alpn_len: u8::try_from(maximum_alpn_len).ok()?,
             client_auth,
         })
     }
@@ -145,6 +146,54 @@ impl FlightProfile {
         (transport_parameters_len <= self.maximum_quic_transport_parameters_len as usize)
             .then_some(self.tls_flight_len + EXTENSION_HEADER_LEN + transport_parameters_len)
     }
+
+    pub(super) fn outbound_layout(
+        self,
+        transport_mode: transport::Mode,
+        transport_parameters_len: usize,
+    ) -> Option<connection::OutboundLayout> {
+        use crate::crypto::{kx, ticket};
+
+        const HANDSHAKE_HEADER: usize = 4;
+        const SERVER_HELLO_FIXED: usize = 2 + handshake::RANDOM_LEN + 1 + 2 + 1 + 2;
+        const SUPPORTED_VERSION: usize = EXTENSION_HEADER_LEN + 2;
+        const RETRY_KEY_SHARE: usize = EXTENSION_HEADER_LEN + 2;
+        const SELECTED_PSK: usize = EXTENSION_HEADER_LEN + 2;
+        const TICKET_FIXED: usize = HANDSHAKE_HEADER + 4 + 4 + 1 + 8 + 2 + 2;
+        const EARLY_DATA: usize = EXTENSION_HEADER_LEN + 4;
+
+        let session_id = if transport_mode.uses_legacy_session_id() {
+            32
+        } else {
+            0
+        };
+        let server_share = kx::KexGroup::SUPPORTED
+            .iter()
+            .map(|group| group.server_share_len())
+            .max()?;
+        let hello = HANDSHAKE_HEADER
+            .checked_add(SERVER_HELLO_FIXED)?
+            .checked_add(session_id)?
+            .checked_add(SUPPORTED_VERSION)?
+            .checked_add(EXTENSION_HEADER_LEN + 2 + 2)?
+            .checked_add(server_share)?
+            .checked_add(SELECTED_PSK)?;
+        let retry = HANDSHAKE_HEADER
+            .checked_add(SERVER_HELLO_FIXED)?
+            .checked_add(session_id)?
+            .checked_add(SUPPORTED_VERSION)?
+            .checked_add(RETRY_KEY_SHARE)?;
+        let plaintext = hello.checked_add(retry)?;
+        let handshake = self.flight_len(transport_mode, transport_parameters_len)?;
+        let application = TICKET_FIXED
+            .checked_add(ticket::encrypted_len(self.maximum_alpn_len as usize)?)?
+            .checked_add(EARLY_DATA)?;
+        Some(connection::OutboundLayout::new(
+            plaintext,
+            handshake,
+            application,
+        ))
+    }
 }
 
 fn full_tls_handshake_flight_len(
@@ -160,8 +209,7 @@ fn full_tls_handshake_flight_len(
         HANDSHAKE_HEADER_LEN + 1 + EXTENSIONS_VECTOR_LEN + EXTENSION_HEADER_LEN + 2 + 2 * 6;
     const FINISHED_MAX_LEN: usize = HANDSHAKE_HEADER_LEN + hash::MAX_LEN;
 
-    let certificate_verify_len =
-        handshake::messages::CertificateVerify::frame_len(signature_len_upper_bound);
+    let certificate_verify_len = messages::CertificateVerify::frame_len(signature_len_upper_bound);
     let alpn_extension_len = if maximum_alpn_len != 0 {
         EXTENSION_HEADER_LEN + 2 + 1 + maximum_alpn_len
     } else {
@@ -199,8 +247,9 @@ pub trait EarlyDataGuard {
     const ACCEPTS_EARLY_DATA: bool = true;
 
     /// Record a single-use token (the PSK binder); `false` means it was already
-    /// seen — a replay. Tokens need only be kept for `TICKET_LIFETIME_SECS`.
-    fn register(&mut self, token: &[u8]) -> bool;
+    /// seen — a replay. Implementations synchronize the shared store; tokens
+    /// need only be kept for `TICKET_LIFETIME_SECS`.
+    fn register(&self, token: &[u8]) -> bool;
 }
 
 /// Default guard for servers that never accept 0-RTT: reports every token as
@@ -210,7 +259,7 @@ pub struct NoGuard;
 impl EarlyDataGuard for NoGuard {
     const ACCEPTS_EARLY_DATA: bool = false;
 
-    fn register(&mut self, _token: &[u8]) -> bool {
+    fn register(&self, _token: &[u8]) -> bool {
         false
     }
 }
@@ -291,11 +340,8 @@ impl ClientCertVerifier for NoClientAuth {
     }
 }
 
-/// Type-level proof that a shard requests and verifies client authentication.
-///
-/// The wrapper is transparent and constructed only by the client-auth shard
-/// constructors. This keeps its workspace reservation profile in the shard's
-/// type without adding runtime state.
+/// Transparent proof that a shard verifies clients and carries their workspace
+/// reservation profile in its type without runtime state.
 #[repr(transparent)]
 pub struct ClientAuthVerifier<V>(V);
 
@@ -316,10 +362,8 @@ impl<V: ClientCertVerifier> ClientCertVerifier for ClientAuthVerifier<V> {
 /// Authorizes a possession-proven client identity, typically by pinning
 /// `spki_der`; CertificateVerify authenticity has already succeeded.
 pub trait ClientCertVerifier {
-    /// Maximum encoded client Certificate message retained for verification.
-    ///
-    /// The server reserves this many bytes once per connection workspace and
-    /// rejects a larger fragmented or retained identity without reallocating.
+    /// Maximum retained Certificate message size, reserved once per workspace;
+    /// larger fragmented identities are rejected without reallocating.
     const MAX_CERTIFICATE_MESSAGE_SIZE: usize = record::MAX_PLAINTEXT_BODY;
 
     fn verify(&self, identity: &ClientIdentity<'_>) -> bool;

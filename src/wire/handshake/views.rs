@@ -77,6 +77,17 @@ impl<'a> ClientHelloRef<'a> {
             extensions,
         })
     }
+
+    pub fn into_owned(self) -> messages::ClientHello {
+        messages::ClientHello {
+            legacy_version: self.legacy_version,
+            random: self.random,
+            legacy_session_id: self.legacy_session_id.to_vec(),
+            cipher_suites: self.cipher_suites.iter().collect(),
+            legacy_compression_methods: self.legacy_compression_methods.to_vec(),
+            extensions: self.extensions.into_owned(),
+        }
+    }
 }
 
 /// Allocation-free view of a validated ServerHello body.
@@ -104,6 +115,17 @@ impl<'a> ServerHelloRef<'a> {
             extensions: extension::Extensions::decode(reader)?,
         })
     }
+
+    pub fn into_owned(self) -> messages::ServerHello {
+        messages::ServerHello {
+            legacy_version: self.legacy_version,
+            random: self.random,
+            legacy_session_id_echo: self.legacy_session_id_echo.to_vec(),
+            cipher_suite: self.cipher_suite,
+            legacy_compression_method: self.legacy_compression_method,
+            extensions: self.extensions.into_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +138,12 @@ impl<'a> EncryptedExtensionsRef<'a> {
         Ok(Self {
             extensions: extension::Extensions::decode(reader)?,
         })
+    }
+
+    pub fn into_owned(self) -> messages::EncryptedExtensions {
+        messages::EncryptedExtensions {
+            extensions: self.extensions.into_owned(),
+        }
     }
 }
 
@@ -131,6 +159,13 @@ impl<'a> CertificateEntryRef<'a> {
             cert_data: codec::FramedVector::<1, 1>::decode_u24(reader)?.as_slice(),
             extensions: extension::Extensions::decode(reader)?,
         })
+    }
+
+    pub fn into_owned(self) -> messages::CertificateEntry {
+        messages::CertificateEntry {
+            cert_data: self.cert_data.to_vec(),
+            extensions: self.extensions.into_owned(),
+        }
     }
 }
 
@@ -205,6 +240,17 @@ impl<'a> CertificateRef<'a> {
             certificate_list: CertificateEntries::decode(reader.vec_u24()?)?,
         })
     }
+
+    pub fn into_owned(self) -> messages::Certificate {
+        messages::Certificate {
+            certificate_request_context: self.certificate_request_context.to_vec(),
+            certificate_list: self
+                .certificate_list
+                .iter()
+                .map(CertificateEntryRef::into_owned)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +266,13 @@ impl<'a> CertificateRequestRef<'a> {
             extensions: extension::Extensions::decode(reader)?,
         })
     }
+
+    pub fn into_owned(self) -> messages::CertificateRequest {
+        messages::CertificateRequest {
+            certificate_request_context: self.certificate_request_context.to_vec(),
+            extensions: self.extensions.into_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +287,13 @@ impl<'a> CertificateVerifyRef<'a> {
             algorithm: sig::SignatureScheme::from_wire_id(reader.u16()?),
             signature: reader.vec_u16()?,
         })
+    }
+
+    pub fn into_owned(self) -> messages::CertificateVerify {
+        messages::CertificateVerify {
+            algorithm: self.algorithm,
+            signature: self.signature.to_vec(),
+        }
     }
 }
 
@@ -255,6 +315,16 @@ impl<'a> NewSessionTicketRef<'a> {
             ticket: codec::FramedVector::<1, 1>::decode_u16(reader)?.as_slice(),
             extensions: extension::Extensions::decode(reader)?,
         })
+    }
+
+    pub fn into_owned(self) -> messages::NewSessionTicket {
+        messages::NewSessionTicket {
+            ticket_lifetime: self.ticket_lifetime,
+            ticket_age_add: self.ticket_age_add,
+            ticket_nonce: self.ticket_nonce.to_vec(),
+            ticket: self.ticket.to_vec(),
+            extensions: self.extensions.into_owned(),
+        }
     }
 }
 
@@ -324,6 +394,30 @@ impl<'a> MessageRef<'a> {
             Self::EndOfEarlyData => super::Type::EndOfEarlyData,
             Self::KeyUpdate(_) => super::Type::KeyUpdate,
             Self::NewSessionTicket(_) => super::Type::NewSessionTicket,
+        }
+    }
+
+    /// Materializes this borrowed message for mutation or storage.
+    pub fn into_owned(self) -> super::Frame {
+        match self {
+            Self::ClientHello(message) => super::Frame::ClientHello(message.into_owned()),
+            Self::ServerHello(message) => super::Frame::ServerHello(message.into_owned()),
+            Self::EncryptedExtensions(message) => {
+                super::Frame::EncryptedExtensions(message.into_owned())
+            }
+            Self::CertificateRequest(message) => {
+                super::Frame::CertificateRequest(message.into_owned())
+            }
+            Self::Certificate(message) => super::Frame::Certificate(message.into_owned()),
+            Self::CertificateVerify(message) => {
+                super::Frame::CertificateVerify(message.into_owned())
+            }
+            Self::Finished(verify_data) => super::Frame::Finished(messages::Finished {
+                verify_data: verify_data.to_vec(),
+            }),
+            Self::EndOfEarlyData => super::Frame::EndOfEarlyData,
+            Self::KeyUpdate(message) => super::Frame::KeyUpdate(message),
+            Self::NewSessionTicket(message) => super::Frame::NewSessionTicket(message.into_owned()),
         }
     }
 }

@@ -151,7 +151,7 @@ fn caller_owned_record_and_event_hot_paths_allocate_nothing() {
         || 0,
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let mut client = Client::new(
         Config {
             verifier: shin::client::config::Verifier::RawPublicKey {

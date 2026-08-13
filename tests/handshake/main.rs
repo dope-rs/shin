@@ -30,7 +30,8 @@ mod ticket_rotation;
 mod zero_rtt;
 
 use shin::wire::codec::{DecodeError, Reader};
-use shin::wire::handshake::frame::{Frame, MessageRef};
+use shin::wire::handshake::Frame;
+use shin::wire::handshake::views::MessageRef;
 
 fn decode_owned<'a>(reader: &mut Reader<'a>) -> Result<Frame, DecodeError> {
     MessageRef::decode_from(reader).map(MessageRef::into_owned)

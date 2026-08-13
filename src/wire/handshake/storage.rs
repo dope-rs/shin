@@ -1,9 +1,10 @@
 use crate::wire::{codec, record};
 use alloc::vec;
-use core::ops;
+use core::{mem, ops};
 
 pub(crate) struct BoundedBuffer {
     bytes: vec::Vec<u8>,
+    base: usize,
     limit: usize,
     overflowed: bool,
 }
@@ -18,38 +19,39 @@ impl BoundedBuffer {
     pub(crate) fn with_capacity(limit: usize) -> Self {
         Self {
             bytes: vec::Vec::with_capacity(limit),
+            base: 0,
             limit,
             overflowed: false,
         }
     }
 
     pub(crate) fn clear(&mut self) {
-        self.bytes.clear();
+        self.bytes.truncate(self.base);
         self.overflowed = false;
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() - self.base
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.len() == 0
     }
 
-    pub(crate) fn capacity(&self) -> usize {
+    pub(crate) const fn capacity(&self) -> usize {
         self.limit
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[self.base..]
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.bytes
+        &mut self.bytes[self.base..]
     }
 
     pub(crate) fn try_extend(&mut self, bytes: &[u8]) -> Result<(), codec::EncodeError> {
-        if bytes.len() > self.limit - self.bytes.len() {
+        if bytes.len() > self.limit - self.len() {
             return Err(codec::EncodeError::Capacity);
         }
         self.bytes.extend_from_slice(bytes);
@@ -57,11 +59,87 @@ impl BoundedBuffer {
     }
 
     fn reserve_encoded(&mut self, additional: usize) -> bool {
-        if self.overflowed || additional > self.limit - self.bytes.len() {
+        if self.overflowed || additional > self.limit - self.len() {
             self.overflowed = true;
             return false;
         }
         true
+    }
+
+    pub(crate) fn flight<'buffer, 'outbound>(
+        &'buffer mut self,
+        outbound: Option<crate::connection::OutboundFlight<'outbound>>,
+    ) -> Flight<'buffer, 'outbound> {
+        let saved = outbound.as_ref().map(|outbound| Saved {
+            base: self.base,
+            limit: self.limit,
+            overflowed: self.overflowed,
+            outbound_base: outbound.base,
+        });
+        let mut outbound = outbound;
+        if let Some(outbound) = outbound.as_mut() {
+            mem::swap(&mut self.bytes, outbound.bytes);
+            self.base = outbound.base;
+            self.limit = outbound.maximum;
+            self.overflowed = false;
+        }
+        Flight {
+            buffer: self,
+            outbound,
+            saved,
+            committed: false,
+        }
+    }
+}
+
+struct Saved {
+    base: usize,
+    limit: usize,
+    overflowed: bool,
+    outbound_base: usize,
+}
+
+pub(crate) struct Flight<'buffer, 'outbound> {
+    buffer: &'buffer mut BoundedBuffer,
+    outbound: Option<crate::connection::OutboundFlight<'outbound>>,
+    saved: Option<Saved>,
+    committed: bool,
+}
+
+impl Flight<'_, '_> {
+    /// Commits newly encoded bytes and reports whether the sink owns them.
+    pub(crate) fn commit(mut self) -> bool {
+        self.committed = true;
+        self.outbound.is_some()
+    }
+}
+
+impl ops::Deref for Flight<'_, '_> {
+    type Target = BoundedBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        self.buffer
+    }
+}
+
+impl ops::DerefMut for Flight<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buffer
+    }
+}
+
+impl Drop for Flight<'_, '_> {
+    fn drop(&mut self) {
+        let (Some(outbound), Some(saved)) = (self.outbound.as_mut(), self.saved.take()) else {
+            return;
+        };
+        if !self.committed {
+            self.buffer.bytes.truncate(saved.outbound_base);
+        }
+        mem::swap(&mut self.buffer.bytes, outbound.bytes);
+        self.buffer.base = saved.base;
+        self.buffer.limit = saved.limit;
+        self.buffer.overflowed = saved.overflowed;
     }
 }
 
@@ -105,24 +183,25 @@ impl codec::Encode for BoundedBuffer {
     }
 
     fn encoded_len(&self) -> usize {
-        self.bytes.len()
+        self.len()
     }
 
     fn reserve_length_prefix(&mut self, width: usize) -> Result<usize, codec::EncodeError> {
         if self.overflowed || !self.reserve_encoded(width) {
             return Err(codec::EncodeError::Capacity);
         }
-        let start = self.bytes.len();
-        self.bytes.resize(start + width, 0);
+        let start = self.len();
+        self.bytes.resize(self.bytes.len() + width, 0);
         Ok(start)
     }
 
     fn rollback_to(&mut self, len: usize) {
-        self.bytes.truncate(len);
+        self.bytes.truncate(self.base + len);
     }
 
     fn patch_length_prefix(&mut self, start: usize, width: usize, len: usize) {
         let encoded = (len as u32).to_be_bytes();
+        let start = self.base + start;
         self.bytes[start..start + width].copy_from_slice(&encoded[4 - width..]);
     }
 

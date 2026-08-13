@@ -1,5 +1,4 @@
 use crate::client;
-use crate::client::drive::Drive as _;
 use crate::connection;
 use crate::crypto::kx;
 use crate::wire::handshake;
@@ -18,22 +17,26 @@ use crate::wire::handshake;
 /// }
 /// ```
 pub struct Updates<'client, C: connection::Clock, K = kx::Owned> {
-    client: &'client mut client::Client<C, K>,
+    core: &'client mut client::Core<C, K>,
+    authority: &'client client::config::Authority,
 }
 
 impl<'client, C: connection::Clock, K: kx::Initiator> Updates<'client, C, K> {
-    pub(super) fn new(client: &'client mut client::Client<C, K>) -> Self {
-        Self { client }
+    pub(super) fn new(
+        core: &'client mut client::Core<C, K>,
+        authority: &'client client::config::Authority,
+    ) -> Self {
+        Self { core, authority }
     }
 
     /// Marks application-data progress and resets the consecutive-update budget.
     pub fn note_application_data(&mut self) {
-        self.client.session.application.traffic.reset_updates();
+        self.core.session.application.traffic.reset_updates();
     }
 
     /// Returns whether a coalesced peer-requested response is pending.
     pub fn response_pending(&self) -> bool {
-        self.client
+        self.core
             .session
             .application
             .traffic
@@ -57,32 +60,24 @@ impl<'client, C: connection::Clock, K: kx::Initiator> Updates<'client, C, K> {
         request: handshake::KeyUpdateRequest,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        if matches!(
-            self.client.session.handshake.state,
-            client::state::State::Failed
-        ) {
+        if self.core.session.handshake.is_failed() {
             return Err(connection::Error::ConnectionFailed.into());
         }
         if !self
-            .client
-            .session
-            .offer
-            .config
+            .authority
+            .template()
             .transport_mode()
             .allows_tls_key_update()
-            || !matches!(
-                self.client.session.handshake.state,
-                client::state::State::Done
-            )
+            || !self.core.session.handshake.is_done()
         {
             return Err(connection::Error::UnexpectedMessage.into());
         }
         let result = connection::KeyUpdateCore::<connection::ClientRole>::new(
-            &mut self.client.session.application.traffic,
+            &mut self.core.session.application.traffic,
         )
         .send(request, events);
         if result.is_err() {
-            self.client.poison();
+            self.core.poison();
         }
         result
     }

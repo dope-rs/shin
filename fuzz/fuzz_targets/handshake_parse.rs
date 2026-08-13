@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use shin::wire::codec::Reader;
-use shin::wire::handshake::frame::MessageRef;
+use shin::wire::handshake::views::MessageRef;
 
 fuzz_target!(|data: &[u8]| {
     let mut borrowed_reader = Reader::new(data);

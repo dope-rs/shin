@@ -1,17 +1,10 @@
 use crate::crypto::sig;
 use crate::wire::codec;
 use crate::wire::handshake::messages;
-use crate::wire::handshake::views;
-
-pub use views::{
-    CertificateEntries, CertificateEntryRef, CertificateEntryRefs, CertificateRef,
-    CertificateRequestRef, CertificateVerifyRef, ClientHelloRef, EncryptedExtensionsRef,
-    MessageRef, NewSessionTicketRef, ServerHelloRef, U16List, U16s,
-};
 
 /// Owned handshake representation for construction, mutation, and retention.
-/// Decode through [`MessageRef`] and cross this allocation boundary explicitly
-/// with [`MessageRef::into_owned`] only when ownership is required.
+/// Decode through [`crate::wire::handshake::views::MessageRef`] and call
+/// [`crate::wire::handshake::views::MessageRef::into_owned`] only when needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     ClientHello(messages::ClientHello),
@@ -79,25 +72,5 @@ impl Frame {
             Self::NewSessionTicket(m) => m.encode(&mut body)?,
         }
         body.finish()
-    }
-}
-
-impl MessageRef<'_> {
-    /// Materializes this borrowed message for mutation or storage.
-    pub fn into_owned(self) -> Frame {
-        match self {
-            Self::ClientHello(message) => Frame::ClientHello(message.into_owned()),
-            Self::ServerHello(message) => Frame::ServerHello(message.into_owned()),
-            Self::EncryptedExtensions(message) => Frame::EncryptedExtensions(message.into_owned()),
-            Self::CertificateRequest(message) => Frame::CertificateRequest(message.into_owned()),
-            Self::Certificate(message) => Frame::Certificate(message.into_owned()),
-            Self::CertificateVerify(message) => Frame::CertificateVerify(message.into_owned()),
-            Self::Finished(verify_data) => Frame::Finished(messages::Finished {
-                verify_data: verify_data.to_vec(),
-            }),
-            Self::EndOfEarlyData => Frame::EndOfEarlyData,
-            Self::KeyUpdate(message) => Frame::KeyUpdate(message),
-            Self::NewSessionTicket(message) => Frame::NewSessionTicket(message.into_owned()),
-        }
     }
 }

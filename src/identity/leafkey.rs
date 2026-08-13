@@ -15,7 +15,7 @@ pub(crate) enum LeafKey<'a> {
     Rsa(&'a [u8]),
 }
 
-const MAX_PEER_KEY_LEN: usize = 2048;
+pub(crate) const MAX_PEER_KEY_LEN: usize = 2048;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LeafKeyKind {

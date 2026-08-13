@@ -3,7 +3,7 @@ use shin::client::config::{Config, OwnedTrustAnchor, Verifier};
 use shin::connection::Epoch;
 use shin::wire::codec::Reader;
 use shin::wire::extension::Type;
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::Frame;
 use shin::wire::handshake::messages::ClientHello;
 
 use crate::common::{CollectEvents, Event};

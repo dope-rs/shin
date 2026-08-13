@@ -3,7 +3,7 @@ use shin::client::config::{Config, Verifier};
 use shin::connection::{Epoch, Error};
 use shin::wire::codec::Reader;
 use shin::wire::extension::{Extension, Type};
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::Frame;
 use shin::wire::handshake::messages::ServerHello;
 use shin::wire::handshake::{RANDOM_LEN, TLS_1_2};
 

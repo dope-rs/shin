@@ -16,14 +16,14 @@ const NOW_MS: u64 = 1_700_000_000_000;
 
 struct TestGuard {
     now: u64,
-    seen: Vec<Vec<u8>>,
+    seen: RefCell<Vec<Vec<u8>>>,
 }
 
 impl TestGuard {
     fn new(now: u64) -> Self {
         Self {
             now,
-            seen: Vec::new(),
+            seen: RefCell::new(Vec::new()),
         }
     }
 }
@@ -35,11 +35,12 @@ impl Clock for TestGuard {
 }
 
 impl EarlyDataGuard for TestGuard {
-    fn register(&mut self, token: &[u8]) -> bool {
-        if self.seen.iter().any(|t| t.as_slice() == token) {
+    fn register(&self, token: &[u8]) -> bool {
+        let mut seen = self.seen.borrow_mut();
+        if seen.iter().any(|t| t.as_slice() == token) {
             return false;
         }
-        self.seen.push(token.to_vec());
+        seen.push(token.to_vec());
         true
     }
 }
@@ -275,7 +276,7 @@ fn quic_zero_rtt_uses_sentinel_and_omits_end_of_early_data() {
     let mut encoded = shin::wire::codec::Reader::new(&s_hs);
     let mut server_advertised_early_data = false;
     while !encoded.is_empty() {
-        if let shin::wire::handshake::frame::Frame::EncryptedExtensions(extensions) =
+        if let shin::wire::handshake::Frame::EncryptedExtensions(extensions) =
             crate::decode_owned(&mut encoded).unwrap()
         {
             server_advertised_early_data = extensions
@@ -394,7 +395,7 @@ fn client_does_not_offer_quic_entitlement_in_tls_mode() {
     );
     let hello = find_send(&events, Epoch::Plaintext).unwrap();
     let mut reader = shin::wire::codec::Reader::new(&hello);
-    let shin::wire::handshake::frame::Frame::ClientHello(hello) =
+    let shin::wire::handshake::Frame::ClientHello(hello) =
         crate::decode_owned(&mut reader).unwrap()
     else {
         panic!("expected ClientHello")
@@ -406,3 +407,4 @@ fn client_does_not_offer_quic_entitlement_in_tls_mode() {
             .all(|extension| extension.ty != shin::wire::extension::Type::EARLY_DATA)
     );
 }
+use std::cell::RefCell;

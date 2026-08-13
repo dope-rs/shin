@@ -9,7 +9,7 @@ use shin::connection::{Epoch, Event, EventContext, EventSink};
 use shin::crypto::sig::SigningKey;
 use shin::identity::asn1::{Reader, Tag};
 use shin::server::config::{CertSource, Config, Connection};
-use shin::server::{ReplayDomain, Server, Shard};
+use shin::server::{OwnedConnection, ReplayDomain, Server, Shard};
 use shin::transport::Mode;
 
 mod support;
@@ -241,43 +241,102 @@ fn valid_server_and_shard_bind_without_deferred_errors() {
         || 0,
     )
     .unwrap();
-    assert!(shard.bind(server).is_ok());
+    assert!(shard.bind(server).into_result().is_ok());
+}
+
+#[test]
+fn rejected_owned_binding_returns_server_and_exact_shard() {
+    let shard = Shard::new(large_x509_config(200_000)).unwrap();
+    let required = shard.tls_profile().capacities();
+    let server = stream_server();
+    let actual = server.into_workspace().capacities();
+    let server = stream_server();
+
+    let Err(rejection) = OwnedConnection::new(server, shard).into_result() else {
+        panic!("undersized owned server was admitted");
+    };
+    let (error, (server, shard)) = rejection.into_parts();
+
+    assert_eq!(error, shin::connection::Error::BadConfig);
+    assert_eq!(server.into_workspace().capacities(), actual);
+    assert_eq!(shard.tls_profile().capacities(), required);
+}
+
+#[test]
+fn prepared_owned_connection_has_no_admission_failure_surface() {
+    let shard = Shard::new(large_x509_config(200_000)).unwrap();
+    let required = shard.tls_profile().capacities();
+    let connection = OwnedConnection::prepare(
+        shard,
+        Connection {
+            transport_params: Vec::new(),
+        },
+        Mode::Tls,
+        (|| 0) as fn() -> u64,
+    )
+    .unwrap();
+
+    assert_eq!(connection.into_workspace().capacities(), required);
+}
+
+#[test]
+fn prepared_borrowed_connection_has_no_admission_failure_surface() {
+    let mut shard = Shard::new(large_x509_config(200_000)).unwrap();
+    let required = shard.tls_profile().capacities();
+    let connection = shin::server::Connection::prepare(
+        &mut shard,
+        Connection {
+            transport_params: Vec::new(),
+        },
+        Mode::Tls,
+        (|| 0) as fn() -> u64,
+    )
+    .unwrap();
+
+    assert_eq!(connection.into_workspace().capacities(), required);
+}
+
+#[test]
+fn tls_profiles_are_bound_to_exact_shard_identity() {
+    let first = Shard::new(raw_config()).unwrap();
+    let second = Shard::new(raw_config()).unwrap();
+
+    assert!(first.tls_profile() == first.tls_profile());
+    assert!(first.tls_profile() != second.tls_profile());
 }
 
 #[test]
 fn multiplexed_connections_admit_many_connections_to_one_exact_shard() {
-    let mut shard = Shard::new(raw_config()).unwrap();
-    let mut first = shard.bind_multiplexed(stream_server()).unwrap();
-    let second = shard.bind_multiplexed(stream_server()).unwrap();
+    let shard = Shard::new(raw_config()).unwrap();
+    let mut first = shard
+        .bind_multiplexed(stream_server())
+        .into_result()
+        .unwrap();
+    let second = shard
+        .bind_multiplexed(stream_server())
+        .into_result()
+        .unwrap();
 
     shard.replace_ticket_keys(None);
     assert_eq!(first.selected_alpn(), None);
     assert_eq!(second.selected_alpn(), None);
-    assert!(
-        first
-            .read_into(&mut shard, Epoch::Plaintext, &[], &mut Ignore)
-            .is_ok()
-    );
+    assert!(first.read_into(Epoch::Plaintext, &[], &mut Ignore).is_ok());
 }
 
 #[test]
-fn multiplexed_connection_rejects_another_same_typed_shard_and_is_poisoned() {
-    let mut admitting = Shard::new(raw_config()).unwrap();
-    let mut foreign = Shard::new(raw_config()).unwrap();
-    let mut connection = admitting.bind_multiplexed(stream_server()).unwrap();
+fn multiplexed_connection_retains_its_exact_authority() {
+    let admitting = Shard::new(raw_config()).unwrap();
+    let mut connection = admitting
+        .bind_multiplexed(stream_server())
+        .into_result()
+        .unwrap();
+    drop(admitting);
 
-    assert!(matches!(
-        connection.read_into(&mut foreign, Epoch::Plaintext, &[], &mut Ignore),
-        Err(shin::connection::DriveError::Protocol(
-            shin::connection::Error::ConnectionFailed
-        ))
-    ));
-    assert!(matches!(
-        connection.read_into(&mut admitting, Epoch::Plaintext, &[], &mut Ignore),
-        Err(shin::connection::DriveError::Protocol(
-            shin::connection::Error::ConnectionFailed
-        ))
-    ));
+    assert!(
+        connection
+            .read_into(Epoch::Plaintext, &[], &mut Ignore)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -304,10 +363,10 @@ fn exact_flight_preflight_preserves_large_tls_identity_but_rejects_quic_sum() {
         || 0,
     )
     .unwrap();
-    assert!(matches!(
-        shard.bind_multiplexed(default),
-        Err(shin::connection::Error::BadConfig)
-    ));
+    let Err(rejection) = shard.bind_multiplexed(default).into_result() else {
+        panic!("undersized server was admitted");
+    };
+    assert_eq!(rejection.error(), &shin::connection::Error::BadConfig);
 
     assert!(matches!(
         shard.new_multiplexed(
@@ -340,13 +399,13 @@ fn quic_workspace_limit_is_the_exact_extension_vector_bound() {
 
 #[test]
 fn exact_large_server_flight_allocates_only_before_admission() {
-    use shin::client::config::{Config as ClientConfig, OwnedTrustAnchor, Verifier};
+    use shin::client::config::{OwnedTrustAnchor, Verifier};
     use shin::crypto::hash;
 
     const OPTIONAL_CERTIFICATE_TYPE_EXTENSIONS_LEN: usize = 2 * (4 + 1);
 
     let (config, certificate) = large_x509_identity(32_000);
-    let mut shard = Shard::new(config).unwrap();
+    let shard = Shard::new(config).unwrap();
     let outbound_flight_capacity = shard.tls_workspace_layout().capacities().1;
     let certificate_view = shin::identity::cert::Cert::parse(&certificate).unwrap();
     let now_ms = shin::identity::UnixTime(
@@ -366,7 +425,7 @@ fn exact_large_server_flight_allocates_only_before_admission() {
         )
         .unwrap();
     let mut client = client::Client::new(
-        ClientConfig {
+        client::config::Config {
             verifier: Verifier::X509 {
                 anchors: vec![OwnedTrustAnchor::from_cert_der(&certificate).unwrap()],
                 hostname: b"large.shin.local".to_vec(),
@@ -385,7 +444,7 @@ fn exact_large_server_flight_allocates_only_before_admission() {
     let mut sent = CaptureServerFlight::reserved();
     let server_allocations = AllocationProbe::measured(|| {
         server
-            .read_into(&mut shard, Epoch::Plaintext, &hello.0, &mut sent)
+            .read_into(Epoch::Plaintext, &hello.0, &mut sent)
             .unwrap();
     });
 
@@ -415,7 +474,7 @@ fn exact_large_server_flight_allocates_only_before_admission() {
 
 #[test]
 fn exact_large_client_identity_allocates_only_before_admission() {
-    use shin::client::config::{Config as ClientConfig, Identity, Verifier};
+    use shin::client::config::{Identity, Verifier};
     use shin::identity::cert::Cert;
     use shin::server::config::{ClientAuth, ClientCertVerifier, ClientIdentity};
 
@@ -439,7 +498,7 @@ fn exact_large_client_identity_allocates_only_before_admission() {
         .spki
         .raw_der
         .to_vec();
-    let mut shard = Shard::with_client_auth(
+    let shard = Shard::with_client_auth(
         Config {
             source: CertSource::RawPublicKey {
                 signing_key: server_key,
@@ -451,17 +510,22 @@ fn exact_large_client_identity_allocates_only_before_admission() {
         PinnedLargeIdentity(client_spki),
     )
     .unwrap();
-    let server_layout = shard.tls_workspace_layout();
+    let server_profile = shard.tls_profile();
     assert_eq!(
-        server_layout.capacities(),
+        server_profile.capacities(),
         (64 * 1024, shin::wire::record::MAX_PLAINTEXT_BODY, 64 * 1024)
     );
-    let mut server_workspace = None;
-    let server_profile = AllocationProbe::measured_with_bytes(|| {
-        server_workspace = Some(server_layout.allocate());
+    let mut server_pool = None;
+    let allocation_profile = AllocationProbe::measured_with_bytes(|| {
+        server_pool = Some(
+            server_profile
+                .into_pool::<fn() -> u64>(o3::collections::slab::Capacity::try_from(1).unwrap()),
+        );
     });
-    assert_eq!(server_profile, (3, 144 * 1024));
-    let mut server = shard.tls_with_workspace(|| 0, server_workspace.unwrap());
+    assert_eq!(allocation_profile.0, 4);
+    assert!(allocation_profile.1 >= 144 * 1024);
+    let server_pool = server_pool.unwrap();
+    let mut server = server_pool.connect((|| 0) as fn() -> u64).unwrap();
 
     let identity = Identity::X509 {
         chain_der: vec![client_certificate],
@@ -469,7 +533,7 @@ fn exact_large_client_identity_allocates_only_before_admission() {
     }
     .try_into_template()
     .unwrap();
-    let prepared = ClientConfig {
+    let prepared = client::config::Config {
         verifier: Verifier::RawPublicKey {
             expected_pubkey: server_pubkey,
         },
@@ -516,7 +580,7 @@ fn exact_large_client_identity_allocates_only_before_admission() {
     client.start_into(&mut hello).unwrap();
     let mut server_flight = CaptureServerFlight::reserved();
     server
-        .read_into(&mut shard, Epoch::Plaintext, &hello.0, &mut server_flight)
+        .read_into(Epoch::Plaintext, &hello.0, &mut server_flight)
         .unwrap();
 
     let mut client_flight = CaptureClientFlight::reserved();
@@ -545,7 +609,7 @@ fn exact_large_client_identity_allocates_only_before_admission() {
     let server_allocations = AllocationProbe::measured(|| {
         for chunk in client_flight.handshake.chunks(4096) {
             server
-                .read_into(&mut shard, Epoch::Handshake, chunk, &mut server_events)
+                .read_into(Epoch::Handshake, chunk, &mut server_events)
                 .unwrap();
         }
     });

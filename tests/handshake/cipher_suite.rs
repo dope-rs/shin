@@ -4,7 +4,7 @@ use shin::connection::{Epoch, Error};
 use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
 use shin::wire::codec::Reader;
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::Frame;
 use shin::wire::record::CipherSuite;
 
 use crate::common::CollectEvents;

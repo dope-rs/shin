@@ -1,7 +1,6 @@
 use crate::connection;
-use crate::server::{self, session};
+use crate::server;
 use crate::wire::handshake;
-use session::Drive as _;
 
 /// Exclusive post-handshake KeyUpdate capability.
 /// Its borrow prevents the server from being driven concurrently.
@@ -56,11 +55,11 @@ impl<'server, C: connection::Clock, const DOMAIN: u8> Updates<'server, C, DOMAIN
         request: handshake::KeyUpdateRequest,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        if self.server.session.handshake.state == session::State::Failed {
+        if self.server.session.handshake.is_failed() {
             return Err(connection::Error::ConnectionFailed.into());
         }
         if !self.server.session.transport_mode.allows_tls_key_update()
-            || self.server.session.handshake.state != session::State::Done
+            || !self.server.session.handshake.is_done()
         {
             return Err(connection::Error::UnexpectedMessage.into());
         }

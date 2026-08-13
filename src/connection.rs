@@ -5,6 +5,8 @@ use crate::wire::alert;
 use crate::wire::codec;
 use crate::wire::handshake;
 use crate::wire::record;
+use alloc::collections::TryReserveError;
+use alloc::vec::Vec;
 use core::{fmt, marker};
 
 use crate::identity::cert;
@@ -25,12 +27,85 @@ impl<F: Fn() -> u64> Clock for F {
     }
 }
 
+/// Borrowed writer over storage whose allocation is retained by a pool.
+/// Growth past the configured limit is rejected before touching the vector.
+pub struct RetainedBytes<'a> {
+    bytes: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl<'a> RetainedBytes<'a> {
+    pub(crate) fn new(bytes: &'a mut Vec<u8>, limit: usize) -> Self {
+        debug_assert!(bytes.capacity() >= limit);
+        debug_assert!(bytes.len() <= limit);
+        Self { bytes, limit }
+    }
+
+    pub fn try_extend(&mut self, value: &[u8]) -> Result<(), Error> {
+        let len = self
+            .bytes
+            .len()
+            .checked_add(value.len())
+            .filter(|len| *len <= self.limit)
+            .ok_or(Error::BadConfig)?;
+        debug_assert!(len <= self.bytes.capacity());
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.limit - self.bytes.len()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Epoch {
     Plaintext,
     EarlyData,
     Handshake,
     Application,
+}
+
+/// Validated cumulative storage required by each outbound handshake epoch.
+///
+/// Multiple flights in one epoch are included in the corresponding bound. In
+/// particular, `plaintext` covers both ClientHellos (or HRR plus ServerHello)
+/// when a HelloRetryRequest occurs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboundLayout {
+    plaintext: usize,
+    handshake: usize,
+    application: usize,
+}
+
+impl OutboundLayout {
+    pub const fn new(plaintext: usize, handshake: usize, application: usize) -> Self {
+        Self {
+            plaintext,
+            handshake,
+            application,
+        }
+    }
+
+    pub const fn plaintext(self) -> usize {
+        self.plaintext
+    }
+
+    pub const fn handshake(self) -> usize {
+        self.handshake
+    }
+
+    pub const fn application(self) -> usize {
+        self.application
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +307,16 @@ impl EventContext {
             .map_err(DriveError::Sink)
     }
 
+    pub(crate) fn begin_send<'a, S: EventSink + ?Sized>(
+        sink: &'a mut S,
+        cipher_suite: Option<record::CipherSuite>,
+        epoch: Epoch,
+        maximum: usize,
+    ) -> Result<Option<OutboundFlight<'a>>, DriveError<S::Error>> {
+        sink.begin_send(epoch, maximum, Self::new(cipher_suite))
+            .map_err(DriveError::Sink)
+    }
+
     /// The record-protection suite negotiated for the connection or authorized
     /// by a resumption ticket for this 0-RTT event.
     pub fn cipher_suite(self) -> Option<record::CipherSuite> {
@@ -296,8 +381,96 @@ impl<E> From<kdf::HkdfError> for DriveError<E> {
 pub trait EventSink {
     type Error;
 
+    /// Optionally lends storage that will own the next encoded TLS flight.
+    ///
+    /// Returning a flight consumes the corresponding [`Event::Send`]: shin
+    /// encodes directly into the lent owner and does not emit a second event.
+    /// The default preserves the borrowed-event API without requiring storage.
+    fn begin_send(
+        &mut self,
+        _epoch: Epoch,
+        _maximum: usize,
+        _context: EventContext,
+    ) -> Result<Option<OutboundFlight<'_>>, Self::Error> {
+        Ok(None)
+    }
+
     /// Consumes one event and its state-machine context before returning.
     fn event(&mut self, event: Event<'_>, context: EventContext) -> Result<(), Self::Error>;
+}
+
+/// Event sink that always lends the final owner of an encoded TLS flight.
+///
+/// Framed transports use this stronger contract so their connection-local TLS
+/// workspace never reserves a duplicate outbound buffer. The returned borrow
+/// cannot outlive the sink, while the backing allocation remains owned by the
+/// transport after the borrow ends.
+pub trait LendingEventSink: EventSink {
+    fn lend_send(
+        &mut self,
+        epoch: Epoch,
+        context: EventContext,
+    ) -> Result<OutboundFlight<'_>, Self::Error>;
+}
+
+pub(crate) struct RequiredFlightSink<'a, S: ?Sized>(&'a mut S);
+
+impl<'a, S: LendingEventSink + ?Sized> RequiredFlightSink<'a, S> {
+    pub(crate) fn new(sink: &'a mut S) -> Self {
+        Self(sink)
+    }
+}
+
+impl<S: LendingEventSink + ?Sized> EventSink for RequiredFlightSink<'_, S> {
+    type Error = S::Error;
+
+    fn begin_send(
+        &mut self,
+        epoch: Epoch,
+        _maximum: usize,
+        context: EventContext,
+    ) -> Result<Option<OutboundFlight<'_>>, Self::Error> {
+        self.0.lend_send(epoch, context).map(Some)
+    }
+
+    fn event(&mut self, event: Event<'_>, context: EventContext) -> Result<(), Self::Error> {
+        self.0.event(event, context)
+    }
+}
+
+/// Transactional lease into a consumer-owned contiguous TLS flight store.
+///
+/// Capacity is reserved before shin receives the lease, so encoding cannot
+/// allocate. Existing bytes remain available for transport retransmission;
+/// failed encoding rolls the appended range back automatically.
+pub struct OutboundFlight<'a> {
+    pub(crate) bytes: &'a mut Vec<u8>,
+    pub(crate) base: usize,
+    pub(crate) maximum: usize,
+}
+
+impl<'a> OutboundFlight<'a> {
+    /// Lends already-reserved storage without invoking the allocator.
+    pub fn from_reserved(bytes: &'a mut Vec<u8>, maximum: usize) -> Option<Self> {
+        (bytes.capacity().saturating_sub(bytes.len()) >= maximum).then(|| {
+            let base = bytes.len();
+            Self {
+                bytes,
+                base,
+                maximum,
+            }
+        })
+    }
+
+    pub fn try_append(bytes: &'a mut Vec<u8>, maximum: usize) -> Result<Self, TryReserveError> {
+        bytes.try_reserve_exact(maximum)?;
+        let base = bytes.len();
+        Ok(Self {
+            bytes,
+            base,
+            maximum,
+        })
+    }
 }
 
 pub(crate) trait KeyUpdateRole {

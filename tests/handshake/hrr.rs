@@ -5,8 +5,8 @@ use shin::crypto::sig::SigningKey;
 use shin::server::config::CertSource;
 use shin::wire::codec::Reader;
 use shin::wire::extension::{Extension, Type};
+use shin::wire::handshake::Frame;
 use shin::wire::handshake::HELLO_RETRY_REQUEST_RANDOM;
-use shin::wire::handshake::frame::Frame;
 
 use crate::common::CollectEvents;
 use crate::common::Event;

@@ -6,6 +6,7 @@ use crate::server;
 use crate::server::config;
 use crate::server::session;
 use crate::wire::handshake::views;
+use core::mem;
 
 struct PresentedClientIdentity<'a> {
     leaf: leafkey::LeafKey<'a>,
@@ -49,40 +50,19 @@ impl<'a> PresentedClientIdentity<'a> {
     }
 }
 
-pub(super) trait Authentication {
-    fn handle_end_of_early_data(
-        &mut self,
-        raw: &[u8],
-        client_handshake_traffic: material::TrafficSecret,
-    ) -> Result<(), connection::Error>;
-    fn expect_client_finished(
-        &mut self,
-        client_handshake_traffic: material::TrafficSecret,
-    ) -> Result<(), connection::Error>;
-    fn handle_client_certificate(
-        &mut self,
-        cert: views::CertificateRef<'_>,
-        raw: &[u8],
-        client_handshake_traffic: material::TrafficSecret,
-        client_auth: Option<config::ClientAuth>,
-    ) -> Result<(), connection::Error>;
-    fn handle_client_cert_verify<
-        G: config::EarlyDataGuard,
-        V: config::ClientCertVerifier,
-        const DOMAIN: u8,
-    >(
-        &mut self,
-        cv: views::CertificateVerifyRef<'_>,
-        raw: &[u8],
-        client_handshake_traffic: material::TrafficSecret,
-        shard: &server::Shard<G, V, DOMAIN>,
-    ) -> Result<(), connection::Error>;
+pub(super) struct Authentication<'session, C> {
+    session: &'session mut session::Session<C>,
 }
-impl<C: connection::Clock, const SERVER_DOMAIN: u8> Authentication
-    for server::Server<C, SERVER_DOMAIN>
-{
-    fn handle_end_of_early_data(
-        &mut self,
+
+const _: () = assert!(mem::size_of::<Authentication<'static, ()>>() == mem::size_of::<usize>());
+
+impl<'session, C> Authentication<'session, C> {
+    pub(super) fn new(session: &'session mut session::Session<C>) -> Self {
+        Self { session }
+    }
+
+    pub(super) fn handle_end_of_early_data(
+        self,
         raw: &[u8],
         client_handshake_traffic: material::TrafficSecret,
     ) -> Result<(), connection::Error> {
@@ -92,7 +72,7 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Authentication
     }
 
     fn expect_client_finished(
-        &mut self,
+        self,
         client_handshake_traffic: material::TrafficSecret,
     ) -> Result<(), connection::Error> {
         use crate::wire::handshake::messages::Finished;
@@ -107,8 +87,8 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Authentication
     /// Mutual TLS: validate and retain the client's Certificate bytes for the
     /// CertificateVerify that follows. An empty list is an anonymous client
     /// (allowed only under `Requested`).
-    fn handle_client_certificate(
-        &mut self,
+    pub(super) fn handle_client_certificate(
+        self,
         cert: views::CertificateRef<'_>,
         raw: &[u8],
         client_handshake_traffic: material::TrafficSecret,
@@ -142,16 +122,16 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Authentication
     /// Mutual TLS: the client's CertificateVerify (RFC 8446 §4.4.3). Verify
     /// possession of the leaf key, then ask the embedder to authorize the
     /// pinned identity. Only then is the expected client Finished computed.
-    fn handle_client_cert_verify<
+    pub(super) fn handle_client_cert_verify<
         G: config::EarlyDataGuard,
         V: config::ClientCertVerifier,
         const DOMAIN: u8,
     >(
-        &mut self,
+        self,
         cv: views::CertificateVerifyRef<'_>,
         raw: &[u8],
         client_handshake_traffic: material::TrafficSecret,
-        shard: &server::Shard<G, V, DOMAIN>,
+        authority: &server::Authority<G, V, DOMAIN>,
     ) -> Result<(), connection::Error> {
         use crate::wire::handshake::messages::CertificateVerify;
         use crate::wire::protocols::SignatureAlgorithms;
@@ -172,10 +152,10 @@ impl<C: connection::Clock, const SERVER_DOMAIN: u8> Authentication
                 PresentedClientIdentity::parse(certificate, self.session.peer.client_cert_type)?;
             presented.leaf.verify(cv.algorithm, &msg, cv.signature)?;
 
-            if shard.policy.client_auth.is_none() {
+            if authority.client_auth.is_none() {
                 return Err(connection::Error::UnexpectedMessage);
             }
-            if !shard.policy.verifier.verify(&presented.public) {
+            if !authority.verifier.verify(&presented.public) {
                 return Err(connection::Error::AccessDenied);
             }
         }

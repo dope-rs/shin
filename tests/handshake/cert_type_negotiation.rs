@@ -32,7 +32,7 @@ use shin::server::config::CertSource;
 use shin::transport::Mode;
 use shin::wire::codec;
 use shin::wire::extension::{Extension, Type};
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::Frame;
 
 use crate::common::CollectEvents;
 use crate::common::Event;

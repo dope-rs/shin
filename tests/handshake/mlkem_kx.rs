@@ -89,7 +89,7 @@ fn pq_client_hello_carries_hybrid_key_share() {
     // x25519(32) = 1216 bytes, far larger than a classical share.
     use shin::wire::codec::Reader;
     use shin::wire::extension::Type;
-    use shin::wire::handshake::frame::Frame;
+    use shin::wire::handshake::Frame;
 
     let mut client = client();
     client.set_kex_group(KexGroup::X25519Mlkem768).unwrap();

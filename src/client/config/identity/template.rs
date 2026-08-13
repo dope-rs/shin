@@ -25,6 +25,11 @@ impl IdentityTemplate {
     pub(crate) fn outbound_flight_capacity(&self) -> usize {
         self.source.outbound_flight_capacity()
     }
+
+    #[cfg(test)]
+    pub(in crate::client) fn strong_count(&self) -> usize {
+        rc::Rc::strong_count(&self.source)
+    }
 }
 
 impl ops::Deref for IdentityTemplate {

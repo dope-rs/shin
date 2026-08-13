@@ -2,13 +2,14 @@ use core::convert::Infallible;
 
 use shin::client::Client;
 use shin::client::config::{Config, NegotiatedAlpn, Restore, Verifier};
-use shin::connection::{DriveError, Epoch, Error, Event, EventContext, EventSink};
+use shin::connection::{DriveError, Epoch, Error, Event, EventContext, EventSink, OutboundFlight};
 use shin::crypto::sig::SigningKey;
 use shin::server;
 use shin::server::config;
 use shin::server::config::CertSource;
 use shin::transport::Mode;
-use shin::wire::record::CipherSuite;
+use shin::wire::handshake::storage::Scratch;
+use shin::wire::record::{CipherSuite, MAX_PLAINTEXT_BODY};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rejected;
@@ -60,6 +61,63 @@ struct Ignore;
 
 impl EventSink for Ignore {
     type Error = Infallible;
+
+    fn event(&mut self, _event: Event<'_>, _context: EventContext) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct DirectSend {
+    bytes: Vec<u8>,
+    borrowed_sends: usize,
+}
+
+impl DirectSend {
+    fn new() -> Self {
+        let mut bytes = Vec::with_capacity(MAX_PLAINTEXT_BODY);
+        bytes.push(0xa5);
+        Self {
+            bytes,
+            borrowed_sends: 0,
+        }
+    }
+}
+
+impl EventSink for DirectSend {
+    type Error = Infallible;
+
+    fn begin_send(
+        &mut self,
+        _epoch: Epoch,
+        maximum: usize,
+        _context: EventContext,
+    ) -> Result<Option<OutboundFlight<'_>>, Self::Error> {
+        Ok(Some(
+            OutboundFlight::try_append(&mut self.bytes, maximum).unwrap(),
+        ))
+    }
+
+    fn event(&mut self, event: Event<'_>, _context: EventContext) -> Result<(), Self::Error> {
+        if matches!(event, Event::Send { .. }) {
+            self.borrowed_sends += 1;
+        }
+        Ok(())
+    }
+}
+
+struct ShortDirectSend(Vec<u8>);
+
+impl EventSink for ShortDirectSend {
+    type Error = Infallible;
+
+    fn begin_send(
+        &mut self,
+        _epoch: Epoch,
+        _maximum: usize,
+        _context: EventContext,
+    ) -> Result<Option<OutboundFlight<'_>>, Self::Error> {
+        Ok(Some(OutboundFlight::try_append(&mut self.0, 1).unwrap()))
+    }
 
     fn event(&mut self, _event: Event<'_>, _context: EventContext) -> Result<(), Self::Error> {
         Ok(())
@@ -161,6 +219,39 @@ fn client() -> Client<fn() -> u64> {
 }
 
 #[test]
+fn direct_send_encodes_into_the_consumers_owner_without_a_borrowed_event() {
+    let mut fallback_client = client();
+    let mut fallback = FirstPlaintextSend::default();
+    fallback_client.start_into(&mut fallback).unwrap();
+
+    let mut direct_client = client();
+    let mut direct = DirectSend::new();
+    let allocation = direct.bytes.as_ptr();
+    direct_client.start_into(&mut direct).unwrap();
+
+    assert_eq!(direct.bytes.as_ptr(), allocation);
+    assert_eq!(direct.bytes[0], 0xa5);
+    assert_eq!(direct.bytes.len(), fallback.0.len() + 1);
+    assert!(matches!(
+        shin::wire::handshake::views::MessageRef::decode(&direct.bytes[1..]).unwrap(),
+        shin::wire::handshake::views::MessageRef::ClientHello(_)
+    ));
+    assert_eq!(direct.borrowed_sends, 0);
+}
+
+#[test]
+fn failed_direct_send_rolls_back_without_touching_retained_bytes() {
+    let mut client = client();
+    let mut direct = ShortDirectSend(vec![0xa5]);
+
+    assert!(matches!(
+        client.start_into(&mut direct),
+        Err(DriveError::Protocol(_))
+    ));
+    assert_eq!(direct.0, [0xa5]);
+}
+
+#[test]
 fn sink_error_is_typed_and_stops_on_the_rejected_event() {
     let mut client = client();
     let mut sink = RejectFirst { seen: 0 };
@@ -191,8 +282,32 @@ fn protocol_error_remains_distinct_from_infallible_sink() {
     );
 }
 
-fn shard(seed: u8) -> server::Shard {
-    server::Shard::new(server::config::Config {
+#[test]
+fn fragmented_client_error_preserves_reassembly_reservation() {
+    let mut client = client();
+    let mut sink = Ignore;
+    client.start_into(&mut sink).unwrap();
+
+    let malformed_server_hello = [2, 0, 0, 1, 0];
+    client
+        .read_into(Epoch::Plaintext, &malformed_server_hello[..2], &mut sink)
+        .unwrap();
+    assert!(
+        client
+            .read_into(Epoch::Plaintext, &malformed_server_hello[2..], &mut sink,)
+            .is_err()
+    );
+
+    assert_eq!(
+        client.into_workspace().capacities(),
+        (MAX_PLAINTEXT_BODY, MAX_PLAINTEXT_BODY),
+    );
+}
+
+fn shard<const DOMAIN: u8>(
+    seed: u8,
+) -> server::Shard<config::NoGuard, config::NoClientAuth, DOMAIN> {
+    server::PreparedShard::new(server::config::Config {
         source: CertSource::RawPublicKey {
             signing_key: SigningKey::from_seed(&[seed; 32]).unwrap(),
         },
@@ -200,6 +315,7 @@ fn shard(seed: u8) -> server::Shard {
         ticket_keys: None,
     })
     .unwrap()
+    .bind_domain::<DOMAIN>()
 }
 
 #[test]
@@ -211,11 +327,40 @@ fn valid_policy_is_bound_before_the_first_read() {
         (|| 0) as fn() -> u64,
     )
     .unwrap();
-    let mut first = shard(7).into_domain::<7>();
-    let mut connection = first.bind(server).unwrap();
+    let mut first = shard::<7>(7);
+    let mut connection = first.bind(server).into_result().unwrap();
     connection
         .read_into(Epoch::Plaintext, &[], &mut Ignore)
         .unwrap();
+}
+
+#[test]
+fn fragmented_server_error_preserves_reassembly_reservation() {
+    let workspace = Scratch::for_server();
+    let capacities = workspace.capacities();
+    let server = server::Server::with_workspace(
+        config::Connection {
+            transport_params: Vec::new(),
+        },
+        (|| 0) as fn() -> u64,
+        workspace,
+    )
+    .unwrap();
+    let mut shard = shard::<0>(7);
+    let mut connection = shard.bind(server).into_result().unwrap();
+    let mut sink = Ignore;
+
+    let malformed_client_hello = [1, 0, 0, 1, 0];
+    connection
+        .read_into(Epoch::Plaintext, &malformed_client_hello[..2], &mut sink)
+        .unwrap();
+    assert!(
+        connection
+            .read_into(Epoch::Plaintext, &malformed_client_hello[2..], &mut sink,)
+            .is_err()
+    );
+
+    assert_eq!(connection.into_workspace().capacities(), capacities);
 }
 
 #[test]
@@ -228,8 +373,8 @@ fn every_server_flight_sink_failure_is_terminal() {
         transport_params: Vec::new(),
     };
     let baseline = server::Server::new(connection(), (|| 0) as fn() -> u64).unwrap();
-    let mut baseline_shard = shard(9);
-    let mut baseline = baseline_shard.bind(baseline).unwrap();
+    let mut baseline_shard = shard::<0>(9);
+    let mut baseline = baseline_shard.bind(baseline).into_result().unwrap();
     let mut count = CountEvents::default();
     baseline
         .read_into(Epoch::Plaintext, &client_events.0, &mut count)
@@ -241,8 +386,8 @@ fn every_server_flight_sink_failure_is_terminal() {
 
     for reject_at in 1..=count.0 {
         let server = server::Server::new(connection(), (|| 0) as fn() -> u64).unwrap();
-        let mut shard = shard(9);
-        let mut server = shard.bind(server).unwrap();
+        let mut shard = shard::<0>(9);
+        let mut server = shard.bind(server).into_result().unwrap();
         let mut reject = RejectNth { seen: 0, reject_at };
         assert_eq!(
             server.read_into(Epoch::Plaintext, &client_events.0, &mut reject),

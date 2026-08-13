@@ -5,7 +5,6 @@ use crate::crypto::sig;
 use crate::wire::codec;
 use crate::wire::codec::Encode as _;
 use crate::wire::extension;
-use crate::wire::handshake::views;
 use alloc::vec;
 use o3::collections::fixed::array;
 
@@ -40,19 +39,6 @@ impl ClientHello {
     }
 }
 
-impl views::ClientHelloRef<'_> {
-    pub fn into_owned(self) -> ClientHello {
-        ClientHello {
-            legacy_version: self.legacy_version,
-            random: self.random,
-            legacy_session_id: self.legacy_session_id.to_vec(),
-            cipher_suites: self.cipher_suites.iter().collect(),
-            legacy_compression_methods: self.legacy_compression_methods.to_vec(),
-            extensions: self.extensions.into_owned(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerHello {
     pub legacy_version: u16,
@@ -76,19 +62,6 @@ impl ServerHello {
     }
 }
 
-impl views::ServerHelloRef<'_> {
-    pub fn into_owned(self) -> ServerHello {
-        ServerHello {
-            legacy_version: self.legacy_version,
-            random: self.random,
-            legacy_session_id_echo: self.legacy_session_id_echo.to_vec(),
-            cipher_suite: self.cipher_suite,
-            legacy_compression_method: self.legacy_compression_method,
-            extensions: self.extensions.into_owned(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedExtensions {
     pub extensions: vec::Vec<extension::Extension>,
@@ -104,14 +77,6 @@ impl EncryptedExtensions {
     }
 }
 
-impl views::EncryptedExtensionsRef<'_> {
-    pub fn into_owned(self) -> EncryptedExtensions {
-        EncryptedExtensions {
-            extensions: self.extensions.into_owned(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateEntry {
     pub cert_data: vec::Vec<u8>,
@@ -124,15 +89,6 @@ impl CertificateEntry {
         data.put_slice(&self.cert_data);
         data.finish()?;
         extension::Extension::encode_list(&self.extensions, out)
-    }
-}
-
-impl views::CertificateEntryRef<'_> {
-    pub fn into_owned(self) -> CertificateEntry {
-        CertificateEntry {
-            cert_data: self.cert_data.to_vec(),
-            extensions: self.extensions.into_owned(),
-        }
     }
 }
 
@@ -173,19 +129,6 @@ impl Certificate {
     }
 }
 
-impl views::CertificateRef<'_> {
-    pub fn into_owned(self) -> Certificate {
-        Certificate {
-            certificate_request_context: self.certificate_request_context.to_vec(),
-            certificate_list: self
-                .certificate_list
-                .iter()
-                .map(views::CertificateEntryRef::into_owned)
-                .collect(),
-        }
-    }
-}
-
 /// TLS 1.3 client-auth context and extensions; `signature_algorithms` declares
 /// schemes accepted for CertificateVerify (RFC 8446 §4.3.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,15 +143,6 @@ impl CertificateRequest {
         context.put_slice(&self.certificate_request_context);
         context.finish()?;
         extension::Extension::encode_list(&self.extensions, out)
-    }
-}
-
-impl views::CertificateRequestRef<'_> {
-    pub fn into_owned(self) -> CertificateRequest {
-        CertificateRequest {
-            certificate_request_context: self.certificate_request_context.to_vec(),
-            extensions: self.extensions.into_owned(),
-        }
     }
 }
 
@@ -261,15 +195,6 @@ impl CertificateVerify {
         let mut signature = out.begin_u16()?;
         signature.put_slice(signature_bytes);
         signature.finish()
-    }
-}
-
-impl views::CertificateVerifyRef<'_> {
-    pub fn into_owned(self) -> CertificateVerify {
-        CertificateVerify {
-            algorithm: self.algorithm,
-            signature: self.signature.to_vec(),
-        }
     }
 }
 
@@ -351,17 +276,5 @@ impl NewSessionTicket {
         ticket.put_slice(&self.ticket);
         ticket.finish()?;
         extension::Extension::encode_list(&self.extensions, out)
-    }
-}
-
-impl views::NewSessionTicketRef<'_> {
-    pub fn into_owned(self) -> NewSessionTicket {
-        NewSessionTicket {
-            ticket_lifetime: self.ticket_lifetime,
-            ticket_age_add: self.ticket_age_add,
-            ticket_nonce: self.ticket_nonce.to_vec(),
-            ticket: self.ticket.to_vec(),
-            extensions: self.extensions.into_owned(),
-        }
     }
 }

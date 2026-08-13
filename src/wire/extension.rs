@@ -64,12 +64,12 @@ impl Extension {
 
 /// Allocation-free view of one validated extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtensionRef<'a> {
+pub struct Ref<'a> {
     pub ty: Type,
     pub data: &'a [u8],
 }
 
-impl<'a> ExtensionRef<'a> {
+impl<'a> Ref<'a> {
     fn decode(r: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         Ok(Self {
             ty: Type(r.u16()?),
@@ -94,7 +94,7 @@ impl<'a> Extensions<'a> {
         let mut reader = codec::Reader::new(encoded);
         let mut seen = array::CopyInline::<u16, MAX_EXTENSIONS>::new();
         while !reader.is_empty() {
-            let extension = ExtensionRef::decode(&mut reader)?;
+            let extension = Ref::decode(&mut reader)?;
             match seen.binary_search(&extension.ty.0) {
                 Ok(_) => return Err(codec::DecodeError::DuplicateExtension),
                 Err(position) if seen.insert(position, extension.ty.0).is_err() => {
@@ -106,32 +106,32 @@ impl<'a> Extensions<'a> {
         Ok(Self { encoded })
     }
 
-    pub fn iter(self) -> ExtensionRefs<'a> {
-        ExtensionRefs {
+    pub fn iter(self) -> Refs<'a> {
+        Refs {
             reader: codec::Reader::new(self.encoded),
         }
     }
 
-    pub fn find(self, ty: Type) -> Option<ExtensionRef<'a>> {
+    pub fn find(self, ty: Type) -> Option<Ref<'a>> {
         self.iter().find(|extension| extension.ty == ty)
     }
 
     pub fn into_owned(self) -> vec::Vec<Extension> {
-        self.iter().map(ExtensionRef::into_owned).collect()
+        self.iter().map(Ref::into_owned).collect()
     }
 }
 
-pub struct ExtensionRefs<'a> {
+pub struct Refs<'a> {
     reader: codec::Reader<'a>,
 }
 
-impl<'a> Iterator for ExtensionRefs<'a> {
-    type Item = ExtensionRef<'a>;
+impl<'a> Iterator for Refs<'a> {
+    type Item = Ref<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.reader.is_empty() {
             return None;
         }
-        ExtensionRef::decode(&mut self.reader).ok()
+        Ref::decode(&mut self.reader).ok()
     }
 }

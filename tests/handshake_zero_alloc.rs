@@ -18,8 +18,9 @@ use shin::server::{
 use shin::transport::Mode;
 use shin::wire::codec;
 use shin::wire::extension::Type;
-use shin::wire::handshake::frame::{Frame, MessageRef};
-use shin::wire::handshake::workspace::Scratch;
+use shin::wire::handshake::Frame;
+use shin::wire::handshake::storage::Scratch;
+use shin::wire::handshake::views::MessageRef;
 use shin::wire::record::{CipherSuite, MAX_PLAINTEXT_BODY};
 
 mod support;
@@ -66,7 +67,7 @@ impl ClientCertVerifier for PinnedSpki {
 struct AcceptEarlyData;
 
 impl EarlyDataGuard for AcceptEarlyData {
-    fn register(&mut self, _token: &[u8]) -> bool {
+    fn register(&self, _token: &[u8]) -> bool {
         true
     }
 }
@@ -171,7 +172,7 @@ fn ticket_processing_allocations(retain: bool) -> usize {
         workspace(),
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let mut client = Client::new(
         Config {
             verifier: Verifier::RawPublicKey {
@@ -282,7 +283,7 @@ fn caller_owned_hybrid_rpk_handshake_has_no_allocations() {
         workspace(),
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let mut hybrid_workspace = HybridWorkspace::new();
     let client = Client::mutual(
         Config {
@@ -376,7 +377,7 @@ fn x509_handshake_has_no_allocations_after_construction() {
         workspace(),
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let mut client = Client::mutual(
         Config {
             verifier: Verifier::X509 {
@@ -460,7 +461,7 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
         workspace(),
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let mut client = Client::new_with_transport(
         Config {
             verifier: Verifier::RawPublicKey {
@@ -547,7 +548,7 @@ fn fragmented_alpn_transport_params_and_resumption_have_no_allocations() {
         workspace(),
     )
     .unwrap();
-    let mut resumed_server = shard.bind(resumed_server).unwrap();
+    let mut resumed_server = shard.bind(resumed_server).into_result().unwrap();
     let mut resumed_client = Client::resume(resumption, true, || 0).unwrap();
     client_wire.clear();
     server_wire.clear();
@@ -601,20 +602,28 @@ fn server_admission_rejects_undersized_storage_without_allocating() {
         ticket_keys: None,
     })
     .unwrap();
+    let workspace = Scratch::new(0, 16 * 1024, 0);
+    let capacities = workspace.capacities();
     let server = Server::with_workspace(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
-        Scratch::new(0, 16 * 1024, 0),
+        workspace,
     )
     .unwrap();
     let mut rejected = false;
+    let mut recovered = None;
     let allocations = AllocationProbe::measured(|| {
-        rejected = matches!(shard.bind(server), Err(Error::BadConfig));
+        let Err(rejection) = shard.bind(server).into_result() else {
+            panic!("undersized server was admitted");
+        };
+        rejected = rejection.error() == &Error::BadConfig;
+        recovered = Some(rejection.into_parts().1);
     });
     assert_eq!(allocations, 0);
     assert!(rejected);
+    assert_eq!(recovered.unwrap().into_workspace().capacities(), capacities);
 
     let server_signing_key = SigningKey::from_seed(&[12; 32]).unwrap();
     let mut shard = Shard::with_client_auth(
@@ -629,20 +638,28 @@ fn server_admission_rejects_undersized_storage_without_allocating() {
         PinnedSpki(Vec::new()),
     )
     .unwrap();
+    let workspace = Scratch::new(16 * 1024, 16 * 1024, 0);
+    let capacities = workspace.capacities();
     let server = Server::with_workspace(
         Connection {
             transport_params: Vec::new(),
         },
         || 0,
-        Scratch::new(16 * 1024, 16 * 1024, 0),
+        workspace,
     )
     .unwrap();
     let mut rejected = false;
+    let mut recovered = None;
     let allocations = AllocationProbe::measured(|| {
-        rejected = matches!(shard.bind(server), Err(Error::BadConfig));
+        let Err(rejection) = shard.bind(server).into_result() else {
+            panic!("undersized server was admitted");
+        };
+        rejected = rejection.error() == &Error::BadConfig;
+        recovered = Some(rejection.into_parts().1);
     });
     assert_eq!(allocations, 0);
     assert!(rejected);
+    assert_eq!(recovered.unwrap().into_workspace().capacities(), capacities);
 }
 
 #[test]
@@ -663,7 +680,7 @@ fn hello_retry_request_has_no_allocations() {
         workspace(),
     )
     .unwrap();
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
     let mut client = Client::new(
         Config {
             verifier: Verifier::RawPublicKey {

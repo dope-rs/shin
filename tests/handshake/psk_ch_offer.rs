@@ -2,7 +2,7 @@ use shin::client::config::{Config, Restore, Verifier};
 use shin::connection::Epoch;
 use shin::wire::codec::Reader;
 use shin::wire::extension::Type;
-use shin::wire::handshake::frame::Frame;
+use shin::wire::handshake::Frame;
 use shin::wire::handshake::messages::ClientHello;
 use shin::wire::psk::{KX_MODE_DHE, KxModesRef, OfferedPsks};
 use shin::wire::record::CipherSuite;

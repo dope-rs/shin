@@ -94,7 +94,7 @@ fn ticket_from(events: &[Event]) -> Option<Restore<'static>> {
 fn server_resumed(server: &mut Server<FixedClock>, restore: Restore<'_>) -> bool {
     use shin::wire::codec::Reader;
     use shin::wire::handshake::Type;
-    use shin::wire::handshake::frame::MessageRef;
+    use shin::wire::handshake::views::MessageRef;
 
     let mut client = fresh_client(Some(restore));
     let c1 = client.start().unwrap();

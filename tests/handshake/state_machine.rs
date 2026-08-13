@@ -2,7 +2,7 @@ use shin::client::Client;
 use shin::client::config::{Config, Verifier};
 use shin::connection::{Epoch, Error};
 use shin::wire::codec::{DecodeError, Reader};
-use shin::wire::handshake::frame::MessageRef;
+use shin::wire::handshake::views::MessageRef;
 
 use crate::common::{CollectEvents, Event};
 

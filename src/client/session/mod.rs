@@ -1,9 +1,5 @@
-use crate::client;
-use crate::client::authentication::Authentication as _;
-use crate::client::config;
-use crate::client::config::resumption;
-use crate::client::negotiation::Negotiation as _;
-use crate::client::state;
+use crate::client::config::resumptions;
+use crate::client::{self, config, workspace};
 use crate::connection;
 use crate::crypto::hash;
 use crate::crypto::kx;
@@ -14,13 +10,17 @@ use crate::wire::extension;
 use crate::wire::handshake;
 use crate::wire::handshake::messages;
 use crate::wire::handshake::reassemblers;
+use crate::wire::handshake::storage;
 use crate::wire::handshake::views;
-use crate::wire::handshake::workspace;
 use crate::wire::protocols;
 use crate::wire::record;
 use core::mem;
 use o3::collections::fixed::array;
 use ring::rand;
+
+mod authentication;
+mod negotiation;
+mod state;
 
 pub(super) struct Session<C, K> {
     pub(super) offer: OfferSettings,
@@ -34,30 +34,53 @@ pub(super) struct Session<C, K> {
 }
 
 pub(super) struct OfferSettings {
-    pub(super) config: config::Template,
     pub(super) enable_early_data: bool,
     pub(super) kex_group: kx::KexGroup,
     pub(super) offered_suites: array::CopyInline<record::CipherSuite, 3>,
 }
 
 pub(super) struct Handshake {
-    pub(super) state: state::State,
+    state: state::State,
     pub(super) transcript: hash::Transcript,
     pub(super) client_random: [u8; handshake::RANDOM_LEN],
     pub(super) session_id: [u8; 32],
     pub(super) hrr_done: bool,
     /// Single ticket slot shared by the pre-start and in-flight phases.
-    pub(super) resumption: Option<resumption::Active>,
+    pub(super) resumption: Option<resumptions::Active>,
     pub(super) psk_used: bool,
 }
 
 impl Handshake {
+    pub(super) fn initial(resumption: Option<resumptions::Active>) -> Self {
+        Self {
+            state: state::State::initial(),
+            transcript: hash::Transcript::new(),
+            client_random: [0; handshake::RANDOM_LEN],
+            session_id: [0; 32],
+            hrr_done: false,
+            resumption,
+            psk_used: false,
+        }
+    }
+
     pub(super) fn require_initial(&self) -> Result<(), connection::Error> {
         match self.state {
             state::State::Initial => Ok(()),
             state::State::Failed => Err(connection::Error::ConnectionFailed),
             _ => Err(connection::Error::UnexpectedMessage),
         }
+    }
+
+    pub(super) fn is_failed(&self) -> bool {
+        matches!(self.state, state::State::Failed)
+    }
+
+    pub(super) fn is_done(&self) -> bool {
+        matches!(self.state, state::State::Done)
+    }
+
+    pub(super) fn expect_server_hello(&mut self) {
+        self.state = state::State::expect_server_hello();
     }
 }
 
@@ -70,7 +93,7 @@ impl Drop for Handshake {
 #[derive(Clone, Copy)]
 pub(super) enum EarlyData {
     NotOffered,
-    Offered(resumption::BoundEarlyData),
+    Offered(resumptions::BoundEarlyData),
     Accepted,
 }
 
@@ -184,8 +207,6 @@ impl<'wire> NegotiatedExtensions<'wire> {
 }
 
 pub(super) struct Credentials {
-    /// Identity to present if the server sends a CertificateRequest (mutual TLS).
-    pub(super) identity: Option<config::IdentityTemplate>,
     /// Main-handshake client-auth response selected from the borrowed request.
     pub(super) certificate_response: Option<CertificateResponse>,
 }
@@ -197,7 +218,7 @@ pub(super) enum CertificateResponse {
 }
 
 const _: () = assert!(mem::size_of::<Option<CertificateResponse>>() == 1);
-const _: () = assert!(mem::size_of::<Credentials>() <= 2 * mem::size_of::<usize>());
+const _: () = assert!(mem::size_of::<Credentials>() == 1);
 
 pub(super) struct Application {
     pub(super) traffic: material::State,
@@ -224,10 +245,9 @@ impl Drop for Application {
 }
 
 pub(super) struct Buffers {
-    pub(super) reasm: reassemblers::HsReassembler,
     /// Outbound flight storage, phase-reused for an X.509 server leaf between
     /// Certificate and CertificateVerify when no outbound bytes are live.
-    pub(super) flight: workspace::BoundedBuffer,
+    pub(super) flight: storage::BoundedBuffer,
 }
 
 pub(super) struct Runtime<C> {
@@ -260,19 +280,20 @@ impl<C, K> Session<C, K> {
         }
     }
 
-    pub(super) fn certificate_type_offers(&self) -> CertificateTypeOffers {
+    pub(super) fn certificate_type_offers(
+        &self,
+        policy: &config::Policy<'_>,
+    ) -> CertificateTypeOffers {
         use crate::identity::CertificateType;
         let server = matches!(
-            self.offer.config.verifier(),
+            policy.template().verifier(),
             config::Verifier::RawPublicKey { .. }
         )
         .then_some(CertificateType::RawPublicKey);
         CertificateTypeOffers {
             server,
-            client: self
-                .credentials
-                .identity
-                .as_ref()
+            client: policy
+                .identity()
                 .map(config::IdentityTemplate::cert_type)
                 .or(server),
         }
@@ -280,47 +301,71 @@ impl<C, K> Session<C, K> {
 }
 
 impl<C: connection::Clock, K: kx::Initiator> Session<C, K> {
-    pub(super) fn release_workspace(mut self) -> client::Workspace {
+    pub(super) fn release_workspace(
+        mut self,
+        mut reassembler: reassemblers::HsReassembler,
+    ) -> workspace::Workspace {
         self.kx.clear();
-        client::Workspace::from_buffers(
-            self.buffers.reasm.release_buffer(),
+        workspace::Workspace::from_buffers(
+            reassembler.release_buffer(),
             mem::take(&mut self.buffers.flight),
         )
     }
 
+    pub(super) fn release_framed_workspace(mut self) -> workspace::Workspace {
+        self.kx.clear();
+        workspace::Workspace::from_buffers(
+            storage::BoundedBuffer::default(),
+            mem::take(&mut self.buffers.flight),
+        )
+    }
+
+    pub(super) fn poison(&mut self) {
+        self.handshake.state.fail();
+        self.kx.clear();
+        self.handshake.resumption = None;
+        self.extensions.early_data = EarlyData::NotOffered;
+        self.application.zeroize_secrets();
+        self.buffers.flight.clear();
+    }
+
     pub(super) fn dispatch<S: connection::EventSink + ?Sized>(
-        client: &mut client::Client<C, K>,
+        &mut self,
+        policy: &config::Policy<'_>,
         epoch: connection::Epoch,
         msg: views::MessageRef<'_>,
         raw: &[u8],
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        let state = mem::replace(&mut client.session.handshake.state, state::State::Failed);
+        let state = mem::replace(&mut self.handshake.state, state::State::Failed);
         match (state, msg) {
             (state::State::ExpectServerHello, views::MessageRef::ServerHello(sh))
                 if epoch == connection::Epoch::Plaintext =>
             {
-                client.session.handshake.state = state::State::ExpectServerHello;
-                client.handle_server_hello(sh, raw, events)
+                self.handshake.state = state::State::ExpectServerHello;
+                negotiation::Negotiation::new(self, policy).handle_server_hello(sh, raw, events)
             }
             (
                 state::State::ExpectEncryptedExtensions { secrets },
                 views::MessageRef::EncryptedExtensions(ee),
             ) if epoch == connection::Epoch::Handshake => {
-                client.handle_encrypted_extensions(ee, raw, secrets, events)
+                negotiation::Negotiation::new(self, policy)
+                    .handle_encrypted_extensions(ee, raw, secrets, events)
             }
             (
                 state::State::ExpectCertificate { secrets },
                 views::MessageRef::CertificateRequest(cr),
             ) if epoch == connection::Epoch::Handshake => {
-                client.session.handshake.state = state::State::ExpectCertificate { secrets };
-                client.handle_certificate_request(cr, raw)?;
+                self.handshake.state = state::State::ExpectCertificate { secrets };
+                authentication::Authentication::new(self, policy)
+                    .handle_certificate_request(cr, raw)?;
                 Ok(())
             }
             (state::State::ExpectCertificate { secrets }, views::MessageRef::Certificate(c))
                 if epoch == connection::Epoch::Handshake =>
             {
-                client.handle_certificate(c, raw, secrets)?;
+                authentication::Authentication::new(self, policy)
+                    .handle_certificate(c, raw, secrets)?;
                 Ok(())
             }
             (
@@ -330,109 +375,122 @@ impl<C: connection::Clock, K: kx::Initiator> Session<C, K> {
                 },
                 views::MessageRef::CertificateVerify(cv),
             ) if epoch == connection::Epoch::Handshake => {
-                client.handle_certificate_verify(cv, raw, secrets, server_leaf)?;
+                authentication::Authentication::new(self, policy).handle_certificate_verify(
+                    cv,
+                    raw,
+                    secrets,
+                    server_leaf,
+                )?;
                 Ok(())
             }
             (state::State::ExpectServerFinished { secrets }, views::MessageRef::Finished(f))
                 if epoch == connection::Epoch::Handshake =>
             {
-                client.handle_server_finished(f, raw, secrets, events)
+                authentication::Authentication::new(self, policy)
+                    .handle_server_finished(f, raw, secrets, events)
             }
             (state::State::Done, views::MessageRef::KeyUpdate(ku))
                 if epoch == connection::Epoch::Application =>
             {
-                client.session.handshake.state = state::State::Done;
-                Self::handle_key_update(client, ku, events)
+                self.handshake.state = state::State::Done;
+                self.handle_key_update(policy, ku, events)
             }
             (state::State::Done, views::MessageRef::NewSessionTicket(nst))
                 if epoch == connection::Epoch::Application =>
             {
-                client.session.handshake.state = state::State::Done;
-                use crate::client::config::resumption::MAX_TICKET_LIFETIME_SECS;
-                use crate::wire::psk::RESUMPTION_HASH;
-                if nst.ticket_lifetime > MAX_TICKET_LIFETIME_SECS {
-                    return Err(connection::Error::IllegalParameter.into());
-                }
-                let mut max_early_data = nst
-                    .extensions
-                    .iter()
-                    .find(|extension| extension.ty == extension::Type::EARLY_DATA)
-                    .map(|extension| {
-                        use crate::wire::codec::Reader;
-                        let mut reader = Reader::new(extension.data);
-                        let value = reader.u32().map_err(connection::Error::from)?;
-                        reader.finish().map_err(connection::Error::from)?;
-                        Ok::<u32, connection::Error>(value)
-                    })
-                    .transpose()?;
-                if client.session.offer.config.transport_mode().is_quic()
-                    && max_early_data.is_some_and(|maximum| maximum != u32::MAX)
-                {
-                    return Err(connection::Error::IllegalParameter.into());
-                }
-                if client.session.offer.config.transport_mode().is_tls()
-                    && max_early_data.is_some_and(|maximum| maximum == 0 || maximum == u32::MAX)
-                {
-                    max_early_data = None;
-                }
-                if nst.ticket_lifetime == 0
-                    || client.session.application.hash_alg()? != RESUMPTION_HASH
-                {
-                    return Ok(());
-                }
-                let Some(master) = client.session.application.resumption_master.as_ref() else {
-                    return Ok(());
-                };
-                let suite = client
-                    .session
-                    .application
-                    .traffic
-                    .suite()
-                    .ok_or(connection::Error::UnexpectedMessage)?;
-                let ticket = client::Ticket {
-                    template: &client.session.offer.config,
-                    master,
-                    nonce: nst.ticket_nonce,
-                    identity: nst.ticket,
-                    timing: resumption::TicketTiming {
-                        lifetime_secs: nst.ticket_lifetime,
-                        age_add: nst.ticket_age_add,
-                        received_at_ms: connection::Clock::now_ms(&client.session.runtime.clock),
-                    },
-                    profile: resumption::IssuedProfile {
-                        max_early_data,
-                        suite,
-                        alpn: client.session.extensions.selected_alpn,
-                    },
-                };
-                connection::EventContext::emit(
+                self.handshake.state = state::State::Done;
+                handle_new_session_ticket(
+                    policy,
+                    self.application.resumption_master.as_ref(),
+                    self.application.traffic.suite(),
+                    self.extensions.selected_alpn,
+                    connection::Clock::now_ms(&self.runtime.clock),
+                    nst,
                     events,
-                    Some(suite),
-                    connection::Event::NewSessionTicket(ticket),
-                )?;
-                Ok(())
+                )
             }
             _ => Err(connection::Error::UnexpectedMessage.into()),
         }
     }
 
     fn handle_key_update<S: connection::EventSink + ?Sized>(
-        client: &mut client::Client<C, K>,
+        &mut self,
+        policy: &config::Policy<'_>,
         update: messages::KeyUpdate,
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        if !client
-            .session
-            .offer
-            .config
-            .transport_mode()
-            .allows_tls_key_update()
-        {
+        if !policy.template().transport_mode().allows_tls_key_update() {
             return Err(connection::Error::UnexpectedMessage.into());
         }
-        connection::KeyUpdateCore::<connection::ClientRole>::new(
-            &mut client.session.application.traffic,
-        )
-        .receive(update.request, events)
+        connection::KeyUpdateCore::<connection::ClientRole>::new(&mut self.application.traffic)
+            .receive(update.request, events)
     }
+}
+
+pub(super) fn handle_new_session_ticket<S: connection::EventSink + ?Sized>(
+    policy: &config::Policy<'_>,
+    master: Option<&material::ResumptionMasterSecret>,
+    suite: Option<record::CipherSuite>,
+    selected_alpn: Option<protocols::AlpnId>,
+    received_at_ms: u64,
+    nst: views::NewSessionTicketRef<'_>,
+    events: &mut S,
+) -> Result<(), connection::DriveError<S::Error>> {
+    use crate::wire::psk::RESUMPTION_HASH;
+
+    if nst.ticket_lifetime > resumptions::MAX_TICKET_LIFETIME_SECS {
+        return Err(connection::Error::IllegalParameter.into());
+    }
+    let mut max_early_data = nst
+        .extensions
+        .iter()
+        .find(|extension| extension.ty == extension::Type::EARLY_DATA)
+        .map(|extension| {
+            use crate::wire::codec::Reader;
+            let mut reader = Reader::new(extension.data);
+            let value = reader.u32().map_err(connection::Error::from)?;
+            reader.finish().map_err(connection::Error::from)?;
+            Ok::<u32, connection::Error>(value)
+        })
+        .transpose()?;
+    if policy.template().transport_mode().is_quic()
+        && max_early_data.is_some_and(|maximum| maximum != u32::MAX)
+    {
+        return Err(connection::Error::IllegalParameter.into());
+    }
+    if policy.template().transport_mode().is_tls()
+        && max_early_data.is_some_and(|maximum| maximum == 0 || maximum == u32::MAX)
+    {
+        max_early_data = None;
+    }
+    let Some(suite) = suite else {
+        return Err(connection::Error::UnexpectedMessage.into());
+    };
+    if nst.ticket_lifetime == 0 || suite.hash_alg() != RESUMPTION_HASH {
+        return Ok(());
+    }
+    let Some(master) = master else {
+        return Ok(());
+    };
+    let ticket = client::Ticket {
+        template: policy.template(),
+        master,
+        nonce: nst.ticket_nonce,
+        identity: nst.ticket,
+        timing: resumptions::TicketTiming {
+            lifetime_secs: nst.ticket_lifetime,
+            age_add: nst.ticket_age_add,
+            received_at_ms,
+        },
+        profile: resumptions::IssuedProfile {
+            max_early_data,
+            suite,
+            alpn: selected_alpn,
+        },
+    };
+    connection::EventContext::emit(
+        events,
+        Some(suite),
+        connection::Event::NewSessionTicket(ticket),
+    )
 }

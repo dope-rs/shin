@@ -1,6 +1,8 @@
+use crate::client::{self, workspace};
 use crate::connection;
+use crate::crypto::sig;
 use crate::transport;
-use crate::wire::protocols;
+use crate::wire::{handshake, protocols, record};
 use alloc::rc;
 use alloc::vec;
 use core::mem;
@@ -9,10 +11,10 @@ mod error;
 mod identity;
 mod owned;
 mod restore;
-pub(crate) mod resumption;
+mod resumption;
+pub(in crate::client) mod resumptions;
 mod ticket;
 mod truststore;
-mod verifier;
 
 pub use error::Error;
 pub use identity::Identity;
@@ -23,9 +25,105 @@ pub use restore::alpn::NegotiatedAlpn;
 pub use resumption::Resumption;
 pub use ticket::Ticket;
 pub use truststore::TrustStore;
-pub use verifier::{CertificateLimit, Verifier};
 
 pub const MAX_TRUST_ANCHORS: usize = 256;
+
+/// Explicit upper bound for a peer's encoded TLS Certificate message.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertificateLimit(u32);
+
+struct CertificateBound<const BYTES: usize>;
+
+impl<const BYTES: usize> CertificateBound<BYTES> {
+    const VALID: () = {
+        assert!(BYTES >= record::MAX_PLAINTEXT_BODY);
+        assert!(BYTES <= handshake::MAX_SIZE);
+    };
+}
+
+impl CertificateLimit {
+    pub const ONE_RECORD: Self = Self(record::MAX_PLAINTEXT_BODY as u32);
+    pub const MAXIMUM: Self = Self(handshake::MAX_SIZE as u32);
+
+    /// Creates a compile-time checked certificate-message bound.
+    pub const fn new<const BYTES: usize>() -> Self {
+        let () = CertificateBound::<BYTES>::VALID;
+        Self(BYTES as u32)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone)]
+pub enum Verifier {
+    RawPublicKey {
+        expected_pubkey: [u8; sig::PUBKEY_LEN],
+    },
+    X509 {
+        anchors: vec::Vec<OwnedTrustAnchor>,
+        hostname: vec::Vec<u8>,
+        certificate_limit: CertificateLimit,
+    },
+    /// X.509 verification backed by a reusable, issuer-indexed trust store.
+    X509Store {
+        roots: TrustStore,
+        hostname: vec::Vec<u8>,
+        certificate_limit: CertificateLimit,
+    },
+}
+
+impl Verifier {
+    pub(crate) fn dns_hostname(&self) -> Option<&[u8]> {
+        use crate::identity::Hostname;
+        match self {
+            Self::X509 { hostname, .. } | Self::X509Store { hostname, .. }
+                if !Hostname::new(hostname).is_ip_literal() =>
+            {
+                Some(hostname)
+            }
+            Self::RawPublicKey { .. } | Self::X509 { .. } | Self::X509Store { .. } => None,
+        }
+    }
+
+    fn prepare(self) -> Result<Self, Error> {
+        match self {
+            Self::X509 {
+                anchors,
+                hostname,
+                certificate_limit,
+            } => Ok(Self::X509Store {
+                roots: TrustStore::new(anchors)?,
+                hostname,
+                certificate_limit,
+            }),
+            verifier => Ok(verifier),
+        }
+    }
+
+    const fn certificate_limit(&self) -> CertificateLimit {
+        match self {
+            Self::RawPublicKey { .. } => CertificateLimit::ONE_RECORD,
+            Self::X509 {
+                certificate_limit, ..
+            }
+            | Self::X509Store {
+                certificate_limit, ..
+            } => *certificate_limit,
+        }
+    }
+
+    pub(in crate::client) const fn peer_identity_capacity(&self) -> usize {
+        match self {
+            Self::X509 { .. } | Self::X509Store { .. } => {
+                crate::identity::leafkey::MAX_PEER_KEY_LEN
+            }
+            Self::RawPublicKey { .. } => 0,
+        }
+    }
+}
 
 pub struct Config {
     pub verifier: Verifier,
@@ -40,11 +138,22 @@ pub struct Template {
     inner: rc::Rc<Shared>,
 }
 
+/// Exact endpoint policy shared by an owned client or one client pool.
+pub(in crate::client) struct Authority {
+    template: Template,
+    identity: Option<IdentityTemplate>,
+}
+
+pub(in crate::client) struct Policy<'a> {
+    authority: &'a Authority,
+    transport_params: Option<&'a [u8]>,
+}
+
 /// A validated template plus connection-local resumption state.
 /// Construction proves the pair fits the initial TLS record.
 pub struct Prepared {
     pub(super) template: Template,
-    pub(super) resumption: Option<resumption::Active>,
+    pub(super) resumption: Option<resumptions::Active>,
     pub(super) enable_early_data: bool,
 }
 
@@ -198,8 +307,8 @@ fn validate_hostname(hostname: &[u8]) -> Result<(), Error> {
 
 impl Template {
     /// Returns the exact reusable workspace plan for this endpoint policy.
-    pub fn workspace_layout(&self, identity: Option<&IdentityTemplate>) -> super::WorkspaceLayout {
-        super::WorkspaceLayout::prepared(
+    pub fn workspace_layout(&self, identity: Option<&IdentityTemplate>) -> workspace::Layout {
+        workspace::Layout::prepared(
             self.inner.verifier.certificate_limit().get(),
             identity.map_or(0, IdentityTemplate::outbound_flight_capacity),
         )
@@ -255,12 +364,137 @@ impl Template {
     pub(crate) fn alpn(&self, id: protocols::AlpnId) -> Option<&[u8]> {
         self.inner.alpn_protocols.get(id)
     }
+
+    #[cfg(test)]
+    pub(in crate::client) fn strong_count(&self) -> usize {
+        rc::Rc::strong_count(&self.inner)
+    }
+}
+
+impl Authority {
+    pub(in crate::client) fn new(template: Template, identity: Option<IdentityTemplate>) -> Self {
+        Self { template, identity }
+    }
+
+    pub(in crate::client) fn policy<'a>(
+        &'a self,
+        transport_params: Option<&'a [u8]>,
+    ) -> Policy<'a> {
+        Policy {
+            authority: self,
+            transport_params,
+        }
+    }
+
+    pub(in crate::client) fn template(&self) -> &Template {
+        &self.template
+    }
+
+    pub(in crate::client) fn identity(&self) -> Option<&IdentityTemplate> {
+        self.identity.as_ref()
+    }
+
+    pub(in crate::client) fn workspace_layout(&self) -> workspace::Layout {
+        self.template.workspace_layout(self.identity.as_ref())
+    }
+
+    pub(in crate::client) fn restore(
+        &self,
+        restore: Restore<'_>,
+        transport_params_capacity: usize,
+    ) -> Result<resumptions::Active, Error> {
+        let active = restore.bind(&self.template);
+        validate_initial_hello_capacity(
+            self.template.transport_mode(),
+            self.template.verifier(),
+            transport_params_capacity,
+            self.template.alpn_protocols(),
+            Some(&active),
+        )?;
+        Ok(active)
+    }
+
+    #[cfg(test)]
+    pub(in crate::client) fn strong_counts(&self) -> (usize, Option<usize>) {
+        (
+            self.template.strong_count(),
+            self.identity.as_ref().map(IdentityTemplate::strong_count),
+        )
+    }
+}
+
+impl Policy<'_> {
+    pub(in crate::client) fn template(&self) -> &Template {
+        self.authority.template()
+    }
+
+    pub(in crate::client) fn identity(&self) -> Option<&IdentityTemplate> {
+        self.authority.identity()
+    }
+
+    pub(in crate::client) fn transport_params(&self) -> &[u8] {
+        self.transport_params
+            .unwrap_or_else(|| self.template().transport_params())
+    }
 }
 
 impl Prepared {
     /// Returns the exact workspace plan for this prepared connection.
-    pub fn workspace_layout(&self, identity: Option<&IdentityTemplate>) -> super::WorkspaceLayout {
+    pub fn workspace_layout(&self, identity: Option<&IdentityTemplate>) -> workspace::Layout {
         self.template.workspace_layout(identity)
+    }
+
+    /// Builds an owned client for a transport that frames handshake messages
+    /// and lends their final outbound owner.
+    pub fn into_framed_client<C: connection::Clock>(
+        self,
+        identity: Option<IdentityTemplate>,
+        clock: C,
+    ) -> client::FramedClient<C> {
+        let peer_identity = self.template.verifier().peer_identity_capacity();
+        let workspace = workspace::Layout::framed(peer_identity).allocate();
+        let Self {
+            template,
+            resumption,
+            enable_early_data,
+        } = self;
+        client::FramedClient {
+            core: client::FramedCore::new(clock, workspace, resumption, enable_early_data),
+            authority: Authority::new(template, identity),
+        }
+    }
+
+    /// Creates a fixed client pool that owns this endpoint policy once.
+    pub fn into_pool<C: connection::Clock>(
+        self,
+        identity: Option<IdentityTemplate>,
+        capacity: o3::collections::slab::Capacity,
+    ) -> workspace::Pool<C> {
+        workspace::Pool::new(self, identity, capacity)
+    }
+
+    /// Creates a pool for embedders that deliver exactly one framed handshake
+    /// message at a time and prepare connection-local transport parameters in
+    /// retained storage.
+    pub fn try_into_framed_pool<C: connection::Clock>(
+        self,
+        identity: Option<IdentityTemplate>,
+        capacity: o3::collections::slab::Capacity,
+        transport_params_capacity: usize,
+    ) -> Result<workspace::FramedPool<C>, Error> {
+        validate_initial_hello_capacity(
+            self.template.transport_mode(),
+            self.template.verifier(),
+            transport_params_capacity,
+            self.template.alpn_protocols(),
+            self.resumption.as_ref(),
+        )?;
+        Ok(workspace::FramedPool::new(
+            self,
+            identity,
+            capacity,
+            transport_params_capacity,
+        ))
     }
 
     /// Returns the validated reusable policy without exposing resumption state.
@@ -273,8 +507,8 @@ impl Prepared {
         self,
         identity: Option<IdentityTemplate>,
         clock: C,
-        storage: super::Workspace,
-    ) -> Result<super::Client<C>, super::WorkspaceRejection> {
+        storage: workspace::Workspace,
+    ) -> Result<client::Client<C>, workspace::Rejection> {
         let layout = self.workspace_layout(identity.as_ref());
         let storage = layout.admit(storage)?;
         Ok(self.build_client(identity, clock, storage))
@@ -284,73 +518,16 @@ impl Prepared {
         self,
         identity: Option<IdentityTemplate>,
         clock: C,
-        storage: super::Workspace,
-    ) -> super::Client<C> {
-        use crate::client::session;
-        use crate::client::state;
-        use crate::crypto::hash::Transcript;
-        use crate::crypto::kx;
-        use crate::crypto::material;
-        use crate::memory::threadbound::ThreadBound;
-        use crate::wire::handshake;
-        use crate::wire::handshake::reassemblers::HsReassembler;
-        use crate::wire::record;
-        use o3::collections::fixed::array;
-        use ring::rand::SystemRandom;
-        use session::Application;
-        use session::Buffers;
-        use session::Credentials;
-        use session::Extensions;
-        use session::Handshake;
-        use session::OfferSettings;
-        use session::Runtime;
+        storage: workspace::Workspace,
+    ) -> client::Client<C> {
         let Self {
-            template: config,
+            template,
             resumption,
             enable_early_data,
         } = self;
-        let super::Workspace { reassembly, flight } = storage;
-        super::Client {
-            session: session::Session {
-                offer: OfferSettings {
-                    config,
-                    enable_early_data,
-                    kex_group: kx::KexGroup::X25519,
-                    offered_suites: array::CopyInline::from_array(record::CipherSuite::SUPPORTED),
-                },
-                handshake: Handshake {
-                    state: state::State::initial(),
-                    transcript: Transcript::new(),
-                    client_random: [0u8; handshake::RANDOM_LEN],
-                    session_id: [0; 32],
-                    hrr_done: false,
-                    resumption,
-                    psk_used: false,
-                },
-                kx: kx::Owned::new(),
-                extensions: Extensions {
-                    selected_alpn: None,
-                    early_data: session::EarlyData::NotOffered,
-                },
-                credentials: Credentials {
-                    identity,
-                    certificate_response: None,
-                },
-                application: Application {
-                    traffic: material::State::default(),
-                    resumption_master: None,
-                    exporter_master: None,
-                },
-                buffers: Buffers {
-                    reasm: HsReassembler::with_buffer(reassembly),
-                    flight,
-                },
-                runtime: Runtime {
-                    clock,
-                    rng: SystemRandom::new(),
-                    _thread: ThreadBound::NEW,
-                },
-            },
+        client::Client {
+            core: client::Core::new(clock, storage, resumption, enable_early_data),
+            authority: Authority::new(template, identity),
         }
     }
 
@@ -379,7 +556,7 @@ fn validate_initial_hello(
     verifier: &Verifier,
     transport_params: &[u8],
     alpn_protocols: &[vec::Vec<u8>],
-    resumption: Option<&resumption::Active>,
+    resumption: Option<&resumptions::Active>,
 ) -> Result<(), Error> {
     use crate::client::offer::Offer;
     use crate::wire::record::MAX_PLAINTEXT_BODY;
@@ -387,6 +564,43 @@ fn validate_initial_hello(
         transport_mode,
         verifier,
         transport_params,
+        alpn_protocols,
+        resumption,
+    )
+    .map_err(|_| Error::ClientHelloEncodingOverflow)?;
+    if len > MAX_PLAINTEXT_BODY {
+        return Err(Error::ClientHelloTooLarge {
+            len,
+            maximum: MAX_PLAINTEXT_BODY,
+        });
+    }
+    Ok(())
+}
+
+fn validate_initial_hello_capacity(
+    transport_mode: transport::Mode,
+    verifier: &Verifier,
+    transport_params_len: usize,
+    alpn_protocols: &[vec::Vec<u8>],
+    resumption: Option<&resumptions::Active>,
+) -> Result<(), Error> {
+    use crate::client::offer::Offer;
+    use crate::wire::record::MAX_PLAINTEXT_BODY;
+    if transport_params_len > u16::MAX as usize {
+        return Err(Error::TransportParametersTooLong {
+            len: transport_params_len,
+            maximum: u16::MAX as usize,
+        });
+    }
+    if transport_mode.is_tls() && transport_params_len != 0 {
+        return Err(Error::TransportParametersInTls {
+            len: transport_params_len,
+        });
+    }
+    let len = Offer::maximum_initial_len_for_transport_params(
+        transport_mode,
+        verifier,
+        transport_params_len,
         alpn_protocols,
         resumption,
     )

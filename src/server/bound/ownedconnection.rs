@@ -1,7 +1,8 @@
 use crate::connection;
 use crate::server;
 use crate::server::config;
-use crate::wire::handshake::workspace;
+use crate::transport;
+use crate::wire::handshake::storage;
 use core::ops;
 
 /// Server connection which owns its single fixed policy shard.
@@ -21,20 +22,42 @@ where
     G: config::EarlyDataGuard,
     V: config::ClientCertVerifier,
 {
+    /// Prepares exact storage before moving this shard into the connection.
+    pub fn prepare(
+        shard: server::Shard<G, V, DOMAIN>,
+        config: config::Connection,
+        transport_mode: transport::Mode,
+        clock: C,
+    ) -> Result<Self, connection::Error> {
+        let workspace = shard.workspace_layout(&config, transport_mode)?.allocate();
+        let server =
+            server::Server::from_validated(config, transport_mode, clock, workspace.into_scratch());
+        Ok(Self::from_validated(server, shard))
+    }
+
     /// Binds a server to an owned policy shard after validating both once.
     pub fn new(
         server: server::Server<C, DOMAIN>,
         shard: server::Shard<G, V, DOMAIN>,
-    ) -> Result<Self, connection::Error> {
-        server.validate_shard(&shard)?;
-        Ok(Self { server, shard })
+    ) -> server::Binding<Self, (server::Server<C, DOMAIN>, server::Shard<G, V, DOMAIN>)> {
+        if let Err(error) = server.validate_shard(&shard) {
+            return server::Binding::rejected(error, (server, shard));
+        }
+        server::Binding::bound(Self::from_validated(server, shard))
+    }
+
+    pub(super) fn from_validated(
+        server: server::Server<C, DOMAIN>,
+        shard: server::Shard<G, V, DOMAIN>,
+    ) -> Self {
+        Self { server, shard }
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
         self.server
             .session
             .peer
-            .selected_alpn(&self.shard.policy.alpn)
+            .selected_alpn(&self.shard.authority.alpn)
     }
 
     pub fn read_into<S: connection::EventSink + ?Sized>(
@@ -43,7 +66,8 @@ where
         data: &[u8],
         events: &mut S,
     ) -> Result<(), connection::DriveError<S::Error>> {
-        self.server.read_bound(epoch, data, &mut self.shard, events)
+        self.server
+            .read_authorized(epoch, data, &self.shard.authority, events)
     }
 
     pub fn note_early_data(&mut self, len: usize) -> Result<(), connection::Error> {
@@ -54,7 +78,7 @@ where
         self.server.key_updates()
     }
 
-    pub fn into_workspace(self) -> workspace::Scratch {
+    pub fn into_workspace(self) -> storage::Scratch {
         self.server.into_workspace()
     }
 }

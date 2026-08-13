@@ -14,14 +14,14 @@ const MAX_EARLY_DATA_SIZE: u32 = 16384;
 
 struct TestGuard {
     now: u64,
-    seen: Vec<Vec<u8>>,
+    seen: RefCell<Vec<Vec<u8>>>,
 }
 
 impl TestGuard {
     fn new(now: u64) -> Self {
         Self {
             now,
-            seen: Vec::new(),
+            seen: RefCell::new(Vec::new()),
         }
     }
 }
@@ -33,11 +33,12 @@ impl Clock for TestGuard {
 }
 
 impl EarlyDataGuard for TestGuard {
-    fn register(&mut self, token: &[u8]) -> bool {
-        if self.seen.iter().any(|t| t.as_slice() == token) {
+    fn register(&self, token: &[u8]) -> bool {
+        let mut seen = self.seen.borrow_mut();
+        if seen.iter().any(|t| t.as_slice() == token) {
             return false;
         }
-        self.seen.push(token.to_vec());
+        seen.push(token.to_vec());
         true
     }
 }
@@ -178,3 +179,4 @@ fn overflow_error_maps_to_unexpected_message_alert() {
         Description::UnexpectedMessage
     );
 }
+use std::cell::RefCell;

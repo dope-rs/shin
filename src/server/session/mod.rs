@@ -4,19 +4,21 @@ use crate::crypto::material;
 use crate::crypto::schedule;
 use crate::identity;
 use crate::memory::threadbound;
-use crate::server;
 use crate::server::config;
-use crate::server::retry;
 use crate::transport;
 use crate::wire::handshake::messages;
-use crate::wire::handshake::reassemblers;
-use crate::wire::handshake::views;
-use crate::wire::handshake::workspace;
+use crate::wire::handshake::storage;
 use crate::wire::protocols;
 use crate::wire::record;
 use core::mem;
 use ring::rand;
 
+mod authentication;
+pub(super) mod drive;
+mod hello;
+mod negotiation;
+mod resumption;
+mod retry;
 pub(super) mod updates;
 
 const MAX_TICKET_AGE_SKEW_MS: u64 = 10_000;
@@ -32,35 +34,6 @@ pub(super) struct Session<C> {
     pub(super) application: Application,
     pub(super) buffers: Buffers,
     pub(super) runtime: Runtime<C>,
-}
-
-pub(super) trait Drive<const DOMAIN: u8> {
-    fn drive_record<G, V, S>(
-        &mut self,
-        epoch: connection::Epoch,
-        data: &[u8],
-        shard: &mut server::Shard<G, V, DOMAIN>,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>
-    where
-        G: config::EarlyDataGuard,
-        V: config::ClientCertVerifier,
-        S: connection::EventSink + ?Sized;
-
-    fn process<G, V, S>(
-        &mut self,
-        epoch: connection::Epoch,
-        message: views::MessageRef<'_>,
-        raw: &[u8],
-        shard: &mut server::Shard<G, V, DOMAIN>,
-        events: &mut S,
-    ) -> Result<(), connection::DriveError<S::Error>>
-    where
-        G: config::EarlyDataGuard,
-        V: config::ClientCertVerifier,
-        S: connection::EventSink + ?Sized;
-
-    fn poison(&mut self);
 }
 
 pub(super) struct AcceptedPsk {
@@ -105,7 +78,7 @@ impl EarlyData {
 
     pub(super) fn admit<G: config::EarlyDataGuard>(
         &mut self,
-        guard: &mut G,
+        guard: &G,
         offered: Option<protocols::EarlyDataSignal>,
         psk: Option<&AcceptedPsk>,
         suite: Option<record::CipherSuite>,
@@ -184,10 +157,10 @@ impl EarlyData {
 }
 
 pub(super) struct Handshake {
-    pub(super) state: State,
-    pub(super) transcript: hash::Transcript,
-    pub(super) hrr_done: bool,
-    pub(super) hrr_invariant: Option<retry::ClientHelloInvariant>,
+    state: State,
+    transcript: hash::Transcript,
+    hrr_done: bool,
+    hrr_invariant: Option<retry::ClientHelloInvariant>,
 }
 
 pub(super) struct Peer {
@@ -241,9 +214,8 @@ impl Drop for Application {
 }
 
 pub(super) struct Buffers {
-    pub(super) reasm: reassemblers::HsReassembler,
-    pub(super) flight: workspace::BoundedBuffer,
-    pub(super) identity_workspace: workspace::BoundedBuffer,
+    pub(super) flight: storage::BoundedBuffer,
+    pub(super) identity_workspace: storage::BoundedBuffer,
 }
 
 pub(super) struct Runtime<C> {
@@ -255,7 +227,7 @@ pub(super) struct Runtime<C> {
 /// Server phase carrying the traffic secret or Finished verifier required by
 /// its next input.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum State {
+enum State {
     ExpectClientHello,
     ExpectEndOfEarlyData {
         client_handshake_traffic: material::TrafficSecret,
@@ -279,7 +251,34 @@ impl State {
     }
 }
 
+impl Handshake {
+    pub(super) fn initial() -> Self {
+        Self {
+            state: State::ExpectClientHello,
+            transcript: hash::Transcript::new(),
+            hrr_done: false,
+            hrr_invariant: None,
+        }
+    }
+
+    pub(super) fn is_failed(&self) -> bool {
+        self.state == State::Failed
+    }
+
+    pub(super) fn is_done(&self) -> bool {
+        self.state == State::Done
+    }
+}
+
 impl<C: connection::Clock> Session<C> {
+    pub(super) fn poison(&mut self) {
+        self.handshake.state.fail();
+        self.application.zeroize_secrets();
+        self.peer.early_data.close();
+        self.buffers.flight.clear();
+        self.buffers.identity_workspace.clear();
+    }
+
     pub(super) fn handle_key_update<S: connection::EventSink + ?Sized>(
         &mut self,
         ku: messages::KeyUpdate,

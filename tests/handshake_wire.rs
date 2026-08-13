@@ -2,16 +2,15 @@ use shin::crypto::sig::SignatureScheme;
 use shin::wire::codec::Reader;
 use shin::wire::extension::{Extension, Type};
 use shin::wire::handshake;
-use shin::wire::handshake::frame::{
-    CertificateEntryRef, CertificateRef, CertificateVerifyRef, ClientHelloRef,
-    EncryptedExtensionsRef, NewSessionTicketRef, ServerHelloRef,
-};
-use shin::wire::handshake::frame::{Frame, MessageRef};
 use shin::wire::handshake::messages::{
     Certificate, CertificateEntry, CertificateRequest, CertificateVerify, ClientHello,
     EncryptedExtensions, Finished, KeyUpdate, NewSessionTicket, ServerHello,
 };
-use shin::wire::handshake::{KeyUpdateRequest, RANDOM_LEN, TLS_1_2, TLS_1_3};
+use shin::wire::handshake::views::{
+    CertificateEntryRef, CertificateRef, CertificateVerifyRef, ClientHelloRef,
+    EncryptedExtensionsRef, MessageRef, NewSessionTicketRef, ServerHelloRef,
+};
+use shin::wire::handshake::{Frame, KeyUpdateRequest, RANDOM_LEN, TLS_1_2, TLS_1_3};
 
 fn sample_extensions() -> Vec<Extension> {
     vec![

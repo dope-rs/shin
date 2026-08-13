@@ -71,7 +71,7 @@ fuzz_target!(|data: &[u8]| {
     ).unwrap();
     let mut events = IgnoreEvents;
     let _ = client.start_into(&mut events);
-    let mut server = shard.bind(server).unwrap();
+    let mut server = shard.bind(server).into_result().unwrap();
 
     let mut r = data;
     while r.len() >= 2 {

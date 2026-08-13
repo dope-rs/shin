@@ -1,7 +1,7 @@
 use crate::connection;
 use crate::memory::threadbound;
 use crate::wire::codec;
-use crate::wire::handshake::workspace;
+use crate::wire::handshake::storage;
 use core::mem;
 
 /// Saturating peer-triggered KeyUpdate allowance, reset at a progress boundary.
@@ -44,28 +44,14 @@ impl<const LIMIT: u32> KeyUpdateBudget<LIMIT> {
 /// Reassembles fragmented or coalesced handshake messages with their transcript
 /// bytes; a message may not cross record epochs (RFC 8446 §5.1).
 pub(crate) struct HsReassembler {
-    buf: workspace::BoundedBuffer,
+    buf: storage::BoundedBuffer,
     epoch: Option<connection::Epoch>,
     key_updates: KeyUpdateBudget<{ super::MAX_KEY_UPDATES_PER_RECORD }>,
     _thread: threadbound::ThreadBound,
 }
 
-pub(crate) enum RecordMessage<'a> {
-    Borrowed(&'a [u8]),
-    Buffered(workspace::BoundedBuffer),
-}
-
-impl AsRef<[u8]> for RecordMessage<'_> {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(bytes) => bytes,
-            Self::Buffered(bytes) => bytes,
-        }
-    }
-}
-
 impl HsReassembler {
-    pub(crate) fn with_buffer(buffer: workspace::BoundedBuffer) -> Self {
+    pub(crate) fn with_buffer(buffer: storage::BoundedBuffer) -> Self {
         Self {
             buf: buffer,
             epoch: None,
@@ -78,10 +64,7 @@ impl HsReassembler {
         self.buf.capacity()
     }
 
-    pub(crate) fn begin_record(
-        &mut self,
-        epoch: connection::Epoch,
-    ) -> Result<(), codec::DecodeError> {
+    fn begin_record(&mut self, epoch: connection::Epoch) -> Result<(), codec::DecodeError> {
         if !self.buf.is_empty() && self.epoch != Some(epoch) {
             return Err(codec::DecodeError::HandshakeSpansEpoch);
         }
@@ -89,67 +72,68 @@ impl HsReassembler {
         Ok(())
     }
 
-    pub(crate) fn next_record<'a>(
+    /// Processes a record while retaining fragmented-message storage.
+    /// The callback lifetime prevents decoded views from escaping this scope,
+    /// eliminating an external recycling protocol.
+    pub(crate) fn read<E>(
         &mut self,
         epoch: connection::Epoch,
-        input: &mut &'a [u8],
-    ) -> Result<Option<RecordMessage<'a>>, connection::Error> {
-        if self.buf.is_empty() {
-            if input.is_empty() {
-                return Ok(None);
+        mut input: &[u8],
+        mut process: impl for<'message> FnMut(&'message [u8]) -> Result<(), connection::DriveError<E>>,
+    ) -> Result<(), connection::DriveError<E>> {
+        self.begin_record(epoch)?;
+        loop {
+            if self.buf.is_empty() {
+                if input.is_empty() {
+                    return Ok(());
+                }
+                if input.len() >= 4 {
+                    let msg_len = super::encoded_message_len(input)?;
+                    if input.len() >= msg_len {
+                        let (raw, rest) = input.split_at(msg_len);
+                        input = rest;
+                        self.validate_message(raw[0])?;
+                        process(raw)?;
+                        continue;
+                    }
+                }
+                self.append(input)?;
+                self.epoch = Some(epoch);
+                return Ok(());
             }
-            if input.len() >= 4 {
-                let msg_len = message_len(input)?;
-                if input.len() >= msg_len {
-                    let (raw, rest) = input.split_at(msg_len);
-                    *input = rest;
-                    self.validate_message(raw)?;
-                    return Ok(Some(RecordMessage::Borrowed(raw)));
+
+            debug_assert_eq!(self.epoch, Some(epoch));
+            if self.buf.len() < 4 {
+                let take = (4 - self.buf.len()).min(input.len());
+                self.append(&input[..take])?;
+                input = &input[take..];
+                if self.buf.len() < 4 {
+                    return Ok(());
                 }
             }
-            self.append(input)?;
-            self.epoch = Some(epoch);
-            *input = &[];
-            return Ok(None);
-        }
 
-        debug_assert_eq!(self.epoch, Some(epoch));
-        if self.buf.len() < 4 {
-            let take = (4 - self.buf.len()).min(input.len());
+            let msg_len = super::encoded_message_len(&self.buf)?;
+            let needed = msg_len
+                .checked_sub(self.buf.len())
+                .ok_or(codec::DecodeError::Trailing)?;
+            let take = needed.min(input.len());
             self.append(&input[..take])?;
-            *input = &input[take..];
-            if self.buf.len() < 4 {
-                return Ok(None);
+            input = &input[take..];
+            if self.buf.len() < msg_len {
+                return Ok(());
             }
-        }
 
-        let msg_len = message_len(&self.buf)?;
-        let needed = msg_len
-            .checked_sub(self.buf.len())
-            .ok_or(codec::DecodeError::Trailing)?;
-        let take = needed.min(input.len());
-        self.append(&input[..take])?;
-        *input = &input[take..];
-        if self.buf.len() < msg_len {
-            return Ok(None);
-        }
-
-        let raw = mem::take(&mut self.buf);
-        self.epoch = None;
-        self.validate_message(raw.as_slice())?;
-        Ok(Some(RecordMessage::Buffered(raw)))
-    }
-
-    pub(crate) fn recycle(&mut self, message: RecordMessage<'_>) {
-        if let RecordMessage::Buffered(mut bytes) = message {
-            bytes.clear();
-            if self.buf.is_empty() && bytes.capacity() > self.buf.capacity() {
-                self.buf = bytes;
-            }
+            self.epoch = None;
+            let result = self
+                .validate_message(self.buf.as_slice()[0])
+                .map_err(connection::DriveError::from)
+                .and_then(|()| process(self.buf.as_slice()));
+            self.buf.clear();
+            result?;
         }
     }
 
-    pub(crate) fn release_buffer(&mut self) -> workspace::BoundedBuffer {
+    pub(crate) fn release_buffer(&mut self) -> storage::BoundedBuffer {
         self.epoch = None;
         self.key_updates.reset();
         let mut buffer = mem::take(&mut self.buf);
@@ -170,25 +154,16 @@ impl HsReassembler {
             .map_err(|_| connection::Error::WorkspaceExhausted(WorkspaceRegion::FragmentedMessage))
     }
 
-    fn validate_message(&mut self, raw: &[u8]) -> Result<(), connection::Error> {
-        if raw[0] == super::Type::KeyUpdate as u8 && !self.key_updates.consume() {
+    fn validate_message(&mut self, ty: u8) -> Result<(), connection::Error> {
+        if ty == super::Type::KeyUpdate as u8 && !self.key_updates.consume() {
             return Err(connection::Error::UnexpectedMessage);
         }
         Ok(())
     }
 }
 
-fn message_len(buf: &[u8]) -> Result<usize, codec::DecodeError> {
-    use crate::wire::handshake::MAX_SIZE;
-    let msg_len = 4 + u32::from_be_bytes([0, buf[1], buf[2], buf[3]]) as usize;
-    if msg_len > MAX_SIZE {
-        return Err(codec::DecodeError::HandshakeTooLarge);
-    }
-    Ok(msg_len)
-}
-
 impl Default for HsReassembler {
     fn default() -> Self {
-        Self::with_buffer(workspace::BoundedBuffer::default())
+        Self::with_buffer(storage::BoundedBuffer::default())
     }
 }
